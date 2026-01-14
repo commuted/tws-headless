@@ -8,6 +8,7 @@ Modules:
     - client: Base IB API connection wrapper
     - portfolio: Portfolio loading and management
     - rebalancer: Rebalancing strategies and execution
+    - command_server: Unix socket command interface
 
 Quick Start:
     from ib import Portfolio, Rebalancer, TargetAllocation
@@ -63,6 +64,14 @@ from .rebalancer import (
     create_equal_weight_targets,
 )
 
+from .command_server import (
+    CommandServer,
+    CommandResult,
+    CommandStatus,
+    send_command,
+    DEFAULT_SOCKET_PATH,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -92,4 +101,10 @@ __all__ = [
     "create_60_40_targets",
     "create_three_fund_targets",
     "create_equal_weight_targets",
+    # Command Server
+    "CommandServer",
+    "CommandResult",
+    "CommandStatus",
+    "send_command",
+    "DEFAULT_SOCKET_PATH",
 ]

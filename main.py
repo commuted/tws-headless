@@ -28,7 +28,13 @@ from rebalancer import (
     create_three_fund_targets,
     create_equal_weight_targets,
 )
-from models import TargetAllocation, AssetType, RebalanceStrategy, Bar
+from models import TargetAllocation, AssetType, RebalanceStrategy, Bar, OrderAction
+from command_server import (
+    CommandServer,
+    CommandResult,
+    CommandStatus,
+    DEFAULT_SOCKET_PATH,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -143,6 +149,337 @@ class ShutdownManager:
 
 # Global shutdown manager instance
 shutdown_manager = ShutdownManager()
+
+
+# =============================================================================
+# Command Handler
+# =============================================================================
+
+class CommandHandler:
+    """
+    Handles commands received from the command server.
+
+    Provides command implementations for controlling the portfolio
+    via external socket commands.
+    """
+
+    def __init__(self, portfolio: Portfolio, shutdown_mgr: ShutdownManager):
+        self.portfolio = portfolio
+        self.shutdown_mgr = shutdown_mgr
+        self._liquidation_in_progress = False
+
+    def register_commands(self, server: CommandServer):
+        """Register all command handlers with the server"""
+        server.register_handler("status", self.handle_status)
+        server.register_handler("positions", self.handle_positions)
+        server.register_handler("liquidate", self.handle_liquidate)
+        server.register_handler("stop", self.handle_stop)
+        server.register_handler("shutdown", self.handle_stop)
+        server.register_handler("sell", self.handle_sell)
+        server.register_handler("buy", self.handle_buy)
+
+    def handle_status(self, args: List[str]) -> CommandResult:
+        """Handle 'status' command - return portfolio status"""
+        try:
+            positions = self.portfolio.positions
+            total_value = self.portfolio.total_value
+            total_pnl = self.portfolio.total_pnl
+
+            account = self.portfolio.get_account_summary()
+            account_data = {}
+            if account and account.is_valid:
+                account_data = {
+                    "account_id": account.account_id,
+                    "net_liquidation": account.net_liquidation,
+                    "available_funds": account.available_funds,
+                    "buying_power": account.buying_power,
+                }
+
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Portfolio: ${total_value:,.2f} ({len(positions)} positions, P&L: ${total_pnl:,.2f})",
+                data={
+                    "total_value": total_value,
+                    "total_pnl": total_pnl,
+                    "position_count": len(positions),
+                    "connected": self.portfolio.connected,
+                    "streaming": self.portfolio.is_streaming,
+                    "bar_streaming": self.portfolio.is_bar_streaming,
+                    "account": account_data,
+                },
+            )
+        except Exception as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Failed to get status: {e}",
+            )
+
+    def handle_positions(self, args: List[str]) -> CommandResult:
+        """Handle 'positions' command - return detailed position list"""
+        try:
+            positions = self.portfolio.positions
+            pos_data = []
+            for pos in sorted(positions, key=lambda p: p.market_value, reverse=True):
+                pos_data.append({
+                    "symbol": pos.symbol,
+                    "quantity": pos.quantity,
+                    "price": pos.current_price,
+                    "value": pos.market_value,
+                    "pnl": pos.unrealized_pnl,
+                    "allocation": pos.allocation_pct,
+                })
+
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"{len(positions)} positions",
+                data={"positions": pos_data},
+            )
+        except Exception as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Failed to get positions: {e}",
+            )
+
+    def handle_liquidate(self, args: List[str]) -> CommandResult:
+        """
+        Handle 'liquidate' command - sell all positions.
+
+        Usage:
+            liquidate           - Liquidate all positions
+            liquidate SYMBOL    - Liquidate specific symbol
+            liquidate --confirm - Execute without dry-run
+        """
+        try:
+            if self._liquidation_in_progress:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message="Liquidation already in progress",
+                )
+
+            confirm = "--confirm" in args
+            symbols = [a for a in args if not a.startswith("--")]
+
+            positions = self.portfolio.positions
+            if not positions:
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message="No positions to liquidate",
+                )
+
+            # Filter to specific symbols if provided
+            if symbols:
+                positions = [p for p in positions if p.symbol in symbols]
+                if not positions:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message=f"Symbol(s) not found: {', '.join(symbols)}",
+                    )
+
+            # Calculate what would be sold
+            total_value = sum(p.market_value for p in positions)
+            sell_list = [(p.symbol, p.quantity, p.market_value) for p in positions]
+
+            if not confirm:
+                # Dry run - just show what would happen
+                sell_info = ", ".join(f"{s[0]}:{s[1]:.0f}" for s in sell_list)
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=f"Would sell: {sell_info} (${total_value:,.2f}). Use --confirm to execute.",
+                    data={
+                        "dry_run": True,
+                        "positions": [{"symbol": s, "qty": q, "value": v} for s, q, v in sell_list],
+                        "total_value": total_value,
+                    },
+                )
+
+            # Execute liquidation
+            self._liquidation_in_progress = True
+            logger.warning(f"LIQUIDATION: Selling {len(positions)} positions (${total_value:,.2f})")
+
+            order_ids = []
+            errors = []
+
+            for pos in positions:
+                if pos.contract and pos.quantity > 0:
+                    order_id = self.portfolio.place_market_order(
+                        contract=pos.contract,
+                        action="SELL",
+                        quantity=pos.quantity,
+                    )
+                    if order_id:
+                        order_ids.append(order_id)
+                        logger.info(f"Liquidate: SELL {pos.quantity} {pos.symbol} (order {order_id})")
+                    else:
+                        errors.append(f"Failed to place order for {pos.symbol}")
+
+            self._liquidation_in_progress = False
+
+            if errors:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Partial liquidation: {len(order_ids)} orders placed, {len(errors)} failed",
+                    data={"order_ids": order_ids, "errors": errors},
+                )
+
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Liquidation initiated: {len(order_ids)} sell orders placed",
+                data={"order_ids": order_ids, "total_value": total_value},
+            )
+
+        except Exception as e:
+            self._liquidation_in_progress = False
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Liquidation failed: {e}",
+            )
+
+    def handle_sell(self, args: List[str]) -> CommandResult:
+        """
+        Handle 'sell' command - sell a specific position.
+
+        Usage:
+            sell SYMBOL QTY         - Sell QTY shares of SYMBOL
+            sell SYMBOL all         - Sell entire position
+            sell SYMBOL QTY --confirm  - Execute without dry-run
+        """
+        if len(args) < 2:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Usage: sell SYMBOL QTY [--confirm]",
+            )
+
+        symbol = args[0].upper()
+        qty_arg = args[1].lower()
+        confirm = "--confirm" in args
+
+        pos = self.portfolio.get_position(symbol)
+        if not pos:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"No position in {symbol}",
+            )
+
+        if qty_arg == "all":
+            quantity = pos.quantity
+        else:
+            try:
+                quantity = float(qty_arg)
+            except ValueError:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Invalid quantity: {qty_arg}",
+                )
+
+        if quantity > pos.quantity:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Cannot sell {quantity}, only have {pos.quantity}",
+            )
+
+        est_value = quantity * pos.current_price
+
+        if not confirm:
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Would sell {quantity:.0f} {symbol} (~${est_value:,.2f}). Use --confirm to execute.",
+                data={"dry_run": True, "symbol": symbol, "quantity": quantity, "est_value": est_value},
+            )
+
+        order_id = self.portfolio.place_market_order(
+            contract=pos.contract,
+            action="SELL",
+            quantity=quantity,
+        )
+
+        if order_id:
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Sell order placed: {quantity:.0f} {symbol} (order {order_id})",
+                data={"order_id": order_id, "symbol": symbol, "quantity": quantity},
+            )
+        else:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Failed to place sell order for {symbol}",
+            )
+
+    def handle_buy(self, args: List[str]) -> CommandResult:
+        """
+        Handle 'buy' command - buy shares of a symbol.
+
+        Usage:
+            buy SYMBOL QTY --confirm  - Buy QTY shares of SYMBOL
+        """
+        if len(args) < 2:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Usage: buy SYMBOL QTY [--confirm]",
+            )
+
+        symbol = args[0].upper()
+        confirm = "--confirm" in args
+
+        try:
+            quantity = float(args[1])
+        except ValueError:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Invalid quantity: {args[1]}",
+            )
+
+        # Get contract from existing position or create new one
+        pos = self.portfolio.get_position(symbol)
+        if pos and pos.contract:
+            contract = pos.contract
+            est_price = pos.current_price
+        else:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"No existing position for {symbol}. Cannot determine contract.",
+            )
+
+        est_value = quantity * est_price
+
+        if not confirm:
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Would buy {quantity:.0f} {symbol} (~${est_value:,.2f}). Use --confirm to execute.",
+                data={"dry_run": True, "symbol": symbol, "quantity": quantity, "est_value": est_value},
+            )
+
+        order_id = self.portfolio.place_market_order(
+            contract=contract,
+            action="BUY",
+            quantity=quantity,
+        )
+
+        if order_id:
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Buy order placed: {quantity:.0f} {symbol} (order {order_id})",
+                data={"order_id": order_id, "symbol": symbol, "quantity": quantity},
+            )
+        else:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Failed to place buy order for {symbol}",
+            )
+
+    def handle_stop(self, args: List[str]) -> CommandResult:
+        """Handle 'stop' or 'shutdown' command - initiate graceful shutdown"""
+        logger.info("Shutdown requested via command")
+        self.shutdown_mgr._shutdown_event.set()
+        self.shutdown_mgr._cleanup()
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message="Shutdown initiated",
+        )
+
+
+# Global command server instance
+command_server: Optional[CommandServer] = None
 
 
 # =============================================================================
@@ -460,11 +797,23 @@ Examples:
         help="Minimal output"
     )
 
+    # Command server options
+    parser.add_argument(
+        "--socket", default=DEFAULT_SOCKET_PATH,
+        help=f"Unix socket path for commands (default: {DEFAULT_SOCKET_PATH})"
+    )
+    parser.add_argument(
+        "--no-server", action="store_true",
+        help="Disable command server"
+    )
+
     return parser.parse_args()
 
 
 def main():
     """Main entry point"""
+    global command_server
+
     args = parse_args()
 
     # Configure logging level
@@ -511,6 +860,16 @@ def main():
         if shutdown_manager.should_shutdown:
             return
 
+        # Start command server (unless disabled)
+        if not args.no_server:
+            command_server = CommandServer(socket_path=args.socket)
+            command_handler = CommandHandler(portfolio, shutdown_manager)
+            command_handler.register_commands(command_server)
+            if command_server.start():
+                logger.info(f"Command server listening on {args.socket}")
+            else:
+                logger.warning("Failed to start command server")
+
         # Show portfolio
         show_portfolio(portfolio)
 
@@ -534,6 +893,9 @@ def main():
         # This may happen if signal handler hasn't fully processed
         logger.info("Interrupted")
     finally:
+        # Stop command server
+        if command_server:
+            command_server.stop()
         portfolio.disconnect()
         shutdown_manager.restore_handlers()
 
