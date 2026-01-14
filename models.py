@@ -51,6 +51,30 @@ class RebalanceStrategy(Enum):
     HYBRID = "hybrid"            # Combination of strategies
 
 
+class BarSize(Enum):
+    """Available bar sizes for streaming"""
+    SEC_5 = "5 secs"          # Only size available for realTimeBars
+    SEC_10 = "10 secs"
+    SEC_15 = "15 secs"
+    SEC_30 = "30 secs"
+    MIN_1 = "1 min"
+    MIN_2 = "2 mins"
+    MIN_3 = "3 mins"
+    MIN_5 = "5 mins"
+    MIN_10 = "10 mins"
+    MIN_15 = "15 mins"
+    MIN_20 = "20 mins"
+    MIN_30 = "30 mins"
+    HOUR_1 = "1 hour"
+    HOUR_2 = "2 hours"
+    HOUR_3 = "3 hours"
+    HOUR_4 = "4 hours"
+    HOUR_8 = "8 hours"
+    DAY_1 = "1 day"
+    WEEK_1 = "1 week"
+    MONTH_1 = "1 month"
+
+
 @dataclass
 class Position:
     """Represents a portfolio position with market data"""
@@ -100,6 +124,65 @@ class Position:
     def __repr__(self):
         return (f"Position({self.symbol}, qty={self.quantity}, "
                 f"price=${self.current_price:.2f}, value=${self.market_value:.2f})")
+
+
+@dataclass
+class Bar:
+    """Represents an OHLCV bar (candlestick)"""
+    symbol: str
+    timestamp: str              # ISO format timestamp
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int = 0
+    wap: float = 0.0           # Weighted average price
+    bar_count: int = 0         # Number of trades in bar
+
+    @property
+    def range(self) -> float:
+        """Price range of the bar"""
+        return self.high - self.low
+
+    @property
+    def body(self) -> float:
+        """Body size (absolute difference between open and close)"""
+        return abs(self.close - self.open)
+
+    @property
+    def is_bullish(self) -> bool:
+        """True if close > open"""
+        return self.close > self.open
+
+    @property
+    def is_bearish(self) -> bool:
+        """True if close < open"""
+        return self.close < self.open
+
+    @property
+    def mid(self) -> float:
+        """Midpoint of high and low"""
+        return (self.high + self.low) / 2
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        return {
+            "symbol": self.symbol,
+            "timestamp": self.timestamp,
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
+            "volume": self.volume,
+            "wap": self.wap,
+            "bar_count": self.bar_count,
+        }
+
+    def __repr__(self):
+        direction = "+" if self.is_bullish else "-"
+        return (f"Bar({self.symbol} {self.timestamp} "
+                f"O:{self.open:.2f} H:{self.high:.2f} L:{self.low:.2f} C:{self.close:.2f} "
+                f"V:{self.volume} {direction})")
 
 
 @dataclass

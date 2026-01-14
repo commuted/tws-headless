@@ -15,7 +15,7 @@ from ibapi.ticktype import TickTypeEnum
 from ibapi.account_summary_tags import AccountSummaryTags
 
 from .client import IBClient
-from .models import Position, AssetType, AccountSummary
+from .models import Position, AssetType, AccountSummary, Bar, BarSize
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +76,19 @@ class Portfolio(IBClient):
         self._market_data_pending = 0
         self._market_data_received = 0
 
-        # Streaming market data
+        # Streaming market data (ticks)
         self._streaming: bool = False
         self._stream_subscriptions: Dict[int, str] = {}  # reqId -> symbol
         self._stream_req_ids: Dict[str, int] = {}  # symbol -> reqId
         self._on_tick: Optional[Callable[[str, float, str], None]] = None
         self._last_prices: Dict[str, Dict[str, float]] = {}  # symbol -> {type: price}
+
+        # Streaming bar data
+        self._bar_streaming: bool = False
+        self._bar_subscriptions: Dict[int, str] = {}  # reqId -> symbol
+        self._bar_req_ids: Dict[str, int] = {}  # symbol -> reqId
+        self._on_bar: Optional[Callable[[Bar], None]] = None
+        self._last_bars: Dict[str, Bar] = {}  # symbol -> last bar
 
         # Account data
         self._account_summary: Dict[str, AccountSummary] = {}
@@ -113,6 +120,16 @@ class Portfolio(IBClient):
         """Get list of symbols currently being streamed"""
         return list(self._stream_subscriptions.values())
 
+    @property
+    def is_bar_streaming(self) -> bool:
+        """Check if bar streaming is active"""
+        return self._bar_streaming and len(self._bar_subscriptions) > 0
+
+    @property
+    def bar_streaming_symbols(self) -> List[str]:
+        """Get list of symbols currently streaming bars"""
+        return list(self._bar_subscriptions.values())
+
     def get_position(self, symbol: str) -> Optional[Position]:
         """Get a specific position by symbol"""
         with self._positions_lock:
@@ -132,6 +149,18 @@ class Portfolio(IBClient):
         if symbol in self._last_prices:
             return self._last_prices[symbol].get(tick_type)
         return None
+
+    def get_last_bar(self, symbol: str) -> Optional[Bar]:
+        """
+        Get the last received bar for a symbol.
+
+        Args:
+            symbol: The symbol to get bar for
+
+        Returns:
+            Last Bar or None if not available
+        """
+        return self._last_bars.get(symbol)
 
     def get_account_summary(self, account: Optional[str] = None) -> Optional[AccountSummary]:
         """
@@ -323,6 +352,152 @@ class Portfolio(IBClient):
 
         logger.debug(f"Stopped stream for {symbol}")
 
+    # =========================================================================
+    # Streaming Bar Data (5-second real-time bars)
+    # =========================================================================
+
+    def start_bar_streaming(
+        self,
+        on_bar: Optional[Callable[[Bar], None]] = None,
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+    ) -> bool:
+        """
+        Start streaming 5-second bars for all portfolio positions.
+
+        Uses IB's reqRealTimeBars which provides 5-second OHLCV bars.
+        This is the only bar size available for real-time streaming.
+        For other bar sizes, use historical data with keepUpToDate=True.
+
+        Args:
+            on_bar: Callback function(bar: Bar) called on each new bar
+            what_to_show: Type of data - TRADES, MIDPOINT, BID, ASK
+            use_rth: Use regular trading hours only
+
+        Returns:
+            True if streaming started successfully
+        """
+        if not self.connected:
+            logger.error("Not connected to IB")
+            return False
+
+        if not self._positions:
+            logger.warning("No positions to stream - load portfolio first")
+            return False
+
+        if self._bar_streaming:
+            logger.warning("Already streaming bars - stop first")
+            return False
+
+        self._on_bar = on_bar
+        self._bar_streaming = True
+
+        logger.info(f"Starting bar streams for {len(self._positions)} positions...")
+
+        for symbol, pos in self._positions.items():
+            if pos.contract:
+                self._start_bar_stream(symbol, pos.contract, what_to_show, use_rth)
+
+        logger.info(f"Streaming bars for {len(self._bar_subscriptions)} symbols")
+        return True
+
+    def _start_bar_stream(
+        self,
+        symbol: str,
+        contract: Contract,
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+    ) -> int:
+        """Start bar streaming for a single symbol"""
+        req_id = self.get_next_req_id()
+
+        self._bar_subscriptions[req_id] = symbol
+        self._bar_req_ids[symbol] = req_id
+
+        # Request real-time 5-second bars
+        # barSize is always 5 seconds for reqRealTimeBars
+        self.reqRealTimeBars(
+            req_id,
+            contract,
+            5,  # bar size in seconds (must be 5)
+            what_to_show,
+            use_rth,
+            [],  # realTimeBarsOptions
+        )
+
+        logger.debug(f"Started bar stream for {symbol} (reqId={req_id})")
+        return req_id
+
+    def stop_bar_streaming(self):
+        """Stop all bar streaming subscriptions"""
+        if not self._bar_streaming:
+            return
+
+        logger.info(f"Stopping {len(self._bar_subscriptions)} bar streams...")
+
+        for req_id, symbol in list(self._bar_subscriptions.items()):
+            self.cancelRealTimeBars(req_id)
+            logger.debug(f"Stopped bar stream for {symbol}")
+
+        self._bar_subscriptions.clear()
+        self._bar_req_ids.clear()
+        self._bar_streaming = False
+        self._on_bar = None
+
+        logger.info("All bar streams stopped")
+
+    def bar_stream_symbol(
+        self,
+        symbol: str,
+        contract: Optional[Contract] = None,
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+    ) -> bool:
+        """
+        Add a single symbol to bar streaming.
+
+        Args:
+            symbol: Symbol to stream
+            contract: IB Contract (uses position's contract if None)
+            what_to_show: Type of data - TRADES, MIDPOINT, BID, ASK
+            use_rth: Use regular trading hours only
+
+        Returns:
+            True if added successfully
+        """
+        if not self.connected:
+            return False
+
+        # Get contract from position if not provided
+        if contract is None:
+            pos = self.get_position(symbol)
+            if pos and pos.contract:
+                contract = pos.contract
+            else:
+                logger.error(f"No contract for {symbol}")
+                return False
+
+        if symbol in self._bar_req_ids:
+            logger.debug(f"{symbol} already streaming bars")
+            return True
+
+        self._bar_streaming = True
+        self._start_bar_stream(symbol, contract, what_to_show, use_rth)
+        return True
+
+    def unstream_bar_symbol(self, symbol: str):
+        """Remove a single symbol from bar streaming"""
+        if symbol not in self._bar_req_ids:
+            return
+
+        req_id = self._bar_req_ids[symbol]
+        self.cancelRealTimeBars(req_id)
+
+        del self._bar_subscriptions[req_id]
+        del self._bar_req_ids[symbol]
+
+        logger.debug(f"Stopped bar stream for {symbol}")
+
     def _fetch_market_data(self, timeout: float = 30.0):
         """Fetch market data for all positions"""
         self._market_data_requests.clear()
@@ -490,6 +665,63 @@ class Portfolio(IBClient):
             self._market_data_received += 1
             if self._market_data_received >= self._market_data_pending:
                 self._market_data_done.set()
+
+    # =========================================================================
+    # EWrapper Callbacks for Real-Time Bars
+    # =========================================================================
+
+    def realtimeBar(
+        self,
+        reqId: int,
+        time: int,
+        open_: float,
+        high: float,
+        low: float,
+        close: float,
+        volume: int,
+        wap: float,
+        count: int,
+    ):
+        """Handle real-time bar data (5-second bars)"""
+        if reqId not in self._bar_subscriptions:
+            return
+
+        symbol = self._bar_subscriptions[reqId]
+
+        # Convert Unix timestamp to ISO format
+        timestamp = datetime.fromtimestamp(time).isoformat()
+
+        bar = Bar(
+            symbol=symbol,
+            timestamp=timestamp,
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
+            volume=volume,
+            wap=wap,
+            bar_count=count,
+        )
+
+        # Store last bar
+        self._last_bars[symbol] = bar
+
+        # Update position with close price
+        with self._positions_lock:
+            if symbol in self._positions:
+                self._positions[symbol].update_market_data(close)
+                self._calculate_allocations()
+
+        # Call the callback if registered
+        if self._on_bar:
+            try:
+                self._on_bar(bar)
+            except Exception as e:
+                logger.error(f"Error in bar callback: {e}")
+
+        # Also invoke registered callback
+        if "bar" in self._callbacks:
+            self._callbacks["bar"](bar)
 
     # =========================================================================
     # EWrapper Callbacks for Account Summary

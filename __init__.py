@@ -36,6 +36,8 @@ __version__ = "0.1.0"
 # Core classes
 from .models import (
     Position,
+    Bar,
+    BarSize,
     TargetAllocation,
     RebalanceTrade,
     RebalanceResult,
@@ -66,6 +68,8 @@ __all__ = [
     "__version__",
     # Models
     "Position",
+    "Bar",
+    "BarSize",
     "TargetAllocation",
     "RebalanceTrade",
     "RebalanceResult",

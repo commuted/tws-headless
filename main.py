@@ -4,7 +4,8 @@ main.py - Entry point for IB Portfolio Rebalancer
 
 Usage:
     python main.py                    # Show portfolio
-    python main.py --stream           # Stream live prices
+    python main.py --stream           # Stream live tick prices
+    python main.py --bars             # Stream 5-second OHLCV bars
     python main.py --rebalance        # Calculate rebalance
     python main.py --execute          # Execute rebalance (requires confirmation)
 """
@@ -25,7 +26,7 @@ from rebalancer import (
     create_three_fund_targets,
     create_equal_weight_targets,
 )
-from models import TargetAllocation, AssetType, RebalanceStrategy
+from models import TargetAllocation, AssetType, RebalanceStrategy, Bar
 
 # Configure logging
 logging.basicConfig(
@@ -173,6 +174,73 @@ def stream_prices(portfolio: Portfolio, duration: int = 0) -> None:
     print("=" * 70)
 
 
+def stream_bars(portfolio: Portfolio, duration: int = 0) -> None:
+    """
+    Stream 5-second OHLCV bars for all portfolio positions.
+
+    Args:
+        portfolio: Connected portfolio instance
+        duration: Duration in seconds (0 = until interrupted)
+    """
+    # Track for clean shutdown
+    running = True
+
+    def signal_handler(sig, frame):
+        nonlocal running
+        print("\nStopping bar streams...")
+        running = False
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Bar counter for stats
+    bar_count = 0
+    start_time = time.time()
+
+    def on_bar(bar: Bar):
+        """Callback for each new bar"""
+        nonlocal bar_count
+        bar_count += 1
+
+        # Format timestamp to just time
+        bar_time = bar.timestamp.split("T")[1] if "T" in bar.timestamp else bar.timestamp
+
+        # Direction indicator
+        direction = "+" if bar.is_bullish else "-"
+
+        pos = portfolio.get_position(bar.symbol)
+        pnl = pos.unrealized_pnl if pos else 0
+
+        print(f"[{bar_time}] {bar.symbol:8} "
+              f"O:{bar.open:>8.2f} H:{bar.high:>8.2f} L:{bar.low:>8.2f} C:{bar.close:>8.2f} "
+              f"V:{bar.volume:>8} {direction} P&L: ${pnl:>10.2f}")
+
+    print("\n" + "=" * 100)
+    print("STREAMING 5-SECOND BARS (Ctrl+C to stop)")
+    print("=" * 100)
+    print(f"{'Time':<12} {'Symbol':<8} {'Open':>10} {'High':>10} {'Low':>10} "
+          f"{'Close':>10} {'Volume':>10} {'':>3} {'P&L':>14}")
+    print("-" * 100)
+
+    # Start bar streaming
+    portfolio.start_bar_streaming(on_bar=on_bar, what_to_show="TRADES", use_rth=False)
+
+    try:
+        if duration > 0:
+            time.sleep(duration)
+        else:
+            while running:
+                time.sleep(0.1)
+    finally:
+        portfolio.stop_bar_streaming()
+
+    # Stats
+    elapsed = time.time() - start_time
+    print("-" * 100)
+    print(f"Streamed {bar_count} bars in {elapsed:.1f}s "
+          f"({bar_count/elapsed:.2f} bars/sec, ~{bar_count/len(portfolio.positions):.0f} per symbol)")
+    print("=" * 100)
+
+
 def calculate_rebalance(
     portfolio: Portfolio,
     targets: List[TargetAllocation],
@@ -233,7 +301,8 @@ def parse_args():
         epilog="""
 Examples:
   %(prog)s                      Show current portfolio
-  %(prog)s --stream             Stream live prices for all positions
+  %(prog)s --stream             Stream live tick prices for all positions
+  %(prog)s --bars               Stream 5-second OHLCV bars for all positions
   %(prog)s --stream --duration 60  Stream for 60 seconds
   %(prog)s --rebalance          Calculate rebalancing trades
   %(prog)s --rebalance --execute Execute trades (with confirmation)
@@ -259,7 +328,11 @@ Examples:
     # Actions
     parser.add_argument(
         "--stream", action="store_true",
-        help="Stream live prices for all portfolio positions"
+        help="Stream live tick prices for all portfolio positions"
+    )
+    parser.add_argument(
+        "--bars", action="store_true",
+        help="Stream 5-second OHLCV bars for all portfolio positions"
     )
     parser.add_argument(
         "--duration", type=int, default=0,
@@ -342,9 +415,12 @@ def main():
         # Show portfolio
         show_portfolio(portfolio)
 
-        # Streaming mode
+        # Streaming modes
         if args.stream:
             stream_prices(portfolio, duration=args.duration)
+
+        elif args.bars:
+            stream_bars(portfolio, duration=args.duration)
 
         # Rebalance actions
         elif args.rebalance:
