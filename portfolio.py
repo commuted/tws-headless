@@ -170,6 +170,11 @@ class Portfolio(IBClient):
         """
         return self._last_bars.get(symbol)
 
+    @property
+    def is_shutting_down(self) -> bool:
+        """Check if shutdown is in progress"""
+        return getattr(self, '_shutting_down', False)
+
     def get_account_summary(self, account: Optional[str] = None) -> Optional[AccountSummary]:
         """
         Get account summary.
@@ -180,6 +185,52 @@ class Portfolio(IBClient):
         if account is None and self.managed_accounts:
             account = self.managed_accounts[0]
         return self._account_summary.get(account)
+
+    def shutdown(self):
+        """
+        Gracefully shutdown all portfolio operations.
+
+        Stops all streams, cancels pending orders, and disconnects.
+        Call this on SIGINT for orderly shutdown.
+        """
+        if getattr(self, '_shutting_down', False):
+            return  # Already shutting down
+        self._shutting_down = True
+
+        logger.info("Portfolio shutdown initiated...")
+
+        # Stop tick streaming
+        if self._streaming:
+            try:
+                self.stop_streaming()
+            except Exception as e:
+                logger.error(f"Error stopping tick streams: {e}")
+
+        # Stop bar streaming
+        if self._bar_streaming:
+            try:
+                self.stop_bar_streaming()
+            except Exception as e:
+                logger.error(f"Error stopping bar streams: {e}")
+
+        # Cancel pending market data requests
+        for req_id in list(self._market_data_requests.keys()):
+            try:
+                self.cancelMktData(req_id)
+            except Exception:
+                pass
+        self._market_data_requests.clear()
+        self._market_data_done.set()
+
+        # Signal any waiting operations to complete
+        self._positions_done.set()
+        self._account_summary_done.set()
+
+        # Signal pending order events
+        for event in self._pending_orders.values():
+            event.set()
+
+        logger.info("Portfolio shutdown complete")
 
     def load(
         self,

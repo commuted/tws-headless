@@ -11,12 +11,14 @@ Usage:
 """
 
 import argparse
+import atexit
 import logging
 import signal
 import sys
 import time
 from datetime import datetime
-from typing import List
+from threading import Event
+from typing import List, Optional
 
 from portfolio import Portfolio
 from rebalancer import (
@@ -35,6 +37,112 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Shutdown Management
+# =============================================================================
+
+class ShutdownManager:
+    """
+    Manages graceful shutdown on SIGINT/SIGTERM.
+
+    Provides a centralized way to handle shutdown signals and
+    coordinate cleanup across the application.
+    """
+
+    def __init__(self):
+        self._shutdown_event = Event()
+        self._portfolio: Optional[Portfolio] = None
+        self._original_sigint = None
+        self._original_sigterm = None
+        self._sigint_count = 0
+
+    @property
+    def should_shutdown(self) -> bool:
+        """Check if shutdown has been requested"""
+        return self._shutdown_event.is_set()
+
+    def register_portfolio(self, portfolio: Portfolio):
+        """Register the portfolio instance for cleanup"""
+        self._portfolio = portfolio
+
+    def install_handlers(self):
+        """Install signal handlers for SIGINT and SIGTERM"""
+        self._original_sigint = signal.signal(signal.SIGINT, self._signal_handler)
+        self._original_sigterm = signal.signal(signal.SIGTERM, self._signal_handler)
+        atexit.register(self._cleanup)
+
+    def restore_handlers(self):
+        """Restore original signal handlers"""
+        if self._original_sigint:
+            signal.signal(signal.SIGINT, self._original_sigint)
+        if self._original_sigterm:
+            signal.signal(signal.SIGTERM, self._original_sigterm)
+
+    def _signal_handler(self, signum, frame):
+        """Handle SIGINT/SIGTERM signals"""
+        self._sigint_count += 1
+        sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+
+        if self._sigint_count == 1:
+            print(f"\n{sig_name} received. Shutting down gracefully...")
+            self._shutdown_event.set()
+            self._cleanup()
+        elif self._sigint_count == 2:
+            print("\nSecond interrupt received. Forcing disconnect...")
+            if self._portfolio:
+                try:
+                    self._portfolio.disconnect()
+                except Exception:
+                    pass
+        else:
+            print("\nForce exit.")
+            sys.exit(1)
+
+    def _cleanup(self):
+        """Perform cleanup operations"""
+        if self._portfolio:
+            try:
+                self._portfolio.shutdown()
+            except Exception as e:
+                logger.debug(f"Error during portfolio shutdown: {e}")
+
+    def wait(self, timeout: float = None) -> bool:
+        """
+        Wait for shutdown signal.
+
+        Args:
+            timeout: Maximum time to wait (None = forever)
+
+        Returns:
+            True if shutdown was signaled, False if timeout
+        """
+        return self._shutdown_event.wait(timeout=timeout)
+
+    def wait_interruptible(self, duration: float = 0, poll_interval: float = 0.1):
+        """
+        Wait for specified duration or until shutdown.
+
+        Args:
+            duration: Time to wait in seconds (0 = until shutdown)
+            poll_interval: How often to check for shutdown
+        """
+        if duration > 0:
+            start = time.time()
+            while not self.should_shutdown:
+                elapsed = time.time() - start
+                if elapsed >= duration:
+                    break
+                remaining = min(poll_interval, duration - elapsed)
+                time.sleep(remaining)
+        else:
+            while not self.should_shutdown:
+                time.sleep(poll_interval)
+
+
+# Global shutdown manager instance
+shutdown_manager = ShutdownManager()
 
 
 # =============================================================================
@@ -125,16 +233,6 @@ def stream_prices(portfolio: Portfolio, duration: int = 0) -> None:
         portfolio: Connected portfolio instance
         duration: Duration in seconds (0 = until interrupted)
     """
-    # Track for clean shutdown
-    running = True
-
-    def signal_handler(sig, frame):
-        nonlocal running
-        print("\nStopping streams...")
-        running = False
-
-    signal.signal(signal.SIGINT, signal_handler)
-
     # Tick counter for stats
     tick_count = 0
     start_time = time.time()
@@ -158,20 +256,18 @@ def stream_prices(portfolio: Portfolio, duration: int = 0) -> None:
     portfolio.start_streaming(on_tick=on_tick, use_delayed=True)
 
     try:
-        if duration > 0:
-            time.sleep(duration)
-        else:
-            while running:
-                time.sleep(0.1)
+        # Use global shutdown manager for interruptible wait
+        shutdown_manager.wait_interruptible(duration=duration)
     finally:
         portfolio.stop_streaming()
 
     # Stats
     elapsed = time.time() - start_time
-    print("-" * 70)
-    print(f"Streamed {tick_count} ticks in {elapsed:.1f}s "
-          f"({tick_count/elapsed:.1f} ticks/sec)")
-    print("=" * 70)
+    if elapsed > 0:
+        print("-" * 70)
+        print(f"Streamed {tick_count} ticks in {elapsed:.1f}s "
+              f"({tick_count/elapsed:.1f} ticks/sec)")
+        print("=" * 70)
 
 
 def stream_bars(portfolio: Portfolio, duration: int = 0) -> None:
@@ -182,16 +278,6 @@ def stream_bars(portfolio: Portfolio, duration: int = 0) -> None:
         portfolio: Connected portfolio instance
         duration: Duration in seconds (0 = until interrupted)
     """
-    # Track for clean shutdown
-    running = True
-
-    def signal_handler(sig, frame):
-        nonlocal running
-        print("\nStopping bar streams...")
-        running = False
-
-    signal.signal(signal.SIGINT, signal_handler)
-
     # Bar counter for stats
     bar_count = 0
     start_time = time.time()
@@ -225,20 +311,19 @@ def stream_bars(portfolio: Portfolio, duration: int = 0) -> None:
     portfolio.start_bar_streaming(on_bar=on_bar, what_to_show="TRADES", use_rth=False)
 
     try:
-        if duration > 0:
-            time.sleep(duration)
-        else:
-            while running:
-                time.sleep(0.1)
+        # Use global shutdown manager for interruptible wait
+        shutdown_manager.wait_interruptible(duration=duration)
     finally:
         portfolio.stop_bar_streaming()
 
     # Stats
     elapsed = time.time() - start_time
-    print("-" * 100)
-    print(f"Streamed {bar_count} bars in {elapsed:.1f}s "
-          f"({bar_count/elapsed:.2f} bars/sec, ~{bar_count/len(portfolio.positions):.0f} per symbol)")
-    print("=" * 100)
+    num_positions = len(portfolio.positions) or 1  # Avoid division by zero
+    if elapsed > 0:
+        print("-" * 100)
+        print(f"Streamed {bar_count} bars in {elapsed:.1f}s "
+              f"({bar_count/elapsed:.2f} bars/sec, ~{bar_count/num_positions:.0f} per symbol)")
+        print("=" * 100)
 
 
 def calculate_rebalance(
@@ -388,6 +473,9 @@ def main():
     elif args.quiet:
         logging.getLogger().setLevel(logging.WARNING)
 
+    # Install signal handlers for graceful shutdown
+    shutdown_manager.install_handlers()
+
     # Create rebalance config
     config = RebalanceConfig(
         drift_threshold_pct=args.threshold,
@@ -403,14 +491,25 @@ def main():
         client_id=args.client_id,
     )
 
+    # Register portfolio with shutdown manager for cleanup
+    shutdown_manager.register_portfolio(portfolio)
+
     if not portfolio.connect():
         logger.error("Failed to connect to IB")
         sys.exit(1)
 
     try:
+        # Check for early shutdown
+        if shutdown_manager.should_shutdown:
+            return
+
         # Load portfolio data
         logger.info("Loading portfolio data...")
         portfolio.load(fetch_prices=True, fetch_account=True)
+
+        # Check for early shutdown
+        if shutdown_manager.should_shutdown:
+            return
 
         # Show portfolio
         show_portfolio(portfolio)
@@ -431,8 +530,12 @@ def main():
             else:
                 calculate_rebalance(portfolio, DEFAULT_TARGETS, config)
 
+    except KeyboardInterrupt:
+        # This may happen if signal handler hasn't fully processed
+        logger.info("Interrupted")
     finally:
         portfolio.disconnect()
+        shutdown_manager.restore_handlers()
 
 
 if __name__ == "__main__":
