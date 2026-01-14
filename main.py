@@ -4,13 +4,17 @@ main.py - Entry point for IB Portfolio Rebalancer
 
 Usage:
     python main.py                    # Show portfolio
+    python main.py --stream           # Stream live prices
     python main.py --rebalance        # Calculate rebalance
     python main.py --execute          # Execute rebalance (requires confirmation)
 """
 
 import argparse
 import logging
+import signal
 import sys
+import time
+from datetime import datetime
 from typing import List
 
 from portfolio import Portfolio
@@ -112,6 +116,63 @@ def show_targets(targets: List[TargetAllocation]) -> None:
     print("=" * 50)
 
 
+def stream_prices(portfolio: Portfolio, duration: int = 0) -> None:
+    """
+    Stream live prices for all portfolio positions.
+
+    Args:
+        portfolio: Connected portfolio instance
+        duration: Duration in seconds (0 = until interrupted)
+    """
+    # Track for clean shutdown
+    running = True
+
+    def signal_handler(sig, frame):
+        nonlocal running
+        print("\nStopping streams...")
+        running = False
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Tick counter for stats
+    tick_count = 0
+    start_time = time.time()
+
+    def on_tick(symbol: str, price: float, tick_type: str):
+        """Callback for each price tick"""
+        nonlocal tick_count
+        tick_count += 1
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        pos = portfolio.get_position(symbol)
+        pnl = pos.unrealized_pnl if pos else 0
+        print(f"[{timestamp}] {symbol:8} {tick_type:12} ${price:>10.2f}  P&L: ${pnl:>10.2f}")
+
+    print("\n" + "=" * 70)
+    print("STREAMING PRICES (Ctrl+C to stop)")
+    print("=" * 70)
+    print(f"{'Time':<15} {'Symbol':<8} {'Type':<12} {'Price':>12}  {'P&L':>14}")
+    print("-" * 70)
+
+    # Start streaming
+    portfolio.start_streaming(on_tick=on_tick, use_delayed=True)
+
+    try:
+        if duration > 0:
+            time.sleep(duration)
+        else:
+            while running:
+                time.sleep(0.1)
+    finally:
+        portfolio.stop_streaming()
+
+    # Stats
+    elapsed = time.time() - start_time
+    print("-" * 70)
+    print(f"Streamed {tick_count} ticks in {elapsed:.1f}s "
+          f"({tick_count/elapsed:.1f} ticks/sec)")
+    print("=" * 70)
+
+
 def calculate_rebalance(
     portfolio: Portfolio,
     targets: List[TargetAllocation],
@@ -172,6 +233,8 @@ def parse_args():
         epilog="""
 Examples:
   %(prog)s                      Show current portfolio
+  %(prog)s --stream             Stream live prices for all positions
+  %(prog)s --stream --duration 60  Stream for 60 seconds
   %(prog)s --rebalance          Calculate rebalancing trades
   %(prog)s --rebalance --execute Execute trades (with confirmation)
   %(prog)s --threshold 3.0      Set drift threshold to 3%%
@@ -194,6 +257,14 @@ Examples:
     )
 
     # Actions
+    parser.add_argument(
+        "--stream", action="store_true",
+        help="Stream live prices for all portfolio positions"
+    )
+    parser.add_argument(
+        "--duration", type=int, default=0,
+        help="Stream duration in seconds (0 = until Ctrl+C)"
+    )
     parser.add_argument(
         "--rebalance", action="store_true",
         help="Calculate rebalancing trades"
@@ -271,8 +342,12 @@ def main():
         # Show portfolio
         show_portfolio(portfolio)
 
+        # Streaming mode
+        if args.stream:
+            stream_prices(portfolio, duration=args.duration)
+
         # Rebalance actions
-        if args.rebalance:
+        elif args.rebalance:
             show_targets(DEFAULT_TARGETS)
 
             if args.execute:
