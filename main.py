@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+main.py - Entry point for IB Portfolio Rebalancer
+
+Usage:
+    python main.py                    # Show portfolio
+    python main.py --rebalance        # Calculate rebalance
+    python main.py --execute          # Execute rebalance (requires confirmation)
+"""
+
+import argparse
+import logging
+import sys
+from typing import List
+
+from portfolio import Portfolio
+from rebalancer import (
+    Rebalancer,
+    RebalanceConfig,
+    create_60_40_targets,
+    create_three_fund_targets,
+    create_equal_weight_targets,
+)
+from models import TargetAllocation, AssetType, RebalanceStrategy
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Default connection settings
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 7497  # TWS paper trading
+DEFAULT_CLIENT_ID = 1
+
+# Example target allocations - customize for your portfolio
+DEFAULT_TARGETS = create_three_fund_targets(
+    us_pct=50.0,
+    intl_pct=30.0,
+    bond_pct=20.0,
+)
+
+# Alternative: Equal weight example
+# DEFAULT_TARGETS = create_equal_weight_targets(["SPY", "QQQ", "IWM", "EFA", "BND"])
+
+
+# =============================================================================
+# Main Functions
+# =============================================================================
+
+def show_portfolio(portfolio: Portfolio) -> None:
+    """Display current portfolio positions"""
+    print("\n" + "=" * 80)
+    print("PORTFOLIO POSITIONS")
+    print("=" * 80)
+
+    positions = portfolio.positions
+    if not positions:
+        print("No positions found")
+        return
+
+    # Sort by market value
+    positions = sorted(positions, key=lambda p: p.market_value, reverse=True)
+
+    # Header
+    print(f"{'Symbol':<8} {'Type':<6} {'Qty':>10} {'Price':>12} "
+          f"{'Value':>14} {'P&L':>12} {'Alloc':>8}")
+    print("-" * 80)
+
+    # Positions
+    for pos in positions:
+        print(f"{pos.symbol:<8} {pos.asset_type.value:<6} {pos.quantity:>10,.0f} "
+              f"${pos.current_price:>10,.2f} ${pos.market_value:>12,.2f} "
+              f"${pos.unrealized_pnl:>10,.2f} {pos.allocation_pct:>7.1f}%")
+
+    # Summary
+    print("-" * 80)
+    total_value = portfolio.total_value
+    total_pnl = portfolio.total_pnl
+    print(f"{'TOTAL':<8} {'':<6} {'':>10} {'':>12} "
+          f"${total_value:>12,.2f} ${total_pnl:>10,.2f} {'100.0':>7}%")
+    print("=" * 80)
+
+    # Account summary
+    account = portfolio.get_account_summary()
+    if account and account.is_valid:
+        print(f"\nAccount: {account.account_id}")
+        print(f"  Net Liquidation: ${account.net_liquidation:,.2f}")
+        print(f"  Available Funds: ${account.available_funds:,.2f}")
+        print(f"  Buying Power:    ${account.buying_power:,.2f}")
+
+
+def show_targets(targets: List[TargetAllocation]) -> None:
+    """Display target allocations"""
+    print("\n" + "=" * 50)
+    print("TARGET ALLOCATIONS")
+    print("=" * 50)
+
+    for target in targets:
+        print(f"  {target.symbol:<8} {target.target_pct:>6.1f}%")
+
+    print("-" * 50)
+    print(f"  {'TOTAL':<8} {sum(t.target_pct for t in targets):>6.1f}%")
+    print("=" * 50)
+
+
+def calculate_rebalance(
+    portfolio: Portfolio,
+    targets: List[TargetAllocation],
+    config: RebalanceConfig,
+) -> None:
+    """Calculate and display rebalancing trades"""
+    rebalancer = Rebalancer(portfolio=portfolio, config=config)
+    rebalancer.set_targets(targets)
+
+    result = rebalancer.calculate(strategy=RebalanceStrategy.THRESHOLD)
+    print(rebalancer.preview(result))
+
+
+def execute_rebalance(
+    portfolio: Portfolio,
+    targets: List[TargetAllocation],
+    config: RebalanceConfig,
+) -> None:
+    """Execute rebalancing trades (with confirmation)"""
+    rebalancer = Rebalancer(portfolio=portfolio, config=config)
+    rebalancer.set_targets(targets)
+
+    result = rebalancer.calculate(strategy=RebalanceStrategy.THRESHOLD)
+    print(rebalancer.preview(result))
+
+    if not result.actionable_trades:
+        print("No trades to execute.")
+        return
+
+    # Confirmation
+    print("\n*** TRADE EXECUTION ***")
+    print(f"This will execute {result.trade_count} trades.")
+
+    if config.dry_run:
+        print("(DRY RUN mode - trades will not actually execute)")
+
+    response = input("\nProceed? (yes/no): ").strip().lower()
+
+    if response == "yes":
+        success = rebalancer.execute(result)
+        if success:
+            print("Trades submitted successfully")
+        else:
+            print("Trade execution failed or not implemented")
+    else:
+        print("Cancelled")
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="IB Portfolio Rebalancer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                      Show current portfolio
+  %(prog)s --rebalance          Calculate rebalancing trades
+  %(prog)s --rebalance --execute Execute trades (with confirmation)
+  %(prog)s --threshold 3.0      Set drift threshold to 3%%
+  %(prog)s --port 4002          Connect to IB Gateway paper trading
+        """,
+    )
+
+    # Connection options
+    parser.add_argument(
+        "--host", default=DEFAULT_HOST,
+        help=f"IB host (default: {DEFAULT_HOST})"
+    )
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT,
+        help=f"IB port (default: {DEFAULT_PORT})"
+    )
+    parser.add_argument(
+        "--client-id", type=int, default=DEFAULT_CLIENT_ID,
+        help=f"Client ID (default: {DEFAULT_CLIENT_ID})"
+    )
+
+    # Actions
+    parser.add_argument(
+        "--rebalance", action="store_true",
+        help="Calculate rebalancing trades"
+    )
+    parser.add_argument(
+        "--execute", action="store_true",
+        help="Execute trades (requires --rebalance)"
+    )
+
+    # Rebalance options
+    parser.add_argument(
+        "--threshold", type=float, default=5.0,
+        help="Drift threshold %% to trigger rebalance (default: 5.0)"
+    )
+    parser.add_argument(
+        "--min-trade", type=float, default=100.0,
+        help="Minimum trade value in dollars (default: 100)"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", default=True,
+        help="Don't actually execute trades (default: True)"
+    )
+    parser.add_argument(
+        "--live", action="store_true",
+        help="Execute real trades (disables dry-run)"
+    )
+
+    # Output options
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Verbose output"
+    )
+    parser.add_argument(
+        "--quiet", "-q", action="store_true",
+        help="Minimal output"
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    """Main entry point"""
+    args = parse_args()
+
+    # Configure logging level
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    elif args.quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+
+    # Create rebalance config
+    config = RebalanceConfig(
+        drift_threshold_pct=args.threshold,
+        min_trade_value=args.min_trade,
+        dry_run=not args.live,
+    )
+
+    # Connect to IB
+    logger.info(f"Connecting to IB at {args.host}:{args.port}...")
+    portfolio = Portfolio(
+        host=args.host,
+        port=args.port,
+        client_id=args.client_id,
+    )
+
+    if not portfolio.connect():
+        logger.error("Failed to connect to IB")
+        sys.exit(1)
+
+    try:
+        # Load portfolio data
+        logger.info("Loading portfolio data...")
+        portfolio.load(fetch_prices=True, fetch_account=True)
+
+        # Show portfolio
+        show_portfolio(portfolio)
+
+        # Rebalance actions
+        if args.rebalance:
+            show_targets(DEFAULT_TARGETS)
+
+            if args.execute:
+                execute_rebalance(portfolio, DEFAULT_TARGETS, config)
+            else:
+                calculate_rebalance(portfolio, DEFAULT_TARGETS, config)
+
+    finally:
+        portfolio.disconnect()
+
+
+if __name__ == "__main__":
+    main()
