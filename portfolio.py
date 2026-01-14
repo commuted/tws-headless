@@ -14,8 +14,10 @@ from ibapi.contract import Contract
 from ibapi.ticktype import TickTypeEnum
 from ibapi.account_summary_tags import AccountSummaryTags
 
+from ibapi.order import Order
+
 from .client import IBClient
-from .models import Position, AssetType, AccountSummary, Bar, BarSize
+from .models import Position, AssetType, AccountSummary, Bar, BarSize, OrderRecord, OrderStatus
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +95,12 @@ class Portfolio(IBClient):
         # Account data
         self._account_summary: Dict[str, AccountSummary] = {}
         self._account_summary_done = Event()
+
+        # Order tracking
+        self._orders: Dict[int, OrderRecord] = {}  # orderId -> OrderRecord
+        self._orders_lock = Lock()
+        self._pending_orders: Dict[int, Event] = {}  # orderId -> completion event
+        self._on_order_status: Optional[Callable[[OrderRecord], None]] = None
 
     @property
     def positions(self) -> List[Position]:
@@ -498,6 +506,196 @@ class Portfolio(IBClient):
 
         logger.debug(f"Stopped bar stream for {symbol}")
 
+    # =========================================================================
+    # Order Placement and Management
+    # =========================================================================
+
+    @property
+    def orders(self) -> List[OrderRecord]:
+        """Get list of all tracked orders"""
+        with self._orders_lock:
+            return list(self._orders.values())
+
+    @property
+    def pending_orders(self) -> List[OrderRecord]:
+        """Get list of pending (non-complete) orders"""
+        with self._orders_lock:
+            return [o for o in self._orders.values() if not o.is_complete]
+
+    def get_order(self, order_id: int) -> Optional[OrderRecord]:
+        """Get an order by ID"""
+        with self._orders_lock:
+            return self._orders.get(order_id)
+
+    def place_order(
+        self,
+        contract: Contract,
+        action: str,
+        quantity: float,
+        order_type: str = "MKT",
+        limit_price: float = 0.0,
+        stop_price: float = 0.0,
+        tif: str = "DAY",
+    ) -> Optional[int]:
+        """
+        Place an order through IB.
+
+        Args:
+            contract: IB Contract to trade
+            action: "BUY" or "SELL"
+            quantity: Number of shares
+            order_type: "MKT", "LMT", "STP", "STP LMT"
+            limit_price: Limit price (for LMT orders)
+            stop_price: Stop price (for STP orders)
+            tif: Time in force - "DAY", "GTC", "IOC", "FOK"
+
+        Returns:
+            Order ID if submitted, None if failed
+        """
+        if not self.connected:
+            logger.error("Not connected to IB")
+            return None
+
+        if self._next_order_id is None:
+            logger.error("No valid order ID available")
+            return None
+
+        # Get next order ID
+        with self._lock:
+            order_id = self._next_order_id
+            self._next_order_id += 1
+
+        # Create order object
+        order = Order()
+        order.action = action
+        order.totalQuantity = quantity
+        order.orderType = order_type
+        order.tif = tif
+
+        if order_type in ("LMT", "STP LMT"):
+            order.lmtPrice = limit_price
+        if order_type in ("STP", "STP LMT"):
+            order.auxPrice = stop_price
+
+        # Create order record for tracking
+        order_record = OrderRecord(
+            order_id=order_id,
+            symbol=contract.symbol,
+            action=action,
+            quantity=quantity,
+            order_type=order_type,
+            submitted_time=datetime.now().isoformat(),
+        )
+
+        # Set up completion event
+        completion_event = Event()
+
+        with self._orders_lock:
+            self._orders[order_id] = order_record
+            self._pending_orders[order_id] = completion_event
+
+        # Submit order
+        try:
+            self.placeOrder(order_id, contract, order)
+            logger.info(f"Placed order {order_id}: {action} {quantity} {contract.symbol} @ {order_type}")
+            return order_id
+        except Exception as e:
+            logger.error(f"Error placing order: {e}")
+            with self._orders_lock:
+                order_record.status = OrderStatus.ERROR
+                order_record.error_message = str(e)
+                completion_event.set()
+            return None
+
+    def place_market_order(
+        self,
+        contract: Contract,
+        action: str,
+        quantity: float,
+    ) -> Optional[int]:
+        """Place a market order (convenience method)"""
+        return self.place_order(contract, action, quantity, order_type="MKT")
+
+    def place_limit_order(
+        self,
+        contract: Contract,
+        action: str,
+        quantity: float,
+        limit_price: float,
+    ) -> Optional[int]:
+        """Place a limit order (convenience method)"""
+        return self.place_order(
+            contract, action, quantity,
+            order_type="LMT", limit_price=limit_price
+        )
+
+    def cancel_order(self, order_id: int) -> bool:
+        """
+        Cancel an order.
+
+        Args:
+            order_id: Order ID to cancel
+
+        Returns:
+            True if cancel request sent
+        """
+        if not self.connected:
+            return False
+
+        try:
+            self.cancelOrder(order_id, "")
+            logger.info(f"Sent cancel request for order {order_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error cancelling order {order_id}: {e}")
+            return False
+
+    def wait_for_order(self, order_id: int, timeout: float = 30.0) -> Optional[OrderRecord]:
+        """
+        Wait for an order to complete (fill, cancel, or error).
+
+        Args:
+            order_id: Order ID to wait for
+            timeout: Maximum time to wait in seconds
+
+        Returns:
+            OrderRecord when complete, or None if timeout
+        """
+        event = self._pending_orders.get(order_id)
+        if not event:
+            return self.get_order(order_id)
+
+        if event.wait(timeout=timeout):
+            return self.get_order(order_id)
+        else:
+            logger.warning(f"Timeout waiting for order {order_id}")
+            return self.get_order(order_id)
+
+    def wait_for_all_orders(self, timeout: float = 60.0) -> bool:
+        """
+        Wait for all pending orders to complete.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+
+        Returns:
+            True if all orders completed, False if timeout
+        """
+        start = datetime.now()
+        while True:
+            pending = self.pending_orders
+            if not pending:
+                return True
+
+            elapsed = (datetime.now() - start).total_seconds()
+            if elapsed >= timeout:
+                logger.warning(f"Timeout waiting for {len(pending)} orders")
+                return False
+
+            # Wait a bit before checking again
+            import time
+            time.sleep(0.1)
+
     def _fetch_market_data(self, timeout: float = 30.0):
         """Fetch market data for all positions"""
         self._market_data_requests.clear()
@@ -757,6 +955,84 @@ class Portfolio(IBClient):
 
         if "accountSummaryEnd" in self._callbacks:
             self._callbacks["accountSummaryEnd"]()
+
+    # =========================================================================
+    # EWrapper Callbacks for Orders
+    # =========================================================================
+
+    def orderStatus(
+        self,
+        orderId: int,
+        status: str,
+        filled: float,
+        remaining: float,
+        avgFillPrice: float,
+        permId: int,
+        parentId: int,
+        lastFillPrice: float,
+        clientId: int,
+        whyHeld: str,
+        mktCapPrice: float = 0.0,
+    ):
+        """Handle order status updates"""
+        with self._orders_lock:
+            order_record = self._orders.get(orderId)
+            if not order_record:
+                return
+
+            # Update order record
+            order_record.status = OrderStatus.from_ib_status(status)
+            order_record.filled_quantity = filled
+            order_record.remaining = remaining
+            order_record.avg_fill_price = avgFillPrice
+            order_record.last_fill_price = lastFillPrice
+
+            # Mark completion time if terminal state
+            if order_record.is_complete:
+                order_record.filled_time = datetime.now().isoformat()
+
+                # Signal completion event
+                event = self._pending_orders.get(orderId)
+                if event:
+                    event.set()
+
+        logger.info(
+            f"Order {orderId} status: {status}, "
+            f"filled={filled}/{order_record.quantity} @ ${avgFillPrice:.2f}"
+        )
+
+        # Call callback if registered
+        if self._on_order_status:
+            try:
+                self._on_order_status(order_record)
+            except Exception as e:
+                logger.error(f"Error in order status callback: {e}")
+
+        if "orderStatus" in self._callbacks:
+            self._callbacks["orderStatus"](order_record)
+
+    def openOrder(
+        self,
+        orderId: int,
+        contract: Contract,
+        order: Order,
+        orderState,
+    ):
+        """Handle open order information"""
+        logger.debug(f"Open order {orderId}: {order.action} {order.totalQuantity} {contract.symbol}")
+
+        if "openOrder" in self._callbacks:
+            self._callbacks["openOrder"](orderId, contract, order, orderState)
+
+    def execDetails(self, reqId: int, contract: Contract, execution):
+        """Handle execution details"""
+        logger.debug(
+            f"Execution: {execution.orderId} {execution.side} "
+            f"{execution.shares} {contract.symbol} @ ${execution.price:.2f}"
+        )
+
+        if "execDetails" in self._callbacks:
+            self._callbacks["execDetails"](reqId, contract, execution)
 
 
 def quick_load(

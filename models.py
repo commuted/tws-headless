@@ -313,3 +313,121 @@ class AccountSummary:
     def is_valid(self) -> bool:
         """Check if account summary has valid data"""
         return self.net_liquidation > 0
+
+
+class OrderStatus(Enum):
+    """Order status states"""
+    PENDING = "PendingSubmit"
+    SUBMITTED = "Submitted"
+    FILLED = "Filled"
+    PARTIALLY_FILLED = "PartiallyFilled"
+    CANCELLED = "Cancelled"
+    ERROR = "Error"
+    UNKNOWN = "Unknown"
+
+    @classmethod
+    def from_ib_status(cls, status: str) -> "OrderStatus":
+        """Convert IB status string to OrderStatus"""
+        mapping = {
+            "PendingSubmit": cls.PENDING,
+            "PendingCancel": cls.PENDING,
+            "PreSubmitted": cls.PENDING,
+            "Submitted": cls.SUBMITTED,
+            "Filled": cls.FILLED,
+            "PartiallyFilled": cls.PARTIALLY_FILLED,
+            "Cancelled": cls.CANCELLED,
+            "ApiCancelled": cls.CANCELLED,
+            "Error": cls.ERROR,
+        }
+        return mapping.get(status, cls.UNKNOWN)
+
+
+@dataclass
+class OrderRecord:
+    """Tracks an order through its lifecycle"""
+    order_id: int
+    symbol: str
+    action: str                    # BUY or SELL
+    quantity: float
+    order_type: str = "MKT"
+    status: OrderStatus = OrderStatus.PENDING
+    filled_quantity: float = 0.0
+    avg_fill_price: float = 0.0
+    last_fill_price: float = 0.0
+    remaining: float = 0.0
+    submitted_time: str = ""
+    filled_time: str = ""
+    error_message: str = ""
+
+    @property
+    def is_complete(self) -> bool:
+        """Check if order is in a terminal state"""
+        return self.status in (
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+            OrderStatus.ERROR,
+        )
+
+    @property
+    def is_filled(self) -> bool:
+        """Check if order was fully filled"""
+        return self.status == OrderStatus.FILLED
+
+    @property
+    def fill_value(self) -> float:
+        """Total value of filled shares"""
+        return self.filled_quantity * self.avg_fill_price
+
+    def __repr__(self):
+        return (f"OrderRecord({self.order_id}: {self.action} {self.quantity} {self.symbol} "
+                f"@ {self.order_type}, status={self.status.value}, "
+                f"filled={self.filled_quantity}@${self.avg_fill_price:.2f})")
+
+
+@dataclass
+class ExecutionResult:
+    """Result of executing a rebalance"""
+    success: bool
+    orders: list                   # List[OrderRecord]
+    total_orders: int = 0
+    filled_orders: int = 0
+    failed_orders: int = 0
+    total_buy_value: float = 0.0
+    total_sell_value: float = 0.0
+    start_time: str = ""
+    end_time: str = ""
+    errors: list = field(default_factory=list)  # List of error messages
+
+    def __post_init__(self):
+        if not self.start_time:
+            from datetime import datetime
+            self.start_time = datetime.now().isoformat()
+
+        self.total_orders = len(self.orders)
+        self.filled_orders = sum(1 for o in self.orders if o.is_filled)
+        self.failed_orders = sum(1 for o in self.orders if o.status == OrderStatus.ERROR)
+
+        self.total_buy_value = sum(
+            o.fill_value for o in self.orders if o.action == "BUY" and o.is_filled
+        )
+        self.total_sell_value = sum(
+            o.fill_value for o in self.orders if o.action == "SELL" and o.is_filled
+        )
+
+    def summary(self) -> str:
+        """Return a summary of the execution"""
+        lines = [
+            f"Execution Result",
+            f"  Status: {'SUCCESS' if self.success else 'FAILED'}",
+            f"  Orders: {self.filled_orders}/{self.total_orders} filled",
+            f"  Failed: {self.failed_orders}",
+            f"  Buy Value: ${self.total_buy_value:,.2f}",
+            f"  Sell Value: ${self.total_sell_value:,.2f}",
+            f"  Started: {self.start_time}",
+            f"  Ended: {self.end_time}",
+        ]
+        if self.errors:
+            lines.append(f"  Errors: {len(self.errors)}")
+            for err in self.errors[:5]:
+                lines.append(f"    - {err}")
+        return "\n".join(lines)

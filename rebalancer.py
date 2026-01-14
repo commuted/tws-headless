@@ -21,8 +21,12 @@ from .models import (
     RebalanceStrategy,
     OrderAction,
     AssetType,
+    OrderRecord,
+    OrderStatus,
+    ExecutionResult,
 )
 from .portfolio import Portfolio
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -463,36 +467,162 @@ class Rebalancer:
         logger.info(f"Rebalance calculation complete: {result.trade_count} trades")
         return result
 
-    def execute(self, result: RebalanceResult) -> bool:
+    def execute(
+        self,
+        result: RebalanceResult,
+        wait_for_fills: bool = True,
+        timeout: float = 60.0,
+    ) -> ExecutionResult:
         """
         Execute rebalancing trades.
 
-        PLACEHOLDER: Implement trade execution logic.
-
         Args:
             result: RebalanceResult from calculate()
+            wait_for_fills: Whether to wait for orders to fill
+            timeout: Maximum time to wait for fills (seconds)
 
         Returns:
-            True if all trades executed successfully
+            ExecutionResult with order details
         """
+        start_time = datetime.now().isoformat()
+        orders: List[OrderRecord] = []
+        errors: List[str] = []
+
+        # Handle dry run
         if self.config.dry_run:
             logger.info("DRY RUN - Trades not executed")
             for trade in result.actionable_trades:
                 logger.info(f"  Would execute: {trade}")
-            return True
 
+            # Create simulated order records for dry run
+            for trade in result.actionable_trades:
+                order = OrderRecord(
+                    order_id=0,
+                    symbol=trade.symbol,
+                    action=trade.action.value,
+                    quantity=trade.quantity,
+                    order_type=self.config.order_type,
+                    status=OrderStatus.FILLED,  # Simulated fill
+                    filled_quantity=trade.quantity,
+                    avg_fill_price=trade.estimated_value / trade.quantity if trade.quantity > 0 else 0,
+                )
+                orders.append(order)
+
+            return ExecutionResult(
+                success=True,
+                orders=orders,
+                start_time=start_time,
+                end_time=datetime.now().isoformat(),
+            )
+
+        # Validate portfolio connection
         if not self.portfolio or not self.portfolio.connected:
-            raise ValueError("Portfolio not connected")
+            return ExecutionResult(
+                success=False,
+                orders=[],
+                start_time=start_time,
+                end_time=datetime.now().isoformat(),
+                errors=["Portfolio not connected"],
+            )
 
-        # PLACEHOLDER: Implement actual trade execution
-        # For each trade:
-        # 1. Create contract
-        # 2. Create order
-        # 3. Submit via portfolio.placeOrder()
-        # 4. Monitor fill status
+        actionable_trades = result.actionable_trades
 
-        logger.warning("Trade execution not implemented")
-        return False
+        if not actionable_trades:
+            logger.info("No trades to execute")
+            return ExecutionResult(
+                success=True,
+                orders=[],
+                start_time=start_time,
+                end_time=datetime.now().isoformat(),
+            )
+
+        # Check max trades limit
+        if len(actionable_trades) > self.config.max_trades_per_run:
+            error_msg = (
+                f"Too many trades: {len(actionable_trades)} > "
+                f"max {self.config.max_trades_per_run}"
+            )
+            logger.error(error_msg)
+            return ExecutionResult(
+                success=False,
+                orders=[],
+                start_time=start_time,
+                end_time=datetime.now().isoformat(),
+                errors=[error_msg],
+            )
+
+        logger.info(f"Executing {len(actionable_trades)} trades...")
+
+        # Execute sells first (to generate cash), then buys
+        sells = [t for t in actionable_trades if t.action == OrderAction.SELL]
+        buys = [t for t in actionable_trades if t.action == OrderAction.BUY]
+        ordered_trades = sells + buys
+
+        order_ids = []
+
+        for trade in ordered_trades:
+            # Validate trade has contract
+            if not trade.contract:
+                error_msg = f"No contract for {trade.symbol}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+                continue
+
+            # Validate minimum shares
+            if trade.quantity < self.config.min_trade_shares:
+                error_msg = f"Trade quantity {trade.quantity} below minimum {self.config.min_trade_shares}"
+                logger.warning(error_msg)
+                errors.append(error_msg)
+                continue
+
+            # Place the order
+            order_id = self.portfolio.place_order(
+                contract=trade.contract,
+                action=trade.action.value,
+                quantity=trade.quantity,
+                order_type=self.config.order_type,
+            )
+
+            if order_id:
+                order_ids.append(order_id)
+                logger.info(f"Submitted order {order_id}: {trade}")
+            else:
+                error_msg = f"Failed to place order for {trade.symbol}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+
+        # Wait for fills if requested
+        if wait_for_fills and order_ids:
+            logger.info(f"Waiting for {len(order_ids)} orders to fill...")
+            self.portfolio.wait_for_all_orders(timeout=timeout)
+
+        # Collect order records
+        for order_id in order_ids:
+            order_record = self.portfolio.get_order(order_id)
+            if order_record:
+                orders.append(order_record)
+
+        # Determine overall success
+        filled_count = sum(1 for o in orders if o.is_filled)
+        failed_count = sum(1 for o in orders if o.status == OrderStatus.ERROR)
+        success = (failed_count == 0) and (filled_count == len(order_ids))
+
+        end_time = datetime.now().isoformat()
+
+        execution_result = ExecutionResult(
+            success=success,
+            orders=orders,
+            start_time=start_time,
+            end_time=end_time,
+            errors=errors,
+        )
+
+        logger.info(
+            f"Execution complete: {filled_count}/{len(order_ids)} filled, "
+            f"{failed_count} failed"
+        )
+
+        return execution_result
 
     def preview(self, result: RebalanceResult) -> str:
         """
