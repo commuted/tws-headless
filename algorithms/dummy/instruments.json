@@ -1,0 +1,28 @@
+{
+  "algorithm": "dummy",
+  "description": "Dummy Algorithm: A placeholder that maintains static 60/40 allocation",
+  "instruments": [
+    {
+      "symbol": "SPY",
+      "name": "SPDR S&P 500 ETF Trust",
+      "weight": 60.0,
+      "min_weight": 0.0,
+      "max_weight": 100.0,
+      "enabled": true,
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK"
+    },
+    {
+      "symbol": "BND",
+      "name": "Vanguard Total Bond Market ETF",
+      "weight": 40.0,
+      "min_weight": 0.0,
+      "max_weight": 100.0,
+      "enabled": true,
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK"
+    }
+  ]
+}
