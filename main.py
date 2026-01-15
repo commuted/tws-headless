@@ -53,9 +53,12 @@ class ShutdownManager:
     """
     Manages graceful shutdown on SIGINT/SIGTERM.
 
-    Provides a centralized way to handle shutdown signals and
-    coordinate cleanup across the application.
+    Requires 3 SIGINT signals within 10 seconds to initiate shutdown.
+    This prevents accidental shutdowns from stray Ctrl+C presses.
     """
+
+    REQUIRED_SIGNALS = 3
+    RESET_TIMEOUT = 10.0  # seconds
 
     def __init__(self):
         self._shutdown_event = Event()
@@ -63,6 +66,8 @@ class ShutdownManager:
         self._original_sigint = None
         self._original_sigterm = None
         self._sigint_count = 0
+        self._first_sigint_time: Optional[float] = None
+        self._shutdown_initiated = False
 
     @property
     def should_shutdown(self) -> bool:
@@ -78,6 +83,7 @@ class ShutdownManager:
         self._original_sigint = signal.signal(signal.SIGINT, self._signal_handler)
         self._original_sigterm = signal.signal(signal.SIGTERM, self._signal_handler)
         atexit.register(self._cleanup)
+        print(f"Press Ctrl+C {self.REQUIRED_SIGNALS} times within {self.RESET_TIMEOUT:.0f}s to shutdown")
 
     def restore_handlers(self):
         """Restore original signal handlers"""
@@ -88,23 +94,55 @@ class ShutdownManager:
 
     def _signal_handler(self, signum, frame):
         """Handle SIGINT/SIGTERM signals"""
-        self._sigint_count += 1
+        current_time = time.time()
         sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
 
+        # SIGTERM always triggers immediate shutdown
+        if signum == signal.SIGTERM:
+            print(f"\n{sig_name} received. Shutting down...")
+            self._initiate_shutdown()
+            return
+
+        # Check if we need to reset the counter (timeout expired)
+        if self._first_sigint_time is not None:
+            elapsed = current_time - self._first_sigint_time
+            if elapsed > self.RESET_TIMEOUT:
+                # Reset counter - timeout expired
+                self._sigint_count = 0
+                self._first_sigint_time = None
+
+        # Increment counter
+        self._sigint_count += 1
+
+        # Record first signal time
         if self._sigint_count == 1:
-            print(f"\n{sig_name} received. Shutting down gracefully...")
-            self._shutdown_event.set()
-            self._cleanup()
-        elif self._sigint_count == 2:
-            print("\nSecond interrupt received. Forcing disconnect...")
-            if self._portfolio:
-                try:
-                    self._portfolio.disconnect()
-                except Exception:
-                    pass
+            self._first_sigint_time = current_time
+
+        # Calculate remaining time
+        elapsed = current_time - self._first_sigint_time
+        remaining_time = max(0, self.RESET_TIMEOUT - elapsed)
+        remaining_signals = self.REQUIRED_SIGNALS - self._sigint_count
+
+        if remaining_signals > 0:
+            # Not enough signals yet
+            print(f"\n{sig_name} ({self._sigint_count}/{self.REQUIRED_SIGNALS}) - "
+                  f"Press Ctrl+C {remaining_signals} more time(s) within {remaining_time:.1f}s to shutdown")
         else:
-            print("\nForce exit.")
+            # Enough signals - initiate shutdown
+            print(f"\n{sig_name} ({self._sigint_count}/{self.REQUIRED_SIGNALS}) - "
+                  f"Shutdown confirmed. Shutting down gracefully...")
+            self._initiate_shutdown()
+
+    def _initiate_shutdown(self):
+        """Initiate the shutdown sequence"""
+        if self._shutdown_initiated:
+            # Already shutting down, force exit on additional signals
+            print("\nShutdown already in progress. Force exit.")
             sys.exit(1)
+
+        self._shutdown_initiated = True
+        self._shutdown_event.set()
+        self._cleanup()
 
     def _cleanup(self):
         """Perform cleanup operations"""
