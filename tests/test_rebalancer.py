@@ -666,3 +666,177 @@ class TestRebalancer:
 
         assert execution.success is True
         assert execution.total_orders == 0
+
+    def test_execute_too_many_trades(self, mock_portfolio):
+        """Test execute rejects too many trades"""
+        config = RebalanceConfig(dry_run=False, max_trades_per_run=2)
+        rebalancer = Rebalancer(portfolio=mock_portfolio, config=config)
+
+        trades = [
+            RebalanceTrade(
+                symbol=f"SYM{i}",
+                action=OrderAction.SELL,
+                quantity=10,
+                current_allocation=30.0,
+                target_allocation=20.0,
+                drift=10.0,
+                estimated_value=1000.0,
+                contract=MagicMock(),
+            )
+            for i in range(5)  # More than max_trades_per_run=2
+        ]
+
+        result = RebalanceResult(
+            trades=trades,
+            total_portfolio_value=100000.0,
+        )
+
+        execution = rebalancer.execute(result)
+
+        assert execution.success is False
+        assert "Too many trades" in str(execution.errors)
+
+    def test_execute_places_orders(self, mock_portfolio):
+        """Test execute places orders when not dry run"""
+        config = RebalanceConfig(dry_run=False)
+        rebalancer = Rebalancer(portfolio=mock_portfolio, config=config)
+
+        mock_contract = MagicMock()
+        trades = [
+            RebalanceTrade(
+                symbol="SPY",
+                action=OrderAction.SELL,
+                quantity=10,
+                current_allocation=65.0,
+                target_allocation=60.0,
+                drift=5.0,
+                estimated_value=4500.0,
+                contract=mock_contract,
+            ),
+        ]
+
+        result = RebalanceResult(
+            trades=trades,
+            total_portfolio_value=100000.0,
+        )
+
+        mock_portfolio.place_order.return_value = 100
+        mock_portfolio.get_order.return_value = MagicMock(is_filled=True, status=MagicMock(value="Filled"))
+
+        execution = rebalancer.execute(result, wait_for_fills=False)
+
+        mock_portfolio.place_order.assert_called_once()
+
+    def test_execute_skips_trade_without_contract(self, mock_portfolio):
+        """Test execute skips trades without contract"""
+        config = RebalanceConfig(dry_run=False)
+        rebalancer = Rebalancer(portfolio=mock_portfolio, config=config)
+
+        trades = [
+            RebalanceTrade(
+                symbol="SPY",
+                action=OrderAction.SELL,
+                quantity=10,
+                current_allocation=65.0,
+                target_allocation=60.0,
+                drift=5.0,
+                estimated_value=4500.0,
+                contract=None,  # No contract
+            ),
+        ]
+
+        result = RebalanceResult(
+            trades=trades,
+            total_portfolio_value=100000.0,
+        )
+
+        execution = rebalancer.execute(result, wait_for_fills=False)
+
+        mock_portfolio.place_order.assert_not_called()
+        assert "No contract" in str(execution.errors)
+
+
+# =============================================================================
+# RebalanceResult Tests
+# =============================================================================
+
+class TestRebalanceResultExtended:
+    """Extended tests for RebalanceResult"""
+
+    def test_summary_no_trades(self):
+        """Test summary with no trades"""
+        result = RebalanceResult(
+            trades=[],
+            total_portfolio_value=100000.0,
+            strategy=RebalanceStrategy.THRESHOLD,
+        )
+
+        summary = result.summary()
+
+        # Summary shows "Trades: 0" format
+        assert "Trades: 0" in summary or "0 trades" in summary or "No trades" in summary
+
+    def test_summary_with_trades(self):
+        """Test summary with trades"""
+        trades = [
+            RebalanceTrade(
+                symbol="SPY",
+                action=OrderAction.SELL,
+                quantity=10,
+                current_allocation=65.0,
+                target_allocation=60.0,
+                drift=5.0,
+                estimated_value=4500.0,
+            ),
+            RebalanceTrade(
+                symbol="BND",
+                action=OrderAction.BUY,
+                quantity=50,
+                current_allocation=35.0,
+                target_allocation=40.0,
+                drift=-5.0,
+                estimated_value=3750.0,
+            ),
+        ]
+
+        result = RebalanceResult(
+            trades=trades,
+            total_portfolio_value=100000.0,
+            strategy=RebalanceStrategy.THRESHOLD,
+        )
+
+        summary = result.summary()
+
+        assert "100,000" in summary or "100000" in summary
+
+    def test_actionable_trades_excludes_hold(self):
+        """Test actionable_trades excludes HOLD trades"""
+        trades = [
+            RebalanceTrade(
+                symbol="SPY",
+                action=OrderAction.SELL,
+                quantity=10,
+                current_allocation=65.0,
+                target_allocation=60.0,
+                drift=5.0,
+                estimated_value=4500.0,
+            ),
+            RebalanceTrade(
+                symbol="QQQ",
+                action=OrderAction.HOLD,
+                quantity=0,
+                current_allocation=30.0,
+                target_allocation=30.0,
+                drift=0.0,
+                estimated_value=0.0,
+            ),
+        ]
+
+        result = RebalanceResult(
+            trades=trades,
+            total_portfolio_value=100000.0,
+        )
+
+        actionable = result.actionable_trades
+        assert len(actionable) == 1
+        assert actionable[0].symbol == "SPY"

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ib-portfolio"
+version = "0.1.0"
+description = "Interactive Brokers Portfolio Rebalancer"
+requires-python = ">=3.10"
+dependencies = [
+    "ibapi",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]

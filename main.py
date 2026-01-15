@@ -526,7 +526,9 @@ command_server: Optional[CommandServer] = None
 
 # Default connection settings
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 7497  # TWS paper trading
+DEFAULT_PORT_PAPER = 7497  # TWS paper trading
+DEFAULT_PORT_LIVE = 7496   # TWS live trading
+DEFAULT_PORT = DEFAULT_PORT_PAPER
 DEFAULT_CLIENT_ID = 1
 
 # Example target allocations - customize for your portfolio
@@ -777,8 +779,8 @@ Examples:
         help=f"IB host (default: {DEFAULT_HOST})"
     )
     parser.add_argument(
-        "--port", type=int, default=DEFAULT_PORT,
-        help=f"IB port (default: {DEFAULT_PORT})"
+        "--port", type=int, default=None,
+        help=f"IB port (default: {DEFAULT_PORT_PAPER} paper, {DEFAULT_PORT_LIVE} live)"
     )
     parser.add_argument(
         "--client-id", type=int, default=DEFAULT_CLIENT_ID,
@@ -822,7 +824,7 @@ Examples:
     )
     parser.add_argument(
         "--live", action="store_true",
-        help="Execute real trades (disables dry-run)"
+        help=f"Connect to live trading (port {DEFAULT_PORT_LIVE}) and execute real trades"
     )
 
     # Output options
@@ -870,11 +872,19 @@ def main():
         dry_run=not args.live,
     )
 
+    # Determine port: explicit --port overrides, otherwise use --live flag
+    if args.port is not None:
+        port = args.port
+    elif args.live:
+        port = DEFAULT_PORT_LIVE
+    else:
+        port = DEFAULT_PORT_PAPER
+
     # Connect to IB
-    logger.info(f"Connecting to IB at {args.host}:{args.port}...")
+    logger.info(f"Connecting to IB at {args.host}:{port}...")
     portfolio = Portfolio(
         host=args.host,
-        port=args.port,
+        port=port,
         client_id=args.client_id,
     )
 

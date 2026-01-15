@@ -72,6 +72,33 @@ from .command_server import (
     DEFAULT_SOCKET_PATH,
 )
 
+from .enter_exit import (
+    EnterExit,
+    OrderBuilder,
+    OrderType,
+    AlgoStrategy,
+    TimeInForce,
+    OrderConfig,
+    BracketConfig,
+    ScaledOrderConfig,
+    AdaptiveConfig,
+    EntryExitResult,
+)
+
+from .security_pool import (
+    SecurityPool,
+    Security,
+    AssetCategory,
+    EquitySubCategory,
+    FixedIncomeSubCategory,
+    CommoditiesSubCategory,
+    RealEstateSubCategory,
+    CurrenciesSubCategory,
+    CashSubCategory,
+    CategoryInfo,
+    load_security_pool,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -107,4 +134,27 @@ __all__ = [
     "CommandStatus",
     "send_command",
     "DEFAULT_SOCKET_PATH",
+    # Enter/Exit
+    "EnterExit",
+    "OrderBuilder",
+    "OrderType",
+    "AlgoStrategy",
+    "TimeInForce",
+    "OrderConfig",
+    "BracketConfig",
+    "ScaledOrderConfig",
+    "AdaptiveConfig",
+    "EntryExitResult",
+    # Security Pool
+    "SecurityPool",
+    "Security",
+    "AssetCategory",
+    "EquitySubCategory",
+    "FixedIncomeSubCategory",
+    "CommoditiesSubCategory",
+    "RealEstateSubCategory",
+    "CurrenciesSubCategory",
+    "CashSubCategory",
+    "CategoryInfo",
+    "load_security_pool",
 ]

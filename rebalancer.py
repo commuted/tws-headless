@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 
-from .models import (
+from models import (
     Position,
     TargetAllocation,
     RebalanceTrade,
@@ -25,7 +25,7 @@ from .models import (
     OrderStatus,
     ExecutionResult,
 )
-from .portfolio import Portfolio
+from portfolio import Portfolio
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
