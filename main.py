@@ -83,7 +83,7 @@ class ShutdownManager:
         self._original_sigint = signal.signal(signal.SIGINT, self._signal_handler)
         self._original_sigterm = signal.signal(signal.SIGTERM, self._signal_handler)
         atexit.register(self._cleanup)
-        print(f"Press Ctrl+C {self.REQUIRED_SIGNALS} times within {self.RESET_TIMEOUT:.0f}s to shutdown")
+        print(f"Shutdown requires {self.REQUIRED_SIGNALS}x Ctrl+C within {self.RESET_TIMEOUT:.0f} seconds")
 
     def restore_handlers(self):
         """Restore original signal handlers"""
@@ -125,12 +125,12 @@ class ShutdownManager:
 
         if remaining_signals > 0:
             # Not enough signals yet
-            print(f"\n{sig_name} ({self._sigint_count}/{self.REQUIRED_SIGNALS}) - "
-                  f"Press Ctrl+C {remaining_signals} more time(s) within {remaining_time:.1f}s to shutdown")
+            print(f"\nCtrl+C [{self._sigint_count}/{self.REQUIRED_SIGNALS}] "
+                  f"Press {remaining_signals} more time(s) within {remaining_time:.1f}s to confirm shutdown")
         else:
             # Enough signals - initiate shutdown
-            print(f"\n{sig_name} ({self._sigint_count}/{self.REQUIRED_SIGNALS}) - "
-                  f"Shutdown confirmed. Shutting down gracefully...")
+            print(f"\nCtrl+C [{self._sigint_count}/{self.REQUIRED_SIGNALS}] "
+                  f"Shutdown confirmed. Exiting gracefully...")
             self._initiate_shutdown()
 
     def _initiate_shutdown(self):
