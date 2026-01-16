@@ -7,6 +7,7 @@ RebalanceResult, OrderRecord, ExecutionResult, and enums.
 
 import pytest
 from unittest.mock import MagicMock
+from decimal import Decimal
 from models import (
     AssetType,
     OrderAction,
@@ -21,6 +22,28 @@ from models import (
     OrderStatus,
     OrderRecord,
     ExecutionResult,
+    # IB API compatible classes
+    Execution,
+    ExecutionFilter,
+    OrderState,
+    OrderAllocation,
+    CommissionAndFeesReport,
+    TickAttrib,
+    TickAttribBidAsk,
+    TickAttribLast,
+    HistoricalTick,
+    HistoricalTickBidAsk,
+    HistoricalTickLast,
+    BarData,
+    RealTimeBar,
+    HistogramData,
+    OptionExerciseType,
+)
+from const import (
+    UNSET_INTEGER,
+    UNSET_DOUBLE,
+    UNSET_DECIMAL,
+    NO_VALID_ID,
 )
 
 
@@ -751,3 +774,409 @@ class TestAccountSummary:
             net_liquidation=-1000.0,
         )
         assert summary.is_valid is False
+
+
+# =============================================================================
+# IB API Compatible Classes Tests
+# =============================================================================
+
+
+class TestConst:
+    """Tests for IB API constants"""
+
+    def test_unset_integer(self):
+        """Test UNSET_INTEGER value"""
+        assert UNSET_INTEGER == 2**31 - 1
+
+    def test_unset_double(self):
+        """Test UNSET_DOUBLE is max float"""
+        import sys
+        assert UNSET_DOUBLE == float(sys.float_info.max)
+
+    def test_unset_decimal(self):
+        """Test UNSET_DECIMAL value"""
+        assert UNSET_DECIMAL == Decimal(2**127 - 1)
+
+    def test_no_valid_id(self):
+        """Test NO_VALID_ID value"""
+        assert NO_VALID_ID == -1
+
+
+class TestExecution:
+    """Tests for Execution dataclass"""
+
+    def test_execution_creation_defaults(self):
+        """Test execution created with defaults"""
+        exec_ = Execution()
+        assert exec_.execId == ""
+        assert exec_.time == ""
+        assert exec_.side == ""
+        assert exec_.price == 0.0
+        assert exec_.shares == UNSET_DECIMAL
+
+    def test_execution_creation_with_values(self):
+        """Test execution created with values"""
+        exec_ = Execution(
+            execId="0001",
+            time="20240115 10:30:00",
+            acctNumber="DU123456",
+            exchange="SMART",
+            side="BOT",
+            shares=Decimal(100),
+            price=175.50,
+            permId=12345,
+            clientId=1,
+            orderId=1001,
+            cumQty=Decimal(100),
+            avgPrice=175.50,
+        )
+        assert exec_.execId == "0001"
+        assert exec_.side == "BOT"
+        assert exec_.shares == Decimal(100)
+        assert exec_.price == 175.50
+        assert exec_.avgPrice == 175.50
+
+    def test_execution_str(self):
+        """Test execution string representation"""
+        exec_ = Execution(
+            execId="0001",
+            time="20240115 10:30:00",
+            acctNumber="DU123456",
+            exchange="SMART",
+            side="BOT",
+            shares=Decimal(100),
+            price=175.50,
+        )
+        s = str(exec_)
+        assert "ExecId: 0001" in s
+        assert "Side: BOT" in s
+        assert "100" in s
+
+
+class TestExecutionFilter:
+    """Tests for ExecutionFilter dataclass"""
+
+    def test_execution_filter_defaults(self):
+        """Test execution filter with defaults"""
+        filter_ = ExecutionFilter()
+        assert filter_.clientId == 0
+        assert filter_.acctCode == ""
+        assert filter_.symbol == ""
+        assert filter_.lastNDays == UNSET_INTEGER
+
+    def test_execution_filter_with_values(self):
+        """Test execution filter with values"""
+        filter_ = ExecutionFilter(
+            clientId=1,
+            acctCode="DU123456",
+            symbol="AAPL",
+            secType="STK",
+            side="BOT",
+        )
+        assert filter_.clientId == 1
+        assert filter_.symbol == "AAPL"
+        assert filter_.secType == "STK"
+
+
+class TestOrderAllocation:
+    """Tests for OrderAllocation dataclass"""
+
+    def test_order_allocation_defaults(self):
+        """Test order allocation with defaults"""
+        alloc = OrderAllocation()
+        assert alloc.account == ""
+        assert alloc.position == UNSET_DECIMAL
+        assert alloc.isMonetary is False
+
+    def test_order_allocation_with_values(self):
+        """Test order allocation with values"""
+        alloc = OrderAllocation(
+            account="DU123456",
+            position=Decimal(100),
+            positionDesired=Decimal(150),
+            positionAfter=Decimal(150),
+        )
+        assert alloc.account == "DU123456"
+        assert alloc.position == Decimal(100)
+
+    def test_order_allocation_str(self):
+        """Test order allocation string representation"""
+        alloc = OrderAllocation(account="DU123456", position=Decimal(100))
+        s = str(alloc)
+        assert "DU123456" in s
+
+
+class TestOrderState:
+    """Tests for OrderState dataclass"""
+
+    def test_order_state_defaults(self):
+        """Test order state with defaults"""
+        state = OrderState()
+        assert state.status == ""
+        assert state.initMarginBefore == ""
+        assert state.commissionAndFees == UNSET_DOUBLE
+
+    def test_order_state_with_values(self):
+        """Test order state with values"""
+        state = OrderState(
+            status="Filled",
+            initMarginBefore="10000.00",
+            maintMarginBefore="5000.00",
+            commissionAndFees=1.50,
+            commissionAndFeesCurrency="USD",
+        )
+        assert state.status == "Filled"
+        assert state.initMarginBefore == "10000.00"
+        assert state.commissionAndFees == 1.50
+
+    def test_order_state_str(self):
+        """Test order state string representation"""
+        state = OrderState(status="Filled", commissionAndFees=1.50)
+        s = str(state)
+        assert "Filled" in s
+
+
+class TestCommissionAndFeesReport:
+    """Tests for CommissionAndFeesReport dataclass"""
+
+    def test_report_defaults(self):
+        """Test report with defaults"""
+        report = CommissionAndFeesReport()
+        assert report.execId == ""
+        assert report.commissionAndFees == 0.0
+        assert report.realizedPNL == 0.0
+
+    def test_report_with_values(self):
+        """Test report with values"""
+        report = CommissionAndFeesReport(
+            execId="0001",
+            commissionAndFees=1.50,
+            currency="USD",
+            realizedPNL=500.0,
+        )
+        assert report.execId == "0001"
+        assert report.commissionAndFees == 1.50
+        assert report.realizedPNL == 500.0
+
+    def test_report_str(self):
+        """Test report string representation"""
+        report = CommissionAndFeesReport(execId="0001", commissionAndFees=1.50)
+        s = str(report)
+        assert "0001" in s
+        assert "1.5" in s
+
+
+class TestTickAttrib:
+    """Tests for TickAttrib dataclass"""
+
+    def test_tick_attrib_defaults(self):
+        """Test tick attrib with defaults"""
+        attrib = TickAttrib()
+        assert attrib.canAutoExecute is False
+        assert attrib.pastLimit is False
+        assert attrib.preOpen is False
+
+    def test_tick_attrib_with_values(self):
+        """Test tick attrib with values"""
+        attrib = TickAttrib(canAutoExecute=True, preOpen=True)
+        assert attrib.canAutoExecute is True
+        assert attrib.preOpen is True
+
+    def test_tick_attrib_str(self):
+        """Test tick attrib string representation"""
+        attrib = TickAttrib(canAutoExecute=True)
+        s = str(attrib)
+        assert "CanAutoExecute: 1" in s
+
+
+class TestTickAttribBidAsk:
+    """Tests for TickAttribBidAsk dataclass"""
+
+    def test_tick_attrib_bid_ask_defaults(self):
+        """Test bid/ask tick attrib with defaults"""
+        attrib = TickAttribBidAsk()
+        assert attrib.bidPastLow is False
+        assert attrib.askPastHigh is False
+
+    def test_tick_attrib_bid_ask_str(self):
+        """Test bid/ask tick attrib string representation"""
+        attrib = TickAttribBidAsk(bidPastLow=True)
+        s = str(attrib)
+        assert "BidPastLow: 1" in s
+
+
+class TestTickAttribLast:
+    """Tests for TickAttribLast dataclass"""
+
+    def test_tick_attrib_last_defaults(self):
+        """Test last tick attrib with defaults"""
+        attrib = TickAttribLast()
+        assert attrib.pastLimit is False
+        assert attrib.unreported is False
+
+    def test_tick_attrib_last_str(self):
+        """Test last tick attrib string representation"""
+        attrib = TickAttribLast(unreported=True)
+        s = str(attrib)
+        assert "Unreported: 1" in s
+
+
+class TestHistoricalTick:
+    """Tests for HistoricalTick dataclass"""
+
+    def test_historical_tick_defaults(self):
+        """Test historical tick with defaults"""
+        tick = HistoricalTick()
+        assert tick.time == 0
+        assert tick.price == 0.0
+        assert tick.size == UNSET_DECIMAL
+
+    def test_historical_tick_with_values(self):
+        """Test historical tick with values"""
+        tick = HistoricalTick(time=1705315800, price=175.50, size=Decimal(100))
+        assert tick.time == 1705315800
+        assert tick.price == 175.50
+        assert tick.size == Decimal(100)
+
+
+class TestHistoricalTickBidAsk:
+    """Tests for HistoricalTickBidAsk dataclass"""
+
+    def test_historical_tick_bid_ask_defaults(self):
+        """Test bid/ask historical tick with defaults"""
+        tick = HistoricalTickBidAsk()
+        assert tick.time == 0
+        assert tick.priceBid == 0.0
+        assert tick.priceAsk == 0.0
+
+    def test_historical_tick_bid_ask_with_values(self):
+        """Test bid/ask historical tick with values"""
+        tick = HistoricalTickBidAsk(
+            time=1705315800,
+            priceBid=175.40,
+            priceAsk=175.50,
+            sizeBid=Decimal(100),
+            sizeAsk=Decimal(200),
+        )
+        assert tick.priceBid == 175.40
+        assert tick.priceAsk == 175.50
+
+
+class TestHistoricalTickLast:
+    """Tests for HistoricalTickLast dataclass"""
+
+    def test_historical_tick_last_defaults(self):
+        """Test last historical tick with defaults"""
+        tick = HistoricalTickLast()
+        assert tick.time == 0
+        assert tick.price == 0.0
+        assert tick.exchange == ""
+
+    def test_historical_tick_last_with_values(self):
+        """Test last historical tick with values"""
+        tick = HistoricalTickLast(
+            time=1705315800,
+            price=175.50,
+            size=Decimal(100),
+            exchange="NASDAQ",
+        )
+        assert tick.price == 175.50
+        assert tick.exchange == "NASDAQ"
+
+
+class TestBarData:
+    """Tests for BarData dataclass"""
+
+    def test_bar_data_defaults(self):
+        """Test bar data with defaults"""
+        bar = BarData()
+        assert bar.date == ""
+        assert bar.open == 0.0
+        assert bar.volume == UNSET_DECIMAL
+
+    def test_bar_data_with_values(self):
+        """Test bar data with values"""
+        bar = BarData(
+            date="20240115",
+            open=175.0,
+            high=180.0,
+            low=174.0,
+            close=178.0,
+            volume=Decimal(1000000),
+        )
+        assert bar.date == "20240115"
+        assert bar.open == 175.0
+        assert bar.close == 178.0
+
+    def test_bar_data_to_bar(self):
+        """Test converting BarData to Bar"""
+        bar_data = BarData(
+            date="20240115 10:00:00",
+            open=175.0,
+            high=180.0,
+            low=174.0,
+            close=178.0,
+            volume=Decimal(1000000),
+            wap=Decimal("177.50"),
+            barCount=5000,
+        )
+        bar = bar_data.to_bar("AAPL")
+        assert bar.symbol == "AAPL"
+        assert bar.timestamp == "20240115 10:00:00"
+        assert bar.open == 175.0
+        assert bar.close == 178.0
+        assert bar.volume == 1000000
+
+
+class TestRealTimeBar:
+    """Tests for RealTimeBar dataclass"""
+
+    def test_real_time_bar_defaults(self):
+        """Test real-time bar with defaults"""
+        bar = RealTimeBar()
+        assert bar.time == 0
+        assert bar.open_ == 0.0
+        assert bar.volume == UNSET_DECIMAL
+
+    def test_real_time_bar_with_values(self):
+        """Test real-time bar with values"""
+        bar = RealTimeBar(
+            time=1705315800,
+            open_=175.0,
+            high=175.5,
+            low=174.8,
+            close=175.2,
+            volume=Decimal(10000),
+            count=500,
+        )
+        assert bar.time == 1705315800
+        assert bar.open_ == 175.0
+        assert bar.close == 175.2
+
+
+class TestHistogramData:
+    """Tests for HistogramData dataclass"""
+
+    def test_histogram_data_defaults(self):
+        """Test histogram data with defaults"""
+        data = HistogramData()
+        assert data.price == 0.0
+        assert data.size == UNSET_DECIMAL
+
+    def test_histogram_data_with_values(self):
+        """Test histogram data with values"""
+        data = HistogramData(price=175.50, size=Decimal(50000))
+        assert data.price == 175.50
+        assert data.size == Decimal(50000)
+
+
+class TestOptionExerciseType:
+    """Tests for OptionExerciseType enum"""
+
+    def test_option_exercise_types(self):
+        """Test option exercise type values"""
+        assert OptionExerciseType.NoneItem.value == (-1, "None")
+        assert OptionExerciseType.Exercise.value == (1, "Exercise")
+        assert OptionExerciseType.Lapse.value == (2, "Lapse")
+        assert OptionExerciseType.Assigned.value == (100, "Assigned")
+        assert OptionExerciseType.Expired.value == (102, "Expired")

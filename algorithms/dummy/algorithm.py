@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from pathlib import Path
 
-from algorithms.base import (
+from ..base import (
     AlgorithmBase,
     TradeSignal,
     AlgorithmInstrument,

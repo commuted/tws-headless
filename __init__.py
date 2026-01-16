@@ -34,6 +34,23 @@ Quick Start:
 
 __version__ = "0.1.0"
 
+# Constants (IB API compatible)
+from .const import (
+    NO_VALID_ID,
+    MAX_MSG_LEN,
+    UNSET_INTEGER,
+    UNSET_LONG,
+    UNSET_DOUBLE,
+    UNSET_DECIMAL,
+    DOUBLE_INFINITY,
+    CUSTOMER,
+    FIRM,
+    AUCTION_UNSET,
+    AUCTION_MATCH,
+    AUCTION_IMPROVEMENT,
+    AUCTION_TRANSPARENT,
+)
+
 # Core classes
 from .models import (
     Position,
@@ -46,6 +63,32 @@ from .models import (
     AssetType,
     OrderAction,
     RebalanceStrategy,
+    # IB API compatible classes
+    Execution,
+    ExecutionFilter,
+    OrderState,
+    OrderAllocation,
+    CommissionAndFeesReport,
+    TickAttrib,
+    TickAttribBidAsk,
+    TickAttribLast,
+    HistoricalTick,
+    HistoricalTickBidAsk,
+    HistoricalTickLast,
+    BarData,
+    RealTimeBar,
+    HistogramData,
+    NewsProvider,
+    DepthMktDataDescription,
+    SmartComponent,
+    FamilyCode,
+    PriceIncrement,
+    HistoricalSession,
+    WshEventData,
+    OptionExerciseType,
+    # Type aliases
+    TickerId,
+    TagValueList,
 )
 
 from .client import IBClient
@@ -125,9 +168,81 @@ from .algorithms import (
     create_registry,
 )
 
+# Contract and Order builders (from Testbed patterns)
+from .contract_builder import ContractBuilder
+
+from .order_builder import OrderFactory
+
+from .algo_params import (
+    AlgoParams,
+    TWAP,
+    VWAP,
+    Adaptive,
+    PctVol,
+    ArrivalPrice,
+    MinImpact,
+    DarkIce,
+    ClosePx,
+)
+
+# Connection and streaming infrastructure
+from .connection_manager import (
+    ConnectionManager,
+    ConnectionConfig,
+    ConnectionState,
+    StreamSubscription,
+)
+
+from .data_feed import (
+    DataFeed,
+    DataType,
+    TickData,
+    DataBuffer,
+    BarAggregator,
+    InstrumentSubscription,
+)
+
+from .algorithm_runner import (
+    AlgorithmRunner,
+    ExecutionMode,
+    OrderExecutionMode,
+    AlgorithmConfig,
+    PendingOrder,
+    ExecutionResult,
+)
+
+from .order_reconciler import (
+    OrderReconciler,
+    ReconciledOrder,
+    ReconciliationMode,
+    PendingSignal,
+    ExecutionAllocation,
+)
+
+from .trading_engine import (
+    TradingEngine,
+    EngineConfig,
+    EngineState,
+    create_engine,
+)
+
 __all__ = [
     # Version
     "__version__",
+    # Constants
+    "NO_VALID_ID",
+    "MAX_MSG_LEN",
+    "UNSET_INTEGER",
+    "UNSET_LONG",
+    "UNSET_DOUBLE",
+    "UNSET_DECIMAL",
+    "DOUBLE_INFINITY",
+    "CUSTOMER",
+    "FIRM",
+    "AUCTION_UNSET",
+    "AUCTION_MATCH",
+    "AUCTION_IMPROVEMENT",
+    "AUCTION_TRANSPARENT",
     # Models
     "Position",
     "Bar",
@@ -140,6 +255,31 @@ __all__ = [
     "AssetType",
     "OrderAction",
     "RebalanceStrategy",
+    # IB API compatible models
+    "Execution",
+    "ExecutionFilter",
+    "OrderState",
+    "OrderAllocation",
+    "CommissionAndFeesReport",
+    "TickAttrib",
+    "TickAttribBidAsk",
+    "TickAttribLast",
+    "HistoricalTick",
+    "HistoricalTickBidAsk",
+    "HistoricalTickLast",
+    "BarData",
+    "RealTimeBar",
+    "HistogramData",
+    "NewsProvider",
+    "DepthMktDataDescription",
+    "SmartComponent",
+    "FamilyCode",
+    "PriceIncrement",
+    "HistoricalSession",
+    "WshEventData",
+    "OptionExerciseType",
+    "TickerId",
+    "TagValueList",
     # Client
     "IBClient",
     # Portfolio
@@ -207,4 +347,43 @@ __all__ = [
     "get_algorithm",
     "list_algorithms",
     "create_registry",
+    # Contract and Order builders (Testbed patterns)
+    "ContractBuilder",
+    "OrderFactory",
+    "AlgoParams",
+    "TWAP",
+    "VWAP",
+    "Adaptive",
+    "PctVol",
+    "ArrivalPrice",
+    "MinImpact",
+    "DarkIce",
+    "ClosePx",
+    # Connection and streaming infrastructure
+    "ConnectionManager",
+    "ConnectionConfig",
+    "ConnectionState",
+    "StreamSubscription",
+    "DataFeed",
+    "DataType",
+    "TickData",
+    "DataBuffer",
+    "BarAggregator",
+    "InstrumentSubscription",
+    "AlgorithmRunner",
+    "ExecutionMode",
+    "OrderExecutionMode",
+    "AlgorithmConfig",
+    "PendingOrder",
+    "ExecutionResult",
+    "TradingEngine",
+    "EngineConfig",
+    "EngineState",
+    "create_engine",
+    # Order reconciliation
+    "OrderReconciler",
+    "ReconciledOrder",
+    "ReconciliationMode",
+    "PendingSignal",
+    "ExecutionAllocation",
 ]

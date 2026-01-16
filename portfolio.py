@@ -16,8 +16,8 @@ from ibapi.account_summary_tags import AccountSummaryTags
 
 from ibapi.order import Order
 
-from client import IBClient
-from models import Position, AssetType, AccountSummary, Bar, BarSize, OrderRecord, OrderStatus
+from .client import IBClient
+from .models import Position, AssetType, AccountSummary, Bar, BarSize, OrderRecord, OrderStatus
 
 logger = logging.getLogger(__name__)
 

@@ -20,16 +20,16 @@ from datetime import datetime
 from threading import Event
 from typing import List, Optional
 
-from portfolio import Portfolio
-from rebalancer import (
+from .portfolio import Portfolio
+from .rebalancer import (
     Rebalancer,
     RebalanceConfig,
     create_60_40_targets,
     create_three_fund_targets,
     create_equal_weight_targets,
 )
-from models import TargetAllocation, AssetType, RebalanceStrategy, Bar, OrderAction
-from command_server import (
+from .models import TargetAllocation, AssetType, RebalanceStrategy, Bar, OrderAction
+from .command_server import (
     CommandServer,
     CommandResult,
     CommandStatus,

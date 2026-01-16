@@ -2,13 +2,22 @@
 models.py - Data models for the IB Portfolio system
 
 Contains all data classes used throughout the application.
+Compatible with the official Interactive Brokers API.
 """
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+from decimal import Decimal
 from ibapi.contract import Contract
 from ibapi.order import Order
+
+from .const import (
+    UNSET_INTEGER,
+    UNSET_DOUBLE,
+    UNSET_DECIMAL,
+    NO_VALID_ID,
+)
 
 
 class AssetType(Enum):
@@ -431,3 +440,463 @@ class ExecutionResult:
             for err in self.errors[:5]:
                 lines.append(f"    - {err}")
         return "\n".join(lines)
+
+
+# =============================================================================
+# Official IB API Compatible Classes
+# =============================================================================
+
+
+class OptionExerciseType(Enum):
+    """Option exercise types from the official IB API"""
+    NoneItem = (-1, "None")
+    Exercise = (1, "Exercise")
+    Lapse = (2, "Lapse")
+    DoNothing = (3, "DoNothing")
+    Assigned = (100, "Assigned")
+    AutoexerciseClearing = (101, "AutoexerciseClearing")
+    Expired = (102, "Expired")
+    Netting = (103, "Netting")
+    AutoexerciseTrading = (200, "AutoexerciseTrading")
+
+
+@dataclass
+class Execution:
+    """
+    Execution details from the official IB API.
+
+    This class provides details about the execution of an order including
+    execution ID, time, price, quantity, and other execution-specific info.
+    """
+    execId: str = ""
+    time: str = ""
+    acctNumber: str = ""
+    exchange: str = ""
+    side: str = ""                              # BOT or SLD
+    shares: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    price: float = 0.0
+    permId: int = 0
+    clientId: int = 0
+    orderId: int = 0
+    liquidation: int = 0
+    cumQty: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    avgPrice: float = 0.0
+    orderRef: str = ""
+    evRule: str = ""                            # Economic Value Rule
+    evMultiplier: float = 0.0                   # Economic Value Multiplier
+    modelCode: str = ""
+    lastLiquidity: int = 0                      # Last liquidity indicator
+    pendingPriceRevision: bool = False
+    submitter: str = ""
+    optExerciseOrLapseType: OptionExerciseType = OptionExerciseType.NoneItem
+
+    def __str__(self) -> str:
+        return (
+            f"ExecId: {self.execId}, Time: {self.time}, Account: {self.acctNumber}, "
+            f"Exchange: {self.exchange}, Side: {self.side}, Shares: {self.shares}, "
+            f"Price: {self.price}, PermId: {self.permId}, ClientId: {self.clientId}, "
+            f"OrderId: {self.orderId}, CumQty: {self.cumQty}, AvgPrice: {self.avgPrice}"
+        )
+
+
+@dataclass
+class ExecutionFilter:
+    """
+    Filter criteria for execution queries from the official IB API.
+
+    Used with reqExecutions() to filter which executions to return.
+    """
+    clientId: int = 0
+    acctCode: str = ""
+    time: str = ""
+    symbol: str = ""
+    secType: str = ""
+    exchange: str = ""
+    side: str = ""
+    lastNDays: int = field(default_factory=lambda: UNSET_INTEGER)
+    specificDates: Optional[List[str]] = None
+
+
+@dataclass
+class OrderAllocation:
+    """
+    Order allocation details for Financial Advisor accounts.
+
+    Provides details about how an order is allocated across sub-accounts.
+    """
+    account: str = ""
+    position: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    positionDesired: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    positionAfter: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    desiredAllocQty: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    allowedAllocQty: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    isMonetary: bool = False
+
+    def __str__(self) -> str:
+        return (
+            f"Account: {self.account}, Position: {self.position}, "
+            f"PositionDesired: {self.positionDesired}, PositionAfter: {self.positionAfter}"
+        )
+
+
+@dataclass
+class OrderState:
+    """
+    Order state and margin impact from the official IB API.
+
+    Contains status, margin impact (before/change/after), and commission info.
+    This is particularly useful for what-if orders.
+    """
+    status: str = ""
+
+    # Margin before order
+    initMarginBefore: str = ""
+    maintMarginBefore: str = ""
+    equityWithLoanBefore: str = ""
+
+    # Margin change from order
+    initMarginChange: str = ""
+    maintMarginChange: str = ""
+    equityWithLoanChange: str = ""
+
+    # Margin after order
+    initMarginAfter: str = ""
+    maintMarginAfter: str = ""
+    equityWithLoanAfter: str = ""
+
+    # Commission and fees
+    commissionAndFees: float = field(default_factory=lambda: UNSET_DOUBLE)
+    minCommissionAndFees: float = field(default_factory=lambda: UNSET_DOUBLE)
+    maxCommissionAndFees: float = field(default_factory=lambda: UNSET_DOUBLE)
+    commissionAndFeesCurrency: str = ""
+    marginCurrency: str = ""
+
+    # Outside RTH margin values
+    initMarginBeforeOutsideRTH: float = field(default_factory=lambda: UNSET_DOUBLE)
+    maintMarginBeforeOutsideRTH: float = field(default_factory=lambda: UNSET_DOUBLE)
+    equityWithLoanBeforeOutsideRTH: float = field(default_factory=lambda: UNSET_DOUBLE)
+    initMarginChangeOutsideRTH: float = field(default_factory=lambda: UNSET_DOUBLE)
+    maintMarginChangeOutsideRTH: float = field(default_factory=lambda: UNSET_DOUBLE)
+    equityWithLoanChangeOutsideRTH: float = field(default_factory=lambda: UNSET_DOUBLE)
+    initMarginAfterOutsideRTH: float = field(default_factory=lambda: UNSET_DOUBLE)
+    maintMarginAfterOutsideRTH: float = field(default_factory=lambda: UNSET_DOUBLE)
+    equityWithLoanAfterOutsideRTH: float = field(default_factory=lambda: UNSET_DOUBLE)
+
+    # Other fields
+    suggestedSize: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    rejectReason: str = ""
+    orderAllocations: Optional[List[OrderAllocation]] = None
+    warningText: str = ""
+    completedTime: str = ""
+    completedStatus: str = ""
+
+    def __str__(self) -> str:
+        return (
+            f"Status: {self.status}, InitMarginBefore: {self.initMarginBefore}, "
+            f"MaintMarginBefore: {self.maintMarginBefore}, "
+            f"CommissionAndFees: {self.commissionAndFees}"
+        )
+
+
+@dataclass
+class CommissionAndFeesReport:
+    """
+    Commission and fees report from the official IB API.
+
+    Received via commissionAndFeesReport callback after an execution.
+    """
+    execId: str = ""
+    commissionAndFees: float = 0.0
+    currency: str = ""
+    realizedPNL: float = 0.0
+    yield_: float = 0.0                         # yield is reserved word
+    yieldRedemptionDate: int = 0                # YYYYMMDD format
+
+    def __str__(self) -> str:
+        return (
+            f"ExecId: {self.execId}, CommissionAndFees: {self.commissionAndFees}, "
+            f"Currency: {self.currency}, RealizedPnL: {self.realizedPNL}"
+        )
+
+
+@dataclass
+class TickAttrib:
+    """
+    Tick attributes from the official IB API.
+
+    Provides additional information about price ticks.
+    """
+    canAutoExecute: bool = False
+    pastLimit: bool = False
+    preOpen: bool = False
+
+    def __str__(self) -> str:
+        return (
+            f"CanAutoExecute: {int(self.canAutoExecute)}, "
+            f"PastLimit: {int(self.pastLimit)}, PreOpen: {int(self.preOpen)}"
+        )
+
+
+@dataclass
+class TickAttribBidAsk:
+    """
+    Bid/Ask tick attributes from the official IB API.
+
+    Used with tick-by-tick bid/ask data.
+    """
+    bidPastLow: bool = False
+    askPastHigh: bool = False
+
+    def __str__(self) -> str:
+        return f"BidPastLow: {int(self.bidPastLow)}, AskPastHigh: {int(self.askPastHigh)}"
+
+
+@dataclass
+class TickAttribLast:
+    """
+    Last tick attributes from the official IB API.
+
+    Used with tick-by-tick last trade data.
+    """
+    pastLimit: bool = False
+    unreported: bool = False
+
+    def __str__(self) -> str:
+        return f"PastLimit: {int(self.pastLimit)}, Unreported: {int(self.unreported)}"
+
+
+@dataclass
+class HistoricalTick:
+    """
+    Historical tick data from the official IB API.
+    """
+    time: int = 0
+    price: float = 0.0
+    size: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+
+    def __str__(self) -> str:
+        return f"Time: {self.time}, Price: {self.price}, Size: {self.size}"
+
+
+@dataclass
+class HistoricalTickBidAsk:
+    """
+    Historical bid/ask tick data from the official IB API.
+    """
+    time: int = 0
+    tickAttribBidAsk: TickAttribBidAsk = field(default_factory=TickAttribBidAsk)
+    priceBid: float = 0.0
+    priceAsk: float = 0.0
+    sizeBid: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    sizeAsk: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+
+    def __str__(self) -> str:
+        return (
+            f"Time: {self.time}, Bid: {self.priceBid}x{self.sizeBid}, "
+            f"Ask: {self.priceAsk}x{self.sizeAsk}"
+        )
+
+
+@dataclass
+class HistoricalTickLast:
+    """
+    Historical last trade tick data from the official IB API.
+    """
+    time: int = 0
+    tickAttribLast: TickAttribLast = field(default_factory=TickAttribLast)
+    price: float = 0.0
+    size: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    exchange: str = ""
+    specialConditions: str = ""
+
+    def __str__(self) -> str:
+        return (
+            f"Time: {self.time}, Price: {self.price}, Size: {self.size}, "
+            f"Exchange: {self.exchange}"
+        )
+
+
+@dataclass
+class BarData:
+    """
+    Bar data (OHLCV) from the official IB API.
+
+    This is the official IB format for historical bar data.
+    """
+    date: str = ""
+    open: float = 0.0
+    high: float = 0.0
+    low: float = 0.0
+    close: float = 0.0
+    volume: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    wap: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    barCount: int = 0
+
+    def __str__(self) -> str:
+        return (
+            f"Date: {self.date}, O: {self.open}, H: {self.high}, "
+            f"L: {self.low}, C: {self.close}, V: {self.volume}"
+        )
+
+    def to_bar(self, symbol: str) -> "Bar":
+        """Convert to our Bar model"""
+        return Bar(
+            symbol=symbol,
+            timestamp=self.date,
+            open=self.open,
+            high=self.high,
+            low=self.low,
+            close=self.close,
+            volume=int(self.volume) if self.volume != UNSET_DECIMAL else 0,
+            wap=float(self.wap) if self.wap != UNSET_DECIMAL else 0.0,
+            bar_count=self.barCount,
+        )
+
+
+@dataclass
+class RealTimeBar:
+    """
+    Real-time bar data from the official IB API.
+
+    5-second bars from IB's realTimeBars streaming.
+    """
+    time: int = 0
+    endTime: int = -1
+    open_: float = 0.0                          # open is reserved
+    high: float = 0.0
+    low: float = 0.0
+    close: float = 0.0
+    volume: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    wap: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+    count: int = 0
+
+    def __str__(self) -> str:
+        return (
+            f"Time: {self.time}, O: {self.open_}, H: {self.high}, "
+            f"L: {self.low}, C: {self.close}, V: {self.volume}"
+        )
+
+
+@dataclass
+class HistogramData:
+    """
+    Histogram data point from the official IB API.
+    """
+    price: float = 0.0
+    size: Decimal = field(default_factory=lambda: UNSET_DECIMAL)
+
+    def __str__(self) -> str:
+        return f"Price: {self.price}, Size: {self.size}"
+
+
+@dataclass
+class NewsProvider:
+    """
+    News provider information from the official IB API.
+    """
+    code: str = ""
+    name: str = ""
+
+    def __str__(self) -> str:
+        return f"Code: {self.code}, Name: {self.name}"
+
+
+@dataclass
+class DepthMktDataDescription:
+    """
+    Market depth data description from the official IB API.
+    """
+    exchange: str = ""
+    secType: str = ""
+    listingExch: str = ""
+    serviceDataType: str = ""
+    aggGroup: int = field(default_factory=lambda: UNSET_INTEGER)
+
+    def __str__(self) -> str:
+        return (
+            f"Exchange: {self.exchange}, SecType: {self.secType}, "
+            f"ListingExch: {self.listingExch}"
+        )
+
+
+@dataclass
+class SmartComponent:
+    """
+    SMART routing component from the official IB API.
+    """
+    bitNumber: int = 0
+    exchange: str = ""
+    exchangeLetter: str = ""
+
+    def __str__(self) -> str:
+        return f"BitNumber: {self.bitNumber}, Exchange: {self.exchange}"
+
+
+@dataclass
+class FamilyCode:
+    """
+    Family code for linked accounts from the official IB API.
+    """
+    accountID: str = ""
+    familyCodeStr: str = ""
+
+    def __str__(self) -> str:
+        return f"AccountId: {self.accountID}, FamilyCodeStr: {self.familyCodeStr}"
+
+
+@dataclass
+class PriceIncrement:
+    """
+    Price increment rule from the official IB API.
+    """
+    lowEdge: float = 0.0
+    increment: float = 0.0
+
+    def __str__(self) -> str:
+        return f"LowEdge: {self.lowEdge}, Increment: {self.increment}"
+
+
+@dataclass
+class HistoricalSession:
+    """
+    Historical trading session from the official IB API.
+    """
+    startDateTime: str = ""
+    endDateTime: str = ""
+    refDate: str = ""
+
+    def __str__(self) -> str:
+        return f"Start: {self.startDateTime}, End: {self.endDateTime}, Ref: {self.refDate}"
+
+
+@dataclass
+class WshEventData:
+    """
+    Wall Street Horizon event data from the official IB API.
+    """
+    conId: int = field(default_factory=lambda: UNSET_INTEGER)
+    filter: str = ""
+    fillWatchlist: bool = False
+    fillPortfolio: bool = False
+    fillCompetitors: bool = False
+    startDate: str = ""
+    endDate: str = ""
+    totalLimit: int = field(default_factory=lambda: UNSET_INTEGER)
+
+    def __str__(self) -> str:
+        return f"ConId: {self.conId}, Filter: {self.filter}"
+
+
+# Type aliases from official API
+TickerId = int
+TagValueList = List
+ListOfHistoricalTick = List[HistoricalTick]
+ListOfHistoricalTickBidAsk = List[HistoricalTickBidAsk]
+ListOfHistoricalTickLast = List[HistoricalTickLast]
+ListOfHistoricalSessions = List[HistoricalSession]
+HistogramDataList = List[HistogramData]
+ListOfPriceIncrements = List[PriceIncrement]
+ListOfNewsProviders = List[NewsProvider]
+ListOfDepthExchanges = List[DepthMktDataDescription]
+SmartComponentMap = Dict[int, SmartComponent]
+ListOfFamilyCode = List[FamilyCode]

@@ -16,8 +16,8 @@ import uuid
 from ibapi.contract import Contract
 from ibapi.order import Order
 
-from models import OrderAction, OrderRecord, OrderStatus
-from portfolio import Portfolio
+from .models import OrderAction, OrderRecord, OrderStatus
+from .portfolio import Portfolio
 
 logger = logging.getLogger(__name__)
 

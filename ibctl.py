@@ -18,7 +18,7 @@ Usage:
 import argparse
 import json
 import sys
-from command_server import send_command, DEFAULT_SOCKET_PATH, CommandStatus
+from .command_server import send_command, DEFAULT_SOCKET_PATH, CommandStatus
 
 
 def format_result(result, verbose: bool = False):
