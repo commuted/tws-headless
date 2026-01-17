@@ -1,0 +1,9 @@
+{
+  "plugin_name": "dummy",
+  "plugin_version": "1.0.0",
+  "state": {
+    "run_counter": 0,
+    "last_signals": []
+  },
+  "saved_at": "2026-01-17T14:53:31.878924"
+}

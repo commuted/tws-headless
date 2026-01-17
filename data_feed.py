@@ -318,6 +318,7 @@ class DataFeed:
             "bars_aggregated": 0,
             "errors": 0,
             "started_at": None,
+            "last_reset": None,
         }
 
     @property
@@ -755,6 +756,23 @@ class DataFeed:
                     self._aggregators[sym] = BarAggregator(sym)
 
         logger.info(f"Cleared buffers for {symbol or 'all symbols'}")
+
+    def reset_stats(self):
+        """
+        Reset statistics counters.
+
+        Preserves started_at but resets all counters and sets last_reset.
+        """
+        started_at = self._stats.get("started_at")
+        self._stats = {
+            "ticks_received": 0,
+            "bars_received": 0,
+            "bars_aggregated": 0,
+            "errors": 0,
+            "started_at": started_at,
+            "last_reset": datetime.now().isoformat(),
+        }
+        logger.info("Data feed stats reset")
 
     def get_status(self) -> Dict[str, Any]:
         """

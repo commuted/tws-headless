@@ -397,3 +397,183 @@ class TestSendCommand:
             timeout=0.001,
         )
         assert result.status == CommandStatus.ERROR
+
+
+# =============================================================================
+# Authentication Tests
+# =============================================================================
+
+class TestCommandServerAuthentication:
+    """Tests for CommandServer authentication functionality"""
+
+    def test_unauthorized_status_exists(self):
+        """Test UNAUTHORIZED status exists"""
+        assert hasattr(CommandStatus, 'UNAUTHORIZED')
+        assert CommandStatus.UNAUTHORIZED.value == "unauthorized"
+
+    def test_server_auth_disabled_by_default(self):
+        """Test authentication is disabled by default"""
+        server = CommandServer()
+        assert server.auth_enabled is False
+
+    def test_server_with_token_file_enables_auth(self):
+        """Test authentication is enabled with token file"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pathlib import Path
+            from auth import TokenStore
+
+            token_path = Path(tmpdir) / "test.token"
+            store = TokenStore(token_path)
+            store.generate_and_save()
+
+            server = CommandServer(token_file=token_path)
+
+            assert server.auth_enabled is True
+
+    def test_execute_command_without_auth_when_disabled(self):
+        """Test commands work without auth when auth is disabled"""
+        server = CommandServer()
+
+        result = server._execute_command("ping")
+
+        assert result.status == CommandStatus.SUCCESS
+        assert result.message == "pong"
+
+    def test_execute_command_without_auth_when_required(self):
+        """Test commands fail without auth when auth is required"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pathlib import Path
+            from auth import TokenStore
+
+            token_path = Path(tmpdir) / "test.token"
+            store = TokenStore(token_path)
+            store.generate_and_save()
+
+            server = CommandServer(token_file=token_path)
+
+            result = server._execute_command("ping")
+
+            assert result.status == CommandStatus.UNAUTHORIZED
+            assert "Authentication required" in result.message
+
+    def test_execute_command_with_valid_token(self):
+        """Test commands succeed with valid token"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pathlib import Path
+            from auth import TokenStore
+
+            token_path = Path(tmpdir) / "test.token"
+            store = TokenStore(token_path)
+            token = store.generate_and_save()
+
+            server = CommandServer(token_file=token_path)
+
+            result = server._execute_command(f"AUTH {token} ping")
+
+            assert result.status == CommandStatus.SUCCESS
+            assert result.message == "pong"
+
+    def test_execute_command_with_invalid_token(self):
+        """Test commands fail with invalid token"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pathlib import Path
+            from auth import TokenStore
+
+            token_path = Path(tmpdir) / "test.token"
+            store = TokenStore(token_path)
+            store.generate_and_save()
+
+            server = CommandServer(token_file=token_path)
+
+            result = server._execute_command("AUTH wrong_token ping")
+
+            assert result.status == CommandStatus.UNAUTHORIZED
+            assert "Invalid" in result.message
+
+    def test_execute_command_with_token_and_args(self):
+        """Test authenticated commands with arguments work"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pathlib import Path
+            from auth import TokenStore
+
+            token_path = Path(tmpdir) / "test.token"
+            store = TokenStore(token_path)
+            token = store.generate_and_save()
+
+            server = CommandServer(token_file=token_path)
+
+            # Register a test handler
+            test_args = []
+            def test_handler(args):
+                test_args.extend(args)
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message="OK",
+                    data={"args": args},
+                )
+            server.register_handler("test", test_handler)
+
+            result = server._execute_command(f"AUTH {token} test arg1 arg2")
+
+            assert result.status == CommandStatus.SUCCESS
+            assert test_args == ["arg1", "arg2"]
+
+
+class TestSendCommandWithToken:
+    """Tests for send_command with authentication token"""
+
+    @pytest.fixture
+    def temp_socket_path(self):
+        """Create a temporary socket path"""
+        fd, path = tempfile.mkstemp(suffix=".sock")
+        os.close(fd)
+        os.unlink(path)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.fixture
+    def auth_server(self, temp_socket_path):
+        """Create a server with authentication enabled"""
+        from pathlib import Path
+        from auth import TokenStore
+
+        # Create token in temporary directory
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = Path(tmpdir) / "test.token"
+            store = TokenStore(token_path)
+            token = store.generate_and_save()
+
+            server = CommandServer(socket_path=temp_socket_path, token_file=token_path)
+            started = server.start()
+            assert started, "Server failed to start"
+            time.sleep(0.1)
+
+            yield server, temp_socket_path, token
+
+            server.stop()
+
+    def test_send_command_with_token(self, auth_server):
+        """Test sending command with authentication token"""
+        server, socket_path, token = auth_server
+
+        result = send_command("ping", socket_path=socket_path, token=token)
+
+        assert result.status == CommandStatus.SUCCESS
+        assert result.message == "pong"
+
+    def test_send_command_without_token_fails(self, auth_server):
+        """Test sending command without token fails when auth required"""
+        server, socket_path, token = auth_server
+
+        result = send_command("ping", socket_path=socket_path)
+
+        assert result.status == CommandStatus.UNAUTHORIZED
+
+    def test_send_command_with_wrong_token_fails(self, auth_server):
+        """Test sending command with wrong token fails"""
+        server, socket_path, token = auth_server
+
+        result = send_command("ping", socket_path=socket_path, token="wrong_token")
+
+        assert result.status == CommandStatus.UNAUTHORIZED

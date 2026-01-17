@@ -1,0 +1,60 @@
+{
+  "plugin_name": "momentum_5day",
+  "plugin_version": "1.0.0",
+  "state": {
+    "run_counter": 1,
+    "last_target_weights": {
+      "SPY": 68.28316065815332,
+      "QQQ": 31.716839341846665
+    },
+    "signals_history": [
+      {
+        "run_number": 1,
+        "timestamp": "2026-01-17T14:53:48.838031",
+        "signals": [
+          {
+            "symbol": "SPY",
+            "action": "HOLD",
+            "quantity": 0,
+            "target_weight": 68.28316065815332,
+            "reason": "Below minimum size ($0)"
+          },
+          {
+            "symbol": "QQQ",
+            "action": "HOLD",
+            "quantity": 0,
+            "target_weight": 31.716839341846665,
+            "reason": "Below minimum size ($0)"
+          }
+        ]
+      }
+    ],
+    "momentum_metrics": {
+      "SPY": {
+        "symbol": "SPY",
+        "returns_5d": 2.2522522522522523,
+        "returns_1d": 0.6651884700665188,
+        "avg_return": 0.5584314343120128,
+        "volatility": 0.12940060394642738,
+        "momentum_score": 4.315524172848581,
+        "trend": "up"
+      },
+      "QQQ": {
+        "symbol": "QQQ",
+        "returns_5d": -1.675977653631285,
+        "returns_1d": -0.28328611898017,
+        "avg_return": -0.4215561237379751,
+        "volatility": 0.16105320616131455,
+        "momentum_score": -2.617496005113583,
+        "trend": "neutral"
+      }
+    },
+    "parameters": {
+      "lookback_days": 5,
+      "rebalance_threshold": 5.0,
+      "momentum_weight": 0.5,
+      "min_position_size": 1000.0
+    }
+  },
+  "saved_at": "2026-01-17T14:53:48.838437"
+}

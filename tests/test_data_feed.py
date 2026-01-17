@@ -893,3 +893,82 @@ class TestThreadSafety:
 
         assert len(errors) == 0
         assert feed.stats["ticks_received"] == 500  # 5 threads * 100 ticks
+
+
+class TestResetStats:
+    """Tests for reset_stats functionality"""
+
+    def test_reset_stats_clears_counters(self):
+        """Test reset_stats clears all counters"""
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        contract = create_contract("SPY")
+        feed.subscribe("SPY", contract)
+
+        # Generate some activity
+        for i in range(10):
+            feed._handle_tick("SPY", 450.0 + i, "LAST")
+
+        # Verify stats have values
+        assert feed.stats["ticks_received"] == 10
+
+        # Reset stats
+        feed.reset_stats()
+
+        # Counters should be zero
+        assert feed.stats["ticks_received"] == 0
+        assert feed.stats["bars_received"] == 0
+        assert feed.stats["bars_aggregated"] == 0
+        assert feed.stats["errors"] == 0
+
+    def test_reset_stats_preserves_started_at(self):
+        """Test reset_stats preserves started_at timestamp"""
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        contract = create_contract("SPY")
+        feed.subscribe("SPY", contract)
+        feed.start()
+
+        original_started_at = feed.stats["started_at"]
+        assert original_started_at is not None
+
+        feed.reset_stats()
+
+        assert feed.stats["started_at"] == original_started_at
+
+    def test_reset_stats_sets_last_reset(self):
+        """Test reset_stats sets last_reset timestamp"""
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+
+        assert feed.stats["last_reset"] is None
+
+        feed.reset_stats()
+
+        assert feed.stats["last_reset"] is not None
+
+    def test_reset_stats_updates_last_reset(self):
+        """Test reset_stats updates last_reset on each call"""
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+
+        feed.reset_stats()
+        first_reset = feed.stats["last_reset"]
+
+        # Small delay to ensure different timestamps
+        import time
+        time.sleep(0.01)
+
+        feed.reset_stats()
+        second_reset = feed.stats["last_reset"]
+
+        assert first_reset != second_reset
+
+    def test_stats_include_last_reset(self):
+        """Test stats include last_reset field"""
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+
+        stats = feed.stats
+
+        assert "last_reset" in stats

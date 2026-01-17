@@ -1,20 +1,25 @@
 """
-algorithms - Trading Algorithm Framework
+algorithms - Trading Algorithm Framework (DEPRECATED)
 
-Provides a framework for implementing and managing multiple trading algorithms.
-Each algorithm has its own:
-- Instruments file (allowed securities with target weights)
-- Trading logic
+NOTE: This module is deprecated in favor of the new 'plugins' module.
+The algorithms module is maintained for backward compatibility.
 
-Holdings can be:
-- Per-algorithm (legacy): Each algorithm has its own holdings.json
-- Shared: All algorithms share a single shared_holdings.json
+Migration Guide:
+    - AlgorithmBase -> PluginBase
+    - AlgorithmInstrument -> PluginInstrument
+    - AlgorithmResult -> PluginResult
+    - AlgorithmRunner -> PluginExecutive
+    - DummyAlgorithm -> DummyPlugin (from plugins.dummy)
+    - Momentum5DayAlgorithm -> Momentum5DayPlugin (from plugins.momentum_5day)
 
-Available Algorithms:
-- momentum_5day: 5-day momentum-based reallocation
-- dummy: Placeholder algorithm (always HOLD)
+New Plugin System Features:
+    - Standardized lifecycle (start, stop, freeze, resume)
+    - Custom request handling (handle_request)
+    - MessageBus pub/sub for indicator feeds
+    - Automatic state persistence
+    - Dynamic plugin loading via socket commands
 
-Usage:
+Usage (Legacy - still supported):
     from algorithms import AlgorithmRegistry, SharedHoldings
 
     # Create shared holdings for multiple algorithms
@@ -29,11 +34,31 @@ Usage:
 
     # Run all algorithms together
     results = registry.run_all(market_data)
+
+Usage (New - recommended):
+    from plugins import PluginBase, PluginInstrument
+    from plugin_executive import PluginExecutive
+    from message_bus import MessageBus
+
+    bus = MessageBus()
+    executive = PluginExecutive(portfolio, data_feed, message_bus=bus)
+    executive.load_plugin_from_file("/path/to/my_plugin.py")
+    executive.start_plugin("my_plugin")
 """
 
 import logging
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Type
+
+# Emit deprecation warning on import
+warnings.warn(
+    "The 'algorithms' module is deprecated. "
+    "Please migrate to the 'plugins' module for new development. "
+    "See module docstring for migration guide.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 from .base import (
     AlgorithmBase,
@@ -454,4 +479,22 @@ __all__ = [
     "get_algorithm",
     "list_algorithms",
     "create_registry",
+    # Forward compatibility aliases (use plugins module instead)
+    "PluginBase",
+    "PluginInstrument",
+    "PluginResult",
 ]
+
+
+# =============================================================================
+# Forward Compatibility Aliases
+# =============================================================================
+
+# These aliases allow code to import from algorithms module while actually
+# getting the new plugin classes. Useful for gradual migration.
+
+try:
+    from ..plugins.base import PluginBase, PluginInstrument, PluginResult
+except ImportError:
+    # plugins module not available, skip aliases
+    pass

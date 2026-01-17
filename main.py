@@ -201,10 +201,20 @@ class CommandHandler:
     via external socket commands.
     """
 
-    def __init__(self, portfolio: Portfolio, shutdown_mgr: ShutdownManager):
+    def __init__(self, portfolio: Portfolio, shutdown_mgr: ShutdownManager, algorithm_runner=None, plugin_executive=None):
         self.portfolio = portfolio
         self.shutdown_mgr = shutdown_mgr
+        self.algorithm_runner = algorithm_runner
+        self.plugin_executive = plugin_executive
         self._liquidation_in_progress = False
+
+    def set_algorithm_runner(self, runner):
+        """Set the algorithm runner for algo commands"""
+        self.algorithm_runner = runner
+
+    def set_plugin_executive(self, executive):
+        """Set the plugin executive for plugin commands"""
+        self.plugin_executive = executive
 
     def register_commands(self, server: CommandServer):
         """Register all command handlers with the server"""
@@ -215,6 +225,8 @@ class CommandHandler:
         server.register_handler("shutdown", self.handle_stop)
         server.register_handler("sell", self.handle_sell)
         server.register_handler("buy", self.handle_buy)
+        server.register_handler("algo", self.handle_algo)
+        server.register_handler("plugin", self.handle_plugin)
 
     def handle_status(self, args: List[str]) -> CommandResult:
         """Handle 'status' command - return portfolio status"""
@@ -503,6 +515,657 @@ class CommandHandler:
                 status=CommandStatus.ERROR,
                 message=f"Failed to place buy order for {symbol}",
             )
+
+    def handle_algo(self, args: List[str]) -> CommandResult:
+        """
+        Handle 'algo' command - algorithm control.
+
+        Usage:
+            algo list                       - List all algorithms
+            algo status <name>              - Get algorithm status
+            algo enable <name>              - Enable algorithm
+            algo disable <name>             - Disable algorithm
+            algo pause <name>               - Pause algorithm
+            algo resume <name>              - Resume algorithm
+            algo reset-cb <name>            - Reset circuit breaker
+            algo trigger <name>             - Manually trigger algorithm run
+            algo param <name> <key> <value> - Set algorithm parameter
+            algo params <name>              - Get algorithm parameters
+        """
+        if self.algorithm_runner is None:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Algorithm runner not configured",
+            )
+
+        if not args:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Usage: algo <command> [args]. Use 'algo list' to see algorithms.",
+            )
+
+        subcommand = args[0].lower()
+        subargs = args[1:]
+
+        try:
+            if subcommand == "list":
+                return self._algo_list()
+            elif subcommand == "status":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: algo status <name>",
+                    )
+                return self._algo_status(subargs[0])
+            elif subcommand == "enable":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: algo enable <name>",
+                    )
+                return self._algo_enable(subargs[0], True)
+            elif subcommand == "disable":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: algo disable <name>",
+                    )
+                return self._algo_enable(subargs[0], False)
+            elif subcommand == "pause":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: algo pause <name>",
+                    )
+                return self._algo_pause(subargs[0])
+            elif subcommand == "resume":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: algo resume <name>",
+                    )
+                return self._algo_resume(subargs[0])
+            elif subcommand == "reset-cb":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: algo reset-cb <name>",
+                    )
+                return self._algo_reset_cb(subargs[0])
+            elif subcommand == "trigger":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: algo trigger <name>",
+                    )
+                return self._algo_trigger(subargs[0])
+            elif subcommand == "param":
+                if len(subargs) < 3:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: algo param <name> <key> <value>",
+                    )
+                return self._algo_set_param(subargs[0], subargs[1], subargs[2])
+            elif subcommand == "params":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: algo params <name>",
+                    )
+                return self._algo_get_params(subargs[0])
+            else:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Unknown algo subcommand: {subcommand}",
+                )
+        except Exception as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Algorithm command failed: {e}",
+            )
+
+    def _algo_list(self) -> CommandResult:
+        """List all registered algorithms"""
+        algorithms = self.algorithm_runner.algorithms
+        all_status = {}
+        for name in algorithms:
+            status = self.algorithm_runner.get_algorithm_status(name)
+            if status:
+                all_status[name] = {
+                    "enabled": status["enabled"],
+                    "paused": status.get("paused", False),
+                    "circuit_breaker_state": status["circuit_breaker"]["state"],
+                    "run_count": status["run_count"],
+                }
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"{len(algorithms)} algorithms registered",
+            data={"algorithms": all_status},
+        )
+
+    def _algo_status(self, name: str) -> CommandResult:
+        """Get detailed algorithm status"""
+        status = self.algorithm_runner.get_algorithm_status(name)
+        if status is None:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Algorithm '{name}' not found",
+            )
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"Algorithm '{name}': {'enabled' if status['enabled'] else 'disabled'}",
+            data=status,
+        )
+
+    def _algo_enable(self, name: str, enabled: bool) -> CommandResult:
+        """Enable or disable an algorithm"""
+        if name not in self.algorithm_runner.algorithms:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Algorithm '{name}' not found",
+            )
+
+        self.algorithm_runner.enable_algorithm(name, enabled)
+        action = "enabled" if enabled else "disabled"
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"Algorithm '{name}' {action}",
+        )
+
+    def _algo_pause(self, name: str) -> CommandResult:
+        """Pause an algorithm"""
+        if self.algorithm_runner.pause_algorithm(name):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Algorithm '{name}' paused",
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to pause algorithm '{name}'",
+        )
+
+    def _algo_resume(self, name: str) -> CommandResult:
+        """Resume an algorithm"""
+        if self.algorithm_runner.resume_algorithm(name):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Algorithm '{name}' resumed",
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to resume algorithm '{name}'",
+        )
+
+    def _algo_reset_cb(self, name: str) -> CommandResult:
+        """Reset algorithm circuit breaker"""
+        if self.algorithm_runner.reset_circuit_breaker(name):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Circuit breaker reset for '{name}'",
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to reset circuit breaker for '{name}'",
+        )
+
+    def _algo_trigger(self, name: str) -> CommandResult:
+        """Manually trigger an algorithm"""
+        result = self.algorithm_runner.trigger_algorithm(name)
+        if result is None:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Algorithm '{name}' not found",
+            )
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS if result.success else CommandStatus.ERROR,
+            message=f"Algorithm '{name}' triggered: {result.signals_count} signals",
+            data={
+                "success": result.success,
+                "signals_count": result.signals_count,
+                "error": result.error,
+            },
+        )
+
+    def _algo_set_param(self, name: str, key: str, value: str) -> CommandResult:
+        """Set an algorithm parameter"""
+        # Try to parse value as number or boolean
+        parsed_value: any = value
+        if value.lower() in ("true", "false"):
+            parsed_value = value.lower() == "true"
+        else:
+            try:
+                parsed_value = float(value)
+                if parsed_value.is_integer():
+                    parsed_value = int(parsed_value)
+            except ValueError:
+                pass  # Keep as string
+
+        if self.algorithm_runner.set_algorithm_parameter(name, key, parsed_value):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Parameter '{key}' set to '{parsed_value}' for '{name}'",
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to set parameter for '{name}'",
+        )
+
+    def _algo_get_params(self, name: str) -> CommandResult:
+        """Get algorithm parameters"""
+        params = self.algorithm_runner.get_algorithm_parameters(name)
+        if params is None:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Algorithm '{name}' not found",
+            )
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"{len(params)} parameters",
+            data={"parameters": params},
+        )
+
+    # =========================================================================
+    # Plugin Commands
+    # =========================================================================
+
+    def handle_plugin(self, args: List[str]) -> CommandResult:
+        """
+        Handle 'plugin' command - plugin lifecycle control.
+
+        Usage:
+            plugin list                          - List all plugins
+            plugin load <path>                   - Load plugin from file
+            plugin unload <name>                 - Unload plugin
+            plugin status <name>                 - Get plugin status
+            plugin start <name>                  - Start plugin
+            plugin stop <name>                   - Stop plugin
+            plugin freeze <name>                 - Freeze plugin
+            plugin resume <name>                 - Resume plugin
+            plugin enable <name>                 - Enable plugin for execution
+            plugin disable <name>                - Disable plugin
+            plugin request <name> <type> <json>  - Send custom request
+            plugin param <name> <key> <value>    - Set plugin parameter
+            plugin params <name>                 - Get plugin parameters
+            plugin feeds                         - List MessageBus channels
+            plugin history <channel> [count]     - Get channel message history
+        """
+        if self.plugin_executive is None:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Plugin executive not configured",
+            )
+
+        if not args:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Usage: plugin <command> [args]. Use 'plugin list' to see plugins.",
+            )
+
+        subcommand = args[0].lower()
+        subargs = args[1:]
+
+        try:
+            if subcommand == "list":
+                return self._plugin_list()
+            elif subcommand == "load":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin load <path>",
+                    )
+                return self._plugin_load(subargs[0])
+            elif subcommand == "unload":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin unload <name>",
+                    )
+                return self._plugin_unload(subargs[0])
+            elif subcommand == "status":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin status <name>",
+                    )
+                return self._plugin_status(subargs[0])
+            elif subcommand == "start":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin start <name>",
+                    )
+                return self._plugin_start(subargs[0])
+            elif subcommand == "stop":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin stop <name>",
+                    )
+                return self._plugin_stop(subargs[0])
+            elif subcommand == "freeze":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin freeze <name>",
+                    )
+                return self._plugin_freeze(subargs[0])
+            elif subcommand == "resume":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin resume <name>",
+                    )
+                return self._plugin_resume(subargs[0])
+            elif subcommand == "enable":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin enable <name>",
+                    )
+                return self._plugin_enable(subargs[0], True)
+            elif subcommand == "disable":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin disable <name>",
+                    )
+                return self._plugin_enable(subargs[0], False)
+            elif subcommand == "request":
+                if len(subargs) < 2:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin request <name> <type> [json_payload]",
+                    )
+                payload = subargs[2] if len(subargs) > 2 else "{}"
+                return self._plugin_request(subargs[0], subargs[1], payload)
+            elif subcommand == "param":
+                if len(subargs) < 3:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin param <name> <key> <value>",
+                    )
+                return self._plugin_set_param(subargs[0], subargs[1], subargs[2])
+            elif subcommand == "params":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin params <name>",
+                    )
+                return self._plugin_get_params(subargs[0])
+            elif subcommand == "feeds":
+                return self._plugin_feeds()
+            elif subcommand == "history":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin history <channel> [count]",
+                    )
+                count = int(subargs[1]) if len(subargs) > 1 else 10
+                return self._plugin_history(subargs[0], count)
+            elif subcommand == "reset-cb":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin reset-cb <name>",
+                    )
+                return self._plugin_reset_cb(subargs[0])
+            elif subcommand == "trigger":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin trigger <name>",
+                    )
+                return self._plugin_trigger(subargs[0])
+            else:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Unknown plugin subcommand: {subcommand}",
+                )
+        except Exception as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Plugin command failed: {e}",
+            )
+
+    def _plugin_list(self) -> CommandResult:
+        """List all registered plugins"""
+        plugins = self.plugin_executive.plugins
+        all_status = {}
+        for name in plugins:
+            status = self.plugin_executive.get_plugin_status(name)
+            if status:
+                all_status[name] = {
+                    "state": status["state"],
+                    "enabled": status["enabled"],
+                    "circuit_breaker_state": status["circuit_breaker"]["state"],
+                    "run_count": status["run_count"],
+                }
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"{len(plugins)} plugins registered",
+            data={"plugins": all_status},
+        )
+
+    def _plugin_load(self, path: str) -> CommandResult:
+        """Load a plugin from file"""
+        name = self.plugin_executive.load_plugin_from_file(path)
+        if name:
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Plugin '{name}' loaded from {path}",
+                data={"plugin_name": name, "path": path},
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to load plugin from {path}",
+        )
+
+    def _plugin_unload(self, name: str) -> CommandResult:
+        """Unload a plugin"""
+        if self.plugin_executive.unload_plugin(name):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Plugin '{name}' unloaded",
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to unload plugin '{name}'",
+        )
+
+    def _plugin_status(self, name: str) -> CommandResult:
+        """Get detailed plugin status"""
+        status = self.plugin_executive.get_plugin_status(name)
+        if status is None:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Plugin '{name}' not found",
+            )
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"Plugin '{name}': {status['state']}",
+            data=status,
+        )
+
+    def _plugin_start(self, name: str) -> CommandResult:
+        """Start a plugin"""
+        if self.plugin_executive.start_plugin(name):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Plugin '{name}' started",
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to start plugin '{name}'",
+        )
+
+    def _plugin_stop(self, name: str) -> CommandResult:
+        """Stop a plugin"""
+        if self.plugin_executive.stop_plugin(name):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Plugin '{name}' stopped",
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to stop plugin '{name}'",
+        )
+
+    def _plugin_freeze(self, name: str) -> CommandResult:
+        """Freeze a plugin"""
+        if self.plugin_executive.freeze_plugin(name):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Plugin '{name}' frozen",
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to freeze plugin '{name}'",
+        )
+
+    def _plugin_resume(self, name: str) -> CommandResult:
+        """Resume a frozen plugin"""
+        if self.plugin_executive.resume_plugin(name):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Plugin '{name}' resumed",
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to resume plugin '{name}'",
+        )
+
+    def _plugin_enable(self, name: str, enabled: bool) -> CommandResult:
+        """Enable or disable a plugin for continuous execution"""
+        if self.plugin_executive.enable_plugin(name, enabled):
+            action = "enabled" if enabled else "disabled"
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Plugin '{name}' {action}",
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Plugin '{name}' not found",
+        )
+
+    def _plugin_request(self, name: str, request_type: str, payload_json: str) -> CommandResult:
+        """Send a custom request to a plugin"""
+        import json
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Invalid JSON payload: {e}",
+            )
+
+        response = self.plugin_executive.send_request(name, request_type, payload)
+
+        if response.get("success"):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=response.get("message", "Request successful"),
+                data=response.get("data", {}),
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=response.get("message", "Request failed"),
+        )
+
+    def _plugin_set_param(self, name: str, key: str, value: str) -> CommandResult:
+        """Set a plugin parameter"""
+        # Try to parse value as number or boolean
+        parsed_value: any = value
+        if value.lower() in ("true", "false"):
+            parsed_value = value.lower() == "true"
+        else:
+            try:
+                parsed_value = float(value)
+                if parsed_value.is_integer():
+                    parsed_value = int(parsed_value)
+            except ValueError:
+                pass
+
+        if self.plugin_executive.set_plugin_parameter(name, key, parsed_value):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Parameter '{key}' set to '{parsed_value}' for '{name}'",
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to set parameter for '{name}'",
+        )
+
+    def _plugin_get_params(self, name: str) -> CommandResult:
+        """Get plugin parameters"""
+        params = self.plugin_executive.get_plugin_parameters(name)
+        if params is None:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Plugin '{name}' not found",
+            )
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"{len(params)} parameters",
+            data={"parameters": params},
+        )
+
+    def _plugin_feeds(self) -> CommandResult:
+        """List all MessageBus channels"""
+        feeds = self.plugin_executive.list_feeds()
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"{len(feeds)} channels",
+            data={"channels": feeds},
+        )
+
+    def _plugin_history(self, channel: str, count: int) -> CommandResult:
+        """Get message history for a channel"""
+        history = self.plugin_executive.get_feed_history(channel, count=count)
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"{len(history)} messages from '{channel}'",
+            data={"messages": history},
+        )
+
+    def _plugin_reset_cb(self, name: str) -> CommandResult:
+        """Reset plugin circuit breaker"""
+        if self.plugin_executive.reset_circuit_breaker(name):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Circuit breaker reset for '{name}'",
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to reset circuit breaker for '{name}'",
+        )
+
+    def _plugin_trigger(self, name: str) -> CommandResult:
+        """Manually trigger a plugin"""
+        result = self.plugin_executive.trigger_plugin(name)
+        if result is None:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Plugin '{name}' not found",
+            )
+
+        signals_count = len(result.actionable_signals) if result.signals else 0
+        return CommandResult(
+            status=CommandStatus.SUCCESS if result.success else CommandStatus.ERROR,
+            message=f"Plugin '{name}' triggered: {signals_count} actionable signals",
+            data={
+                "success": result.success,
+                "signals_count": signals_count,
+                "error": result.error,
+            },
+        )
 
     def handle_stop(self, args: List[str]) -> CommandResult:
         """Handle 'stop' or 'shutdown' command - initiate graceful shutdown"""

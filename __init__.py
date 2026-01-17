@@ -209,6 +209,7 @@ from .algorithm_runner import (
     AlgorithmConfig,
     PendingOrder,
     ExecutionResult,
+    CircuitBreaker,
 )
 
 from .order_reconciler import (
@@ -224,6 +225,22 @@ from .trading_engine import (
     EngineConfig,
     EngineState,
     create_engine,
+)
+
+from .rate_limiter import (
+    RateLimiter,
+    RateLimiterConfig,
+    RateLimiterStats,
+    OrderRateLimiter,
+)
+
+from .auth import (
+    TokenStore,
+    Authenticator,
+    AuthResult,
+    generate_token,
+    create_token_file,
+    load_token,
 )
 
 __all__ = [
@@ -376,6 +393,7 @@ __all__ = [
     "AlgorithmConfig",
     "PendingOrder",
     "ExecutionResult",
+    "CircuitBreaker",
     "TradingEngine",
     "EngineConfig",
     "EngineState",
@@ -386,4 +404,16 @@ __all__ = [
     "ReconciliationMode",
     "PendingSignal",
     "ExecutionAllocation",
+    # Rate limiting
+    "RateLimiter",
+    "RateLimiterConfig",
+    "RateLimiterStats",
+    "OrderRateLimiter",
+    # Authentication
+    "TokenStore",
+    "Authenticator",
+    "AuthResult",
+    "generate_token",
+    "create_token_file",
+    "load_token",
 ]

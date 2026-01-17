@@ -1188,3 +1188,247 @@ class TestGlobalShutdownManager:
 
         assert isinstance(shutdown_manager, ShutdownManager)
 
+
+# =============================================================================
+# Algorithm Command Handler Tests
+# =============================================================================
+
+class TestCommandHandlerAlgoRegistration:
+    """Tests for algo command registration"""
+
+    @pytest.fixture
+    def handler(self, mock_ibapi):
+        """Create CommandHandler for testing"""
+        from main import CommandHandler
+
+        mock_portfolio = MagicMock()
+        mock_shutdown = MagicMock()
+        return CommandHandler(mock_portfolio, mock_shutdown)
+
+    def test_algo_command_registered(self, handler):
+        """Test algo command is registered"""
+        mock_server = MagicMock()
+
+        handler.register_commands(mock_server)
+
+        calls = mock_server.register_handler.call_args_list
+        command_names = [call[0][0] for call in calls]
+
+        assert "algo" in command_names
+
+
+class TestCommandHandlerAlgoCommands:
+    """Tests for handle_algo command"""
+
+    @pytest.fixture
+    def handler_with_runner(self, mock_ibapi):
+        """Create CommandHandler with algorithm runner for testing"""
+        from main import CommandHandler
+
+        mock_portfolio = MagicMock()
+        mock_shutdown = MagicMock()
+        handler = CommandHandler(mock_portfolio, mock_shutdown)
+
+        # Create mock algorithm runner
+        mock_runner = MagicMock()
+        mock_runner.algorithms = ["test_algo", "momentum_algo"]
+        mock_runner.get_algorithm_status.return_value = {
+            "name": "test_algo",
+            "enabled": True,
+            "paused": False,
+            "execution_mode": "on_bar",
+            "circuit_breaker": {"state": "closed", "consecutive_failures": 0},
+            "parameters": {"lookback": 20},
+        }
+        mock_runner.enable_algorithm.return_value = True
+        mock_runner.pause_algorithm.return_value = True
+        mock_runner.resume_algorithm.return_value = True
+        mock_runner.reset_circuit_breaker.return_value = True
+        mock_runner.trigger_algorithm.return_value = MagicMock(success=True)
+        mock_runner.set_algorithm_parameter.return_value = True
+        mock_runner.get_algorithm_parameters.return_value = {"lookback": 20}
+
+        handler.set_algorithm_runner(mock_runner)
+
+        return handler
+
+    def test_handle_algo_no_runner(self, mock_ibapi):
+        """Test handle_algo when no runner is set"""
+        from main import CommandHandler
+        from command_server import CommandStatus
+
+        mock_portfolio = MagicMock()
+        mock_shutdown = MagicMock()
+        handler = CommandHandler(mock_portfolio, mock_shutdown)
+
+        result = handler.handle_algo(["list"])
+
+        assert result.status == CommandStatus.ERROR
+        assert "not available" in result.message.lower()
+
+    def test_handle_algo_no_subcommand(self, handler_with_runner):
+        """Test handle_algo with no subcommand"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo([])
+
+        assert result.status == CommandStatus.ERROR
+        assert "Usage" in result.message
+
+    def test_handle_algo_unknown_subcommand(self, handler_with_runner):
+        """Test handle_algo with unknown subcommand"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["unknown"])
+
+        assert result.status == CommandStatus.ERROR
+        assert "Unknown" in result.message
+
+    def test_handle_algo_list(self, handler_with_runner):
+        """Test algo list command"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["list"])
+
+        assert result.status == CommandStatus.SUCCESS
+        assert "algorithms" in result.data
+        assert len(result.data["algorithms"]) == 2
+
+    def test_handle_algo_status(self, handler_with_runner):
+        """Test algo status command"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["status", "test_algo"])
+
+        assert result.status == CommandStatus.SUCCESS
+        assert result.data["name"] == "test_algo"
+        assert result.data["enabled"] is True
+
+    def test_handle_algo_status_no_name(self, handler_with_runner):
+        """Test algo status without algorithm name"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["status"])
+
+        assert result.status == CommandStatus.ERROR
+        assert "Usage" in result.message
+
+    def test_handle_algo_status_not_found(self, handler_with_runner):
+        """Test algo status for nonexistent algorithm"""
+        from command_server import CommandStatus
+
+        handler_with_runner._algorithm_runner.get_algorithm_status.return_value = None
+
+        result = handler_with_runner.handle_algo(["status", "nonexistent"])
+
+        assert result.status == CommandStatus.ERROR
+        assert "not found" in result.message.lower()
+
+    def test_handle_algo_enable(self, handler_with_runner):
+        """Test algo enable command"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["enable", "test_algo"])
+
+        assert result.status == CommandStatus.SUCCESS
+        handler_with_runner._algorithm_runner.enable_algorithm.assert_called_once_with("test_algo", enabled=True)
+
+    def test_handle_algo_disable(self, handler_with_runner):
+        """Test algo disable command"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["disable", "test_algo"])
+
+        assert result.status == CommandStatus.SUCCESS
+        handler_with_runner._algorithm_runner.enable_algorithm.assert_called_once_with("test_algo", enabled=False)
+
+    def test_handle_algo_pause(self, handler_with_runner):
+        """Test algo pause command"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["pause", "test_algo"])
+
+        assert result.status == CommandStatus.SUCCESS
+        handler_with_runner._algorithm_runner.pause_algorithm.assert_called_once_with("test_algo")
+
+    def test_handle_algo_resume(self, handler_with_runner):
+        """Test algo resume command"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["resume", "test_algo"])
+
+        assert result.status == CommandStatus.SUCCESS
+        handler_with_runner._algorithm_runner.resume_algorithm.assert_called_once_with("test_algo")
+
+    def test_handle_algo_reset_cb(self, handler_with_runner):
+        """Test algo reset-cb command"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["reset-cb", "test_algo"])
+
+        assert result.status == CommandStatus.SUCCESS
+        handler_with_runner._algorithm_runner.reset_circuit_breaker.assert_called_once_with("test_algo")
+
+    def test_handle_algo_trigger(self, handler_with_runner):
+        """Test algo trigger command"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["trigger", "test_algo"])
+
+        assert result.status == CommandStatus.SUCCESS
+        handler_with_runner._algorithm_runner.trigger_algorithm.assert_called_once_with("test_algo")
+
+    def test_handle_algo_param_set(self, handler_with_runner):
+        """Test algo param set command"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["param", "test_algo", "lookback", "30"])
+
+        assert result.status == CommandStatus.SUCCESS
+        handler_with_runner._algorithm_runner.set_algorithm_parameter.assert_called_once_with("test_algo", "lookback", "30")
+
+    def test_handle_algo_param_missing_args(self, handler_with_runner):
+        """Test algo param with missing arguments"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["param", "test_algo", "lookback"])
+
+        assert result.status == CommandStatus.ERROR
+        assert "Usage" in result.message
+
+    def test_handle_algo_params(self, handler_with_runner):
+        """Test algo params command"""
+        from command_server import CommandStatus
+
+        result = handler_with_runner.handle_algo(["params", "test_algo"])
+
+        assert result.status == CommandStatus.SUCCESS
+        assert result.data["parameters"]["lookback"] == 20
+
+    def test_handle_algo_params_not_found(self, handler_with_runner):
+        """Test algo params for nonexistent algorithm"""
+        from command_server import CommandStatus
+
+        handler_with_runner._algorithm_runner.get_algorithm_parameters.return_value = None
+
+        result = handler_with_runner.handle_algo(["params", "nonexistent"])
+
+        assert result.status == CommandStatus.ERROR
+
+
+class TestSetAlgorithmRunner:
+    """Tests for set_algorithm_runner method"""
+
+    def test_set_algorithm_runner(self, mock_ibapi):
+        """Test setting algorithm runner"""
+        from main import CommandHandler
+
+        mock_portfolio = MagicMock()
+        mock_shutdown = MagicMock()
+        handler = CommandHandler(mock_portfolio, mock_shutdown)
+
+        mock_runner = MagicMock()
+        handler.set_algorithm_runner(mock_runner)
+
+        assert handler._algorithm_runner is mock_runner
+

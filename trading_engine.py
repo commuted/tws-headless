@@ -1,22 +1,23 @@
 """
 trading_engine.py - Unified trading engine
 
-Combines ConnectionManager, DataFeed, and AlgorithmRunner into a single
+Combines ConnectionManager, DataFeed, and AlgorithmRunner/PluginExecutive into a single
 easy-to-use interface for continuous algorithmic trading.
 
 Provides:
 - Robust connection with auto-reconnect
 - Real-time market data streaming
-- Continuous algorithm execution
+- Continuous algorithm/plugin execution
 - Order execution and management
 - Health monitoring and recovery
+- MessageBus integration for plugin communication
 """
 
 import logging
 import signal
 import sys
 from threading import Event
-from typing import Optional, Callable, Dict, List, Any, Set
+from typing import Optional, Callable, Dict, List, Any, Set, Union
 from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
@@ -27,6 +28,9 @@ from .data_feed import DataFeed, DataType, TickData
 from .algorithm_runner import AlgorithmRunner, ExecutionMode, OrderExecutionMode, ExecutionResult
 from .algorithms.base import AlgorithmBase, TradeSignal
 from .models import Bar
+from .message_bus import MessageBus
+from .plugin_executive import PluginExecutive
+from .plugins.base import PluginBase, TradeSignal as PluginSignal, PluginState
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +66,17 @@ class EngineConfig:
     default_execution_mode: ExecutionMode = ExecutionMode.ON_BAR
     default_bar_timeframe: DataType = DataType.BAR_1MIN
 
+    # Rate limiting settings (IB compliance)
+    order_rate_limit: float = 10.0  # Orders per second
+    order_burst_size: int = 10  # Max burst size
+
     # Engine settings
     load_portfolio_on_start: bool = True
     fetch_prices_on_start: bool = True
+
+    # Plugin system settings
+    use_plugin_executive: bool = False  # Use PluginExecutive instead of AlgorithmRunner
+    enable_message_bus: bool = True  # Enable MessageBus for plugin communication
 
 
 class TradingEngine:
@@ -74,23 +86,29 @@ class TradingEngine:
     Combines all components needed for live algorithmic trading:
     - ConnectionManager: Robust IB connection with auto-reconnect
     - DataFeed: Real-time market data streaming
-    - AlgorithmRunner: Continuous algorithm execution
+    - AlgorithmRunner: Continuous algorithm execution (legacy)
+    - PluginExecutive: Plugin lifecycle and execution (new)
+    - MessageBus: Pub/Sub communication between plugins
 
     Usage:
-        # Simple usage
+        # Simple usage with algorithms (legacy)
         engine = TradingEngine()
         engine.add_algorithm(MyAlgorithm())
         engine.start()
 
-        # With configuration
+        # Using the new plugin system
         config = EngineConfig(
             port=4002,  # Paper trading gateway
-            order_mode=OrderExecutionMode.IMMEDIATE,  # Live trading
+            order_mode=OrderExecutionMode.IMMEDIATE,
+            use_plugin_executive=True,
         )
         engine = TradingEngine(config)
-        engine.add_algorithm(algo1)
-        engine.add_algorithm(algo2)
+        engine.add_plugin(plugin1)
+        engine.add_plugin(plugin2)
         engine.start()
+
+        # Or dynamically load plugins
+        engine.load_plugin("/path/to/my_plugin.py")
 
         # Run until interrupted
         engine.run_forever()
@@ -134,14 +152,33 @@ class TradingEngine:
             use_delayed_data=self.config.use_delayed_data,
         )
 
-        self._runner = AlgorithmRunner(
-            self._portfolio,
-            self._data_feed,
-            order_mode=self.config.order_mode,
-        )
+        # Create MessageBus for plugin communication
+        self._message_bus = MessageBus() if self.config.enable_message_bus else None
 
-        # Pending algorithms (to be registered after start)
+        # Create runner based on config
+        if self.config.use_plugin_executive:
+            self._runner = None  # Don't create AlgorithmRunner
+            self._plugin_executive = PluginExecutive(
+                self._portfolio,
+                self._data_feed,
+                message_bus=self._message_bus,
+                order_mode=self.config.order_mode,
+                order_rate_limit=self.config.order_rate_limit,
+                order_burst_size=self.config.order_burst_size,
+            )
+        else:
+            self._runner = AlgorithmRunner(
+                self._portfolio,
+                self._data_feed,
+                order_mode=self.config.order_mode,
+                order_rate_limit=self.config.order_rate_limit,
+                order_burst_size=self.config.order_burst_size,
+            )
+            self._plugin_executive = None
+
+        # Pending algorithms/plugins (to be registered after start)
         self._pending_algorithms: List[tuple] = []
+        self._pending_plugins: List[tuple] = []
 
         # Instrument subscriptions
         self._subscribed_symbols: Set[str] = set()
@@ -150,10 +187,11 @@ class TradingEngine:
         self.on_started: Optional[Callable[[], None]] = None
         self.on_stopped: Optional[Callable[[], None]] = None
         self.on_error: Optional[Callable[[Exception], None]] = None
-        self.on_signal: Optional[Callable[[str, TradeSignal], None]] = None
+        self.on_signal: Optional[Callable[[str, Union[TradeSignal, PluginSignal]], None]] = None
         self.on_execution: Optional[Callable[[ExecutionResult], None]] = None
         self.on_tick: Optional[Callable[[str, TickData], None]] = None
         self.on_bar: Optional[Callable[[str, Bar, DataType], None]] = None
+        self.on_plugin_state_change: Optional[Callable[[str, PluginState], None]] = None
 
         # Set up internal callbacks
         self._setup_callbacks()
@@ -184,9 +222,19 @@ class TradingEngine:
         return self._data_feed
 
     @property
-    def runner(self) -> AlgorithmRunner:
-        """Get the algorithm runner instance"""
+    def runner(self) -> Optional[AlgorithmRunner]:
+        """Get the algorithm runner instance (None if using plugin executive)"""
         return self._runner
+
+    @property
+    def plugin_executive(self) -> Optional[PluginExecutive]:
+        """Get the plugin executive instance (None if using algorithm runner)"""
+        return self._plugin_executive
+
+    @property
+    def message_bus(self) -> Optional[MessageBus]:
+        """Get the MessageBus instance"""
+        return self._message_bus
 
     def _setup_callbacks(self):
         """Set up internal callbacks between components"""
@@ -200,10 +248,16 @@ class TradingEngine:
         self._data_feed.on_bar = self._on_bar
         self._data_feed.on_error = self._on_data_error
 
-        # Runner callbacks
-        self._runner.on_signal = self._on_signal
-        self._runner.on_execution = self._on_execution
-        self._runner.on_error = self._on_runner_error
+        # Runner/Executive callbacks
+        if self._runner:
+            self._runner.on_signal = self._on_signal
+            self._runner.on_execution = self._on_execution
+            self._runner.on_error = self._on_runner_error
+        elif self._plugin_executive:
+            self._plugin_executive.on_signal = self._on_signal
+            self._plugin_executive.on_execution = self._on_execution
+            self._plugin_executive.on_error = self._on_runner_error
+            self._plugin_executive.on_plugin_state_change = self._on_plugin_state_change
 
     def _on_connected(self):
         """Handle connection established"""
@@ -223,9 +277,11 @@ class TradingEngine:
         if not self._data_feed.is_running:
             self._data_feed.start()
 
-        # Start runner if not already running
-        if not self._runner.is_running:
+        # Start runner or executive if not already running
+        if self._runner and not self._runner.is_running:
             self._runner.start()
+        elif self._plugin_executive and not self._plugin_executive.is_running:
+            self._plugin_executive.start()
 
         # Resubscribe to instruments
         self._resubscribe_instruments()
@@ -281,12 +337,21 @@ class TradingEngine:
 
     def _on_runner_error(self, algorithm_name: str, error: Exception):
         """Handle runner error"""
-        logger.error(f"Algorithm '{algorithm_name}' error: {error}")
+        logger.error(f"Algorithm/Plugin '{algorithm_name}' error: {error}")
         if self.on_error:
             try:
                 self.on_error(error)
             except:
                 pass
+
+    def _on_plugin_state_change(self, plugin_name: str, new_state: PluginState):
+        """Handle plugin state change"""
+        logger.info(f"Plugin '{plugin_name}' state changed to {new_state.value}")
+        if self.on_plugin_state_change:
+            try:
+                self.on_plugin_state_change(plugin_name, new_state)
+            except Exception as e:
+                logger.error(f"Error in on_plugin_state_change callback: {e}")
 
     def add_algorithm(
         self,
@@ -346,7 +411,174 @@ class TradingEngine:
         Args:
             name: Algorithm name
         """
-        self._runner.unregister_algorithm(name)
+        if self._runner:
+            self._runner.unregister_algorithm(name)
+        else:
+            logger.warning("Cannot remove algorithm: using plugin executive")
+
+    def add_plugin(
+        self,
+        plugin: PluginBase,
+        execution_mode: Optional[ExecutionMode] = None,
+        bar_timeframe: Optional[DataType] = None,
+        enabled: bool = True,
+        auto_subscribe: bool = True,
+        auto_start: bool = True,
+    ) -> bool:
+        """
+        Add a plugin to the engine.
+
+        Args:
+            plugin: Plugin instance
+            execution_mode: When to trigger (uses config default if None)
+            bar_timeframe: Bar timeframe for ON_BAR mode (uses config default if None)
+            enabled: Whether plugin is enabled
+            auto_subscribe: Automatically subscribe to plugin's instruments
+            auto_start: Automatically start the plugin after registration
+
+        Returns:
+            True if added successfully
+        """
+        if not self._plugin_executive:
+            logger.error("Cannot add plugin: engine not configured for plugin executive")
+            return False
+
+        if execution_mode is None:
+            execution_mode = self.config.default_execution_mode
+        if bar_timeframe is None:
+            bar_timeframe = self.config.default_bar_timeframe
+
+        # Load if not loaded
+        if not plugin.is_loaded:
+            if not plugin.load():
+                logger.error(f"Failed to load plugin '{plugin.name}'")
+                return False
+
+        # Set up MessageBus
+        if self._message_bus:
+            plugin.set_message_bus(self._message_bus)
+
+        # If engine is running, register immediately
+        if self.is_running:
+            success = self._plugin_executive.register_plugin(
+                plugin,
+                execution_mode=execution_mode,
+                bar_timeframe=bar_timeframe,
+                enabled=enabled,
+            )
+            if success:
+                if auto_subscribe:
+                    self._subscribe_plugin_instruments(plugin)
+                if auto_start:
+                    self._plugin_executive.start_plugin(plugin.name)
+            return success
+        else:
+            # Queue for registration after start
+            self._pending_plugins.append((
+                plugin, execution_mode, bar_timeframe, enabled, auto_subscribe, auto_start
+            ))
+            logger.info(f"Queued plugin '{plugin.name}' for registration")
+            return True
+
+    def load_plugin(
+        self,
+        file_path: str,
+        execution_mode: Optional[ExecutionMode] = None,
+        bar_timeframe: Optional[DataType] = None,
+        enabled: bool = True,
+        auto_subscribe: bool = True,
+        auto_start: bool = True,
+    ) -> Optional[str]:
+        """
+        Load and add a plugin from a file.
+
+        Args:
+            file_path: Path to the Python file containing the plugin
+            execution_mode: When to trigger
+            bar_timeframe: Bar timeframe for ON_BAR mode
+            enabled: Whether plugin is enabled
+            auto_subscribe: Automatically subscribe to plugin's instruments
+            auto_start: Automatically start the plugin
+
+        Returns:
+            Plugin name if loaded successfully, None otherwise
+        """
+        if not self._plugin_executive:
+            logger.error("Cannot load plugin: engine not configured for plugin executive")
+            return None
+
+        if execution_mode is None:
+            execution_mode = self.config.default_execution_mode
+        if bar_timeframe is None:
+            bar_timeframe = self.config.default_bar_timeframe
+
+        name = self._plugin_executive.load_plugin_from_file(
+            file_path,
+            execution_mode=execution_mode,
+            bar_timeframe=bar_timeframe,
+            enabled=enabled,
+        )
+
+        if name:
+            if auto_subscribe:
+                # Get plugin and subscribe to its instruments
+                status = self._plugin_executive.get_plugin_status(name)
+                if status:
+                    # Subscribe using plugin instruments would require access to the plugin
+                    pass
+            if auto_start:
+                self._plugin_executive.start_plugin(name)
+
+        return name
+
+    def remove_plugin(self, name: str) -> bool:
+        """
+        Remove a plugin from the engine.
+
+        Args:
+            name: Plugin name
+
+        Returns:
+            True if removed successfully
+        """
+        if not self._plugin_executive:
+            logger.warning("Cannot remove plugin: using algorithm runner")
+            return False
+        return self._plugin_executive.unload_plugin(name)
+
+    def start_plugin(self, name: str) -> bool:
+        """Start a plugin"""
+        if self._plugin_executive:
+            return self._plugin_executive.start_plugin(name)
+        return False
+
+    def stop_plugin(self, name: str) -> bool:
+        """Stop a plugin"""
+        if self._plugin_executive:
+            return self._plugin_executive.stop_plugin(name)
+        return False
+
+    def freeze_plugin(self, name: str) -> bool:
+        """Freeze a plugin"""
+        if self._plugin_executive:
+            return self._plugin_executive.freeze_plugin(name)
+        return False
+
+    def resume_plugin(self, name: str) -> bool:
+        """Resume a frozen plugin"""
+        if self._plugin_executive:
+            return self._plugin_executive.resume_plugin(name)
+        return False
+
+    def _subscribe_plugin_instruments(self, plugin: PluginBase):
+        """Subscribe to data for a plugin's instruments"""
+        for instrument in plugin.enabled_instruments:
+            symbol = instrument.symbol
+            contract = instrument.to_contract()
+            data_types = {DataType.TICK, DataType.BAR_5SEC, DataType.BAR_1MIN}
+            self._data_feed.subscribe(symbol, contract, data_types, subscriber=plugin.name)
+            self._subscribed_symbols.add(symbol)
+            logger.debug(f"Subscribed plugin '{plugin.name}' to {symbol}")
 
     def _subscribe_algorithm_instruments(self, algorithm: AlgorithmBase):
         """Subscribe to data for an algorithm's instruments"""
@@ -424,17 +656,33 @@ class TradingEngine:
                     self._state = EngineState.ERROR
                     return False
 
-            # Register pending algorithms
-            for (algo, mode, timeframe, enabled, auto_sub) in self._pending_algorithms:
-                self._runner.register_algorithm(
-                    algo,
-                    execution_mode=mode,
-                    bar_timeframe=timeframe,
-                    enabled=enabled,
-                )
-                if auto_sub:
-                    self._subscribe_algorithm_instruments(algo)
-            self._pending_algorithms.clear()
+            # Register pending algorithms (if using AlgorithmRunner)
+            if self._runner:
+                for (algo, mode, timeframe, enabled, auto_sub) in self._pending_algorithms:
+                    self._runner.register_algorithm(
+                        algo,
+                        execution_mode=mode,
+                        bar_timeframe=timeframe,
+                        enabled=enabled,
+                    )
+                    if auto_sub:
+                        self._subscribe_algorithm_instruments(algo)
+                self._pending_algorithms.clear()
+
+            # Register pending plugins (if using PluginExecutive)
+            if self._plugin_executive:
+                for (plugin, mode, timeframe, enabled, auto_sub, auto_start) in self._pending_plugins:
+                    self._plugin_executive.register_plugin(
+                        plugin,
+                        execution_mode=mode,
+                        bar_timeframe=timeframe,
+                        enabled=enabled,
+                    )
+                    if auto_sub:
+                        self._subscribe_plugin_instruments(plugin)
+                    if auto_start:
+                        self._plugin_executive.start_plugin(plugin.name)
+                self._pending_plugins.clear()
 
             self._state = EngineState.RUNNING
             logger.info("Trading engine started")
@@ -466,7 +714,10 @@ class TradingEngine:
 
         try:
             # Stop in reverse order
-            self._runner.stop()
+            if self._runner:
+                self._runner.stop()
+            if self._plugin_executive:
+                self._plugin_executive.stop()
             self._data_feed.stop()
             self._connection_manager.stop()
 
@@ -484,16 +735,22 @@ class TradingEngine:
             self._state = EngineState.ERROR
 
     def pause(self):
-        """Pause algorithm execution (data still flows)"""
+        """Pause algorithm/plugin execution (data still flows)"""
         if self._state == EngineState.RUNNING:
-            self._runner.pause()
+            if self._runner:
+                self._runner.pause()
+            if self._plugin_executive:
+                self._plugin_executive.pause()
             self._state = EngineState.PAUSED
             logger.info("Trading engine paused")
 
     def resume(self):
-        """Resume algorithm execution"""
+        """Resume algorithm/plugin execution"""
         if self._state == EngineState.PAUSED:
-            self._runner.resume()
+            if self._runner:
+                self._runner.resume()
+            if self._plugin_executive:
+                self._plugin_executive.resume()
             self._state = EngineState.RUNNING
             logger.info("Trading engine resumed")
 
@@ -555,18 +812,27 @@ class TradingEngine:
         Returns:
             Status dictionary
         """
-        return {
+        status = {
             "state": self._state.value,
             "connected": self.is_connected,
             "connection": self._connection_manager.get_status(),
             "data_feed": self._data_feed.get_status(),
-            "runner": self._runner.get_status(),
             "subscribed_symbols": list(self._subscribed_symbols),
             "portfolio": {
                 "positions": len(self._portfolio.positions),
                 "total_value": self._portfolio.total_value,
             } if self.is_connected else None,
         }
+
+        # Add runner or plugin executive status
+        if self._runner:
+            status["runner"] = self._runner.get_status()
+        if self._plugin_executive:
+            status["plugin_executive"] = self._plugin_executive.get_status()
+        if self._message_bus:
+            status["message_bus"] = self._message_bus.get_stats()
+
+        return status
 
     def get_positions(self) -> List[Dict]:
         """Get current portfolio positions"""

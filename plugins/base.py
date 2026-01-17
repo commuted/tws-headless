@@ -1,18 +1,22 @@
 """
-algorithms/base.py - Base class for trading algorithms
+plugins/base.py - Base class for trading plugins
 
-Provides the foundation for implementing trading algorithms with
-standardized interfaces for instruments, holdings, and execution.
+Provides the foundation for implementing trading plugins with:
+- Standardized lifecycle commands (start, stop, freeze, resume)
+- Custom request handling
+- Pub/Sub MessageBus integration for indicator feeds
+- Automatic state persistence to JSON files
+- Instruments, holdings, and execution from AlgorithmBase
 """
 
 import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Callable
 
 from ibapi.contract import Contract
 
@@ -20,7 +24,21 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Data Classes
+# Plugin State Enum
+# =============================================================================
+
+class PluginState(Enum):
+    """Plugin lifecycle states"""
+    UNLOADED = "unloaded"
+    LOADED = "loaded"
+    STARTED = "started"
+    FROZEN = "frozen"
+    STOPPED = "stopped"
+    ERROR = "error"
+
+
+# =============================================================================
+# Data Classes (preserved from AlgorithmBase)
 # =============================================================================
 
 @dataclass
@@ -55,11 +73,11 @@ class HoldingPosition:
 @dataclass
 class Holdings:
     """
-    Tracks algorithm holdings including cash and positions.
+    Tracks plugin holdings including cash and positions.
 
     Manages initial funding, current holdings, and historical snapshots.
     """
-    algorithm_name: str
+    plugin_name: str
     initial_cash: float = 0.0
     initial_positions: List[HoldingPosition] = field(default_factory=list)
     current_cash: float = 0.0
@@ -95,7 +113,7 @@ class Holdings:
 
     def to_dict(self) -> Dict:
         return {
-            "algorithm": self.algorithm_name,
+            "plugin": self.plugin_name,
             "initial_funding": {
                 "cash": self.initial_cash,
                 "positions": [p.to_dict() for p in self.initial_positions],
@@ -121,8 +139,11 @@ class Holdings:
         if data.get("created_at"):
             created_at = datetime.fromisoformat(data["created_at"])
 
+        # Support both "plugin" and legacy "algorithm" keys
+        plugin_name = data.get("plugin", data.get("algorithm", "unknown"))
+
         return cls(
-            algorithm_name=data.get("algorithm", "unknown"),
+            plugin_name=plugin_name,
             initial_cash=initial.get("cash", 0.0),
             initial_positions=[HoldingPosition.from_dict(p) for p in initial.get("positions", [])],
             current_cash=current.get("cash", 0.0),
@@ -133,8 +154,8 @@ class Holdings:
 
 
 @dataclass
-class AlgorithmInstrument:
-    """An instrument approved for trading by an algorithm"""
+class PluginInstrument:
+    """An instrument approved for trading by a plugin"""
     symbol: str
     name: str
     weight: float = 0.0  # Target weight in portfolio (0-100)
@@ -167,7 +188,7 @@ class AlgorithmInstrument:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict) -> "AlgorithmInstrument":
+    def from_dict(cls, data: Dict) -> "PluginInstrument":
         return cls(
             symbol=data["symbol"],
             name=data.get("name", data["symbol"]),
@@ -183,7 +204,7 @@ class AlgorithmInstrument:
 
 @dataclass
 class TradeSignal:
-    """A signal to trade from an algorithm"""
+    """A signal to trade from a plugin"""
     symbol: str
     action: str  # BUY, SELL, HOLD
     quantity: int = 0
@@ -199,9 +220,9 @@ class TradeSignal:
 
 
 @dataclass
-class AlgorithmResult:
-    """Result of algorithm execution"""
-    algorithm_name: str
+class PluginResult:
+    """Result of plugin execution"""
+    plugin_name: str
     timestamp: datetime
     signals: List[TradeSignal] = field(default_factory=list)
     executed_trades: List[Dict] = field(default_factory=list)
@@ -216,37 +237,66 @@ class AlgorithmResult:
 
 
 # =============================================================================
-# Base Algorithm Class
+# Base Plugin Class
 # =============================================================================
 
-class AlgorithmBase(ABC):
+class PluginBase(ABC):
     """
-    Abstract base class for trading algorithms.
+    Abstract base class for trading plugins.
 
-    Each algorithm manages its own:
+    Provides:
+    - Standardized lifecycle (start, stop, freeze, resume)
+    - Custom request handling (handle_request)
+    - Pub/Sub MessageBus integration
+    - Automatic state persistence
+    - Instruments, holdings, and trading execution
+
+    Each plugin manages its own:
     - Instruments file (allowed securities with target weights)
-    - Holdings (either per-algorithm or shared across algorithms)
+    - Holdings (either per-plugin or shared)
+    - State file (for recovery)
     - Trading logic (implemented in subclasses)
 
-    Supports two holdings modes:
-    - Per-algorithm holdings (legacy): Each algorithm has its own holdings.json
-    - Shared holdings: All algorithms share positions via SharedHoldings
+    Lifecycle States:
+        UNLOADED -> LOADED -> STARTED -> FROZEN -> STARTED
+                              STARTED -> STOPPED -> UNLOADED
+                              Any state -> ERROR
 
     Usage:
-        class MyAlgorithm(AlgorithmBase):
+        class MyPlugin(PluginBase):
             def __init__(self):
-                super().__init__("my_algorithm")
+                super().__init__("my_plugin")
+
+            def start(self) -> bool:
+                state = self.load_state()
+                self.subscribe("momentum_signals", self._on_signal)
+                return True
+
+            def stop(self) -> bool:
+                self.save_state({"my_data": self._data})
+                self.unsubscribe_all()
+                return True
+
+            def freeze(self) -> bool:
+                self.save_state({"my_data": self._data})
+                return True
+
+            def resume(self) -> bool:
+                return True
+
+            def handle_request(self, request_type, payload):
+                if request_type == "get_metrics":
+                    return {"success": True, "metrics": self._metrics}
+                return {"success": False, "message": "Unknown request"}
 
             def calculate_signals(self, market_data):
-                # Implement trading logic
-                return [TradeSignal(...)]
-
-        # With shared holdings:
-        from algorithms.shared_holdings import SharedHoldings
-        shared = SharedHoldings()
-        shared.load()
-        algo = MyAlgorithm(shared_holdings=shared)
+                signals = [...]
+                self.publish("my_plugin_signals", {"symbol": "SPY", "value": 0.8})
+                return signals
     """
+
+    # Plugin version (override in subclasses)
+    VERSION = "1.0.0"
 
     def __init__(
         self,
@@ -254,19 +304,22 @@ class AlgorithmBase(ABC):
         base_path: Optional[Path] = None,
         portfolio=None,
         shared_holdings=None,
+        message_bus=None,
     ):
         """
-        Initialize the algorithm.
+        Initialize the plugin.
 
         Args:
-            name: Unique algorithm name (used for file paths)
-            base_path: Base path for algorithm files (default: algorithms/<name>/)
+            name: Unique plugin name (used for file paths and MessageBus)
+            base_path: Base path for plugin files (default: plugins/<name>/)
             portfolio: Optional Portfolio instance for live trading
             shared_holdings: Optional SharedHoldings instance for shared position tracking
+            message_bus: Optional MessageBus instance for pub/sub communication
         """
         self.name = name
         self.portfolio = portfolio
         self._shared_holdings = shared_holdings
+        self._message_bus = message_bus
 
         # Set up paths
         if base_path:
@@ -276,23 +329,357 @@ class AlgorithmBase(ABC):
 
         self._instruments_file = self._base_path / "instruments.json"
         self._holdings_file = self._base_path / "holdings.json"
+        self._state_file = self._base_path / "state.json"
 
         # Data stores
-        self._instruments: Dict[str, AlgorithmInstrument] = {}
-        self._holdings: Optional[Holdings] = None  # Used when not using shared holdings
-        self._market_data: Dict[str, List[Dict]] = {}  # symbol -> list of bars
+        self._instruments: Dict[str, PluginInstrument] = {}
+        self._holdings: Optional[Holdings] = None
+        self._market_data: Dict[str, List[Dict]] = {}
 
-        # State
+        # Plugin state
+        self._state = PluginState.UNLOADED
         self._loaded = False
         self._last_run: Optional[datetime] = None
 
+        # MessageBus subscriptions tracking
+        self._subscriptions: List[str] = []
+
     # =========================================================================
-    # Shared Holdings Support
+    # Lifecycle State Property
+    # =========================================================================
+
+    @property
+    def state(self) -> PluginState:
+        """Current plugin state"""
+        return self._state
+
+    @state.setter
+    def state(self, value: PluginState):
+        """Set plugin state with logging"""
+        old_state = self._state
+        self._state = value
+        logger.info(f"Plugin '{self.name}' state: {old_state.value} -> {value.value}")
+
+    # =========================================================================
+    # MANDATORY LIFECYCLE INTERFACE - Must be implemented
+    # =========================================================================
+
+    @abstractmethod
+    def start(self) -> bool:
+        """
+        Start the plugin - initialize and begin processing.
+
+        Called when transitioning from LOADED to STARTED state.
+        Should:
+        - Load any saved state via load_state()
+        - Set up MessageBus subscriptions
+        - Initialize any required resources
+
+        Returns:
+            True if started successfully
+        """
+        pass
+
+    @abstractmethod
+    def stop(self) -> bool:
+        """
+        Stop the plugin - cleanup and shutdown.
+
+        Called when transitioning from STARTED/FROZEN to STOPPED state.
+        Should:
+        - Save state via save_state()
+        - Unsubscribe from all MessageBus channels
+        - Release any resources
+
+        Returns:
+            True if stopped successfully
+        """
+        pass
+
+    @abstractmethod
+    def freeze(self) -> bool:
+        """
+        Freeze the plugin - pause processing, maintain state.
+
+        Called when transitioning from STARTED to FROZEN state.
+        Should:
+        - Save current state via save_state()
+        - Pause any ongoing processing
+        - Keep resources allocated for quick resume
+
+        Returns:
+            True if frozen successfully
+        """
+        pass
+
+    @abstractmethod
+    def resume(self) -> bool:
+        """
+        Resume the plugin - continue from frozen state.
+
+        Called when transitioning from FROZEN to STARTED state.
+        Should:
+        - Resume processing where it left off
+        - State should already be in memory
+
+        Returns:
+            True if resumed successfully
+        """
+        pass
+
+    @abstractmethod
+    def handle_request(self, request_type: str, payload: Dict) -> Dict:
+        """
+        Handle a custom request.
+
+        Allows external systems to send custom commands to the plugin.
+
+        Args:
+            request_type: Type of request (e.g., "get_metrics", "set_config")
+            payload: Request payload data
+
+        Returns:
+            Dict with at least "success" key (True/False) and optionally
+            "message", "data", or other response fields
+
+        Example:
+            def handle_request(self, request_type, payload):
+                if request_type == "get_metrics":
+                    return {"success": True, "data": self._metrics}
+                elif request_type == "reset_state":
+                    self._reset()
+                    return {"success": True, "message": "State reset"}
+                return {"success": False, "message": f"Unknown request: {request_type}"}
+        """
+        pass
+
+    # =========================================================================
+    # TRADING INTERFACE - Must be implemented
+    # =========================================================================
+
+    @abstractmethod
+    def calculate_signals(
+        self,
+        market_data: Dict[str, List[Dict]],
+    ) -> List[TradeSignal]:
+        """
+        Calculate trading signals based on market data.
+
+        Args:
+            market_data: Dict mapping symbol to list of bar data
+                        Each bar: {"date", "open", "high", "low", "close", "volume"}
+
+        Returns:
+            List of TradeSignal objects
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """Human-readable description of the plugin"""
+        pass
+
+    @property
+    def required_bars(self) -> int:
+        """Number of historical bars required for calculation"""
+        return 1
+
+    # =========================================================================
+    # State Persistence
+    # =========================================================================
+
+    def save_state(self, state: Dict[str, Any]) -> bool:
+        """
+        Save plugin state to JSON file.
+
+        Automatically called on freeze() and stop().
+        Can also be called manually for periodic saves.
+
+        Args:
+            state: State data to save (must be JSON-serializable)
+
+        Returns:
+            True if saved successfully
+        """
+        try:
+            # Ensure directory exists
+            self._base_path.mkdir(parents=True, exist_ok=True)
+
+            state_data = {
+                "plugin_name": self.name,
+                "plugin_version": self.VERSION,
+                "state": state,
+                "saved_at": datetime.now().isoformat(),
+            }
+
+            with open(self._state_file, "w") as f:
+                json.dump(state_data, f, indent=2, default=str)
+
+            logger.debug(f"Plugin '{self.name}' state saved to {self._state_file}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to save state for plugin '{self.name}': {e}")
+            return False
+
+    def load_state(self) -> Dict[str, Any]:
+        """
+        Load plugin state from JSON file.
+
+        Should be called during start() to restore previous state.
+
+        Returns:
+            State dict, or empty dict if no state file exists
+        """
+        try:
+            if not self._state_file.exists():
+                logger.debug(f"No state file for plugin '{self.name}'")
+                return {}
+
+            with open(self._state_file) as f:
+                data = json.load(f)
+
+            state = data.get("state", {})
+            saved_at = data.get("saved_at", "unknown")
+            logger.debug(f"Plugin '{self.name}' state loaded (saved at {saved_at})")
+            return state
+
+        except Exception as e:
+            logger.error(f"Failed to load state for plugin '{self.name}': {e}")
+            return {}
+
+    def clear_state(self) -> bool:
+        """
+        Clear saved state file.
+
+        Returns:
+            True if cleared (or didn't exist)
+        """
+        try:
+            if self._state_file.exists():
+                self._state_file.unlink()
+                logger.debug(f"Plugin '{self.name}' state cleared")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear state for plugin '{self.name}': {e}")
+            return False
+
+    # =========================================================================
+    # MessageBus Integration
+    # =========================================================================
+
+    def set_message_bus(self, message_bus) -> None:
+        """Set the MessageBus instance for pub/sub communication"""
+        self._message_bus = message_bus
+
+    def publish(
+        self,
+        channel: str,
+        payload: Any,
+        message_type: str = "data",
+    ) -> bool:
+        """
+        Publish a message to a MessageBus channel.
+
+        Args:
+            channel: Channel name (e.g., "my_plugin_signals")
+            payload: Message payload (any JSON-serializable data)
+            message_type: Type of message (data, signal, alert, metric, state)
+
+        Returns:
+            True if published (False if no MessageBus configured)
+        """
+        if self._message_bus is None:
+            logger.warning(f"Plugin '{self.name}' has no MessageBus - cannot publish")
+            return False
+
+        return self._message_bus.publish(
+            channel=channel,
+            payload=payload,
+            publisher=self.name,
+            message_type=message_type,
+        )
+
+    def subscribe(
+        self,
+        channel: str,
+        callback: Callable,
+    ) -> bool:
+        """
+        Subscribe to a MessageBus channel.
+
+        Args:
+            channel: Channel name to subscribe to
+            callback: Function called for each message (receives Message object)
+
+        Returns:
+            True if subscribed (False if no MessageBus configured)
+        """
+        if self._message_bus is None:
+            logger.warning(f"Plugin '{self.name}' has no MessageBus - cannot subscribe")
+            return False
+
+        result = self._message_bus.subscribe(
+            channel=channel,
+            callback=callback,
+            subscriber=self.name,
+        )
+
+        if result and channel not in self._subscriptions:
+            self._subscriptions.append(channel)
+
+        return result
+
+    def unsubscribe(self, channel: str) -> bool:
+        """
+        Unsubscribe from a MessageBus channel.
+
+        Args:
+            channel: Channel name to unsubscribe from
+
+        Returns:
+            True if unsubscribed (False if no MessageBus or wasn't subscribed)
+        """
+        if self._message_bus is None:
+            return False
+
+        result = self._message_bus.unsubscribe(
+            channel=channel,
+            subscriber=self.name,
+        )
+
+        if channel in self._subscriptions:
+            self._subscriptions.remove(channel)
+
+        return result
+
+    def unsubscribe_all(self) -> int:
+        """
+        Unsubscribe from all channels.
+
+        Returns:
+            Number of channels unsubscribed from
+        """
+        if self._message_bus is None:
+            return 0
+
+        count = self._message_bus.unsubscribe_all(self.name)
+        self._subscriptions.clear()
+        return count
+
+    @property
+    def subscribed_channels(self) -> List[str]:
+        """Get list of currently subscribed channels"""
+        return list(self._subscriptions)
+
+    # =========================================================================
+    # Shared Holdings Support (preserved from AlgorithmBase)
     # =========================================================================
 
     @property
     def uses_shared_holdings(self) -> bool:
-        """Whether this algorithm uses shared holdings"""
+        """Whether this plugin uses shared holdings"""
         return self._shared_holdings is not None
 
     @property
@@ -308,7 +695,7 @@ class AlgorithmBase(ABC):
 
     def get_effective_holdings(self) -> Dict:
         """
-        Get holdings from appropriate source (shared or per-algorithm).
+        Get holdings from appropriate source (shared or per-plugin).
 
         Returns:
             Dict with cash, positions, total_value
@@ -317,7 +704,7 @@ class AlgorithmBase(ABC):
             return self._shared_holdings.get_algorithm_holdings(self.name)
         elif self._holdings:
             return {
-                "algorithm": self.name,
+                "plugin": self.name,
                 "cash": self._holdings.current_cash,
                 "positions": [
                     {
@@ -333,7 +720,7 @@ class AlgorithmBase(ABC):
             }
         else:
             return {
-                "algorithm": self.name,
+                "plugin": self.name,
                 "cash": 0.0,
                 "positions": [],
                 "total_value": 0.0,
@@ -368,16 +755,16 @@ class AlgorithmBase(ABC):
         return holdings.get("total_value", 0.0)
 
     # =========================================================================
-    # Properties
+    # Properties (preserved from AlgorithmBase)
     # =========================================================================
 
     @property
-    def instruments(self) -> List[AlgorithmInstrument]:
+    def instruments(self) -> List[PluginInstrument]:
         """Get list of all instruments"""
         return list(self._instruments.values())
 
     @property
-    def enabled_instruments(self) -> List[AlgorithmInstrument]:
+    def enabled_instruments(self) -> List[PluginInstrument]:
         """Get list of enabled instruments"""
         return [i for i in self._instruments.values() if i.enabled]
 
@@ -388,61 +775,22 @@ class AlgorithmBase(ABC):
 
     @property
     def is_loaded(self) -> bool:
-        """Whether algorithm data has been loaded"""
+        """Whether plugin data has been loaded"""
         return self._loaded
 
     # =========================================================================
-    # Abstract Methods - Must be implemented by subclasses
-    # =========================================================================
-
-    @abstractmethod
-    def calculate_signals(
-        self,
-        market_data: Dict[str, List[Dict]],
-    ) -> List[TradeSignal]:
-        """
-        Calculate trading signals based on market data.
-
-        Args:
-            market_data: Dict mapping symbol to list of bar data
-                        Each bar: {"date", "open", "high", "low", "close", "volume"}
-
-        Returns:
-            List of TradeSignal objects
-        """
-        pass
-
-    @property
-    @abstractmethod
-    def description(self) -> str:
-        """Human-readable description of the algorithm"""
-        pass
-
-    @property
-    def required_bars(self) -> int:
-        """Number of historical bars required for calculation"""
-        return 1
-
-    # =========================================================================
-    # Runtime Parameters Interface
+    # Runtime Parameters Interface (preserved from AlgorithmBase)
     # =========================================================================
 
     def get_parameters(self) -> Dict[str, Any]:
         """
         Get configurable parameters and their current values.
 
-        Override in subclasses to expose algorithm-specific parameters
+        Override in subclasses to expose plugin-specific parameters
         that can be modified at runtime.
 
         Returns:
             Dict mapping parameter names to current values
-
-        Example:
-            def get_parameters(self):
-                return {
-                    "momentum_period": self.momentum_period,
-                    "threshold": self.threshold,
-                }
         """
         return {}
 
@@ -451,7 +799,6 @@ class AlgorithmBase(ABC):
         Set a parameter value at runtime.
 
         Override in subclasses to handle parameter updates.
-        Return True if the parameter was set successfully.
 
         Args:
             key: Parameter name
@@ -459,16 +806,6 @@ class AlgorithmBase(ABC):
 
         Returns:
             True if parameter was set successfully
-
-        Example:
-            def set_parameter(self, key, value):
-                if key == "momentum_period":
-                    self.momentum_period = int(value)
-                    return True
-                elif key == "threshold":
-                    self.threshold = float(value)
-                    return True
-                return False
         """
         return False
 
@@ -479,29 +816,12 @@ class AlgorithmBase(ABC):
         Override in subclasses to provide validation metadata.
 
         Returns:
-            Dict mapping parameter names to schema dicts with:
-            - type: Parameter type (str, int, float, bool)
-            - description: Human-readable description
-            - min: Minimum value (for numeric types)
-            - max: Maximum value (for numeric types)
-            - default: Default value
-
-        Example:
-            def get_parameter_schema(self):
-                return {
-                    "momentum_period": {
-                        "type": "int",
-                        "description": "Number of days for momentum calculation",
-                        "min": 1,
-                        "max": 100,
-                        "default": 5,
-                    },
-                }
+            Dict mapping parameter names to schema dicts
         """
         return {}
 
     # =========================================================================
-    # Load/Save Methods
+    # Load/Save Methods (preserved from AlgorithmBase)
     # =========================================================================
 
     def load(self) -> bool:
@@ -515,10 +835,12 @@ class AlgorithmBase(ABC):
             self._load_instruments()
             self._load_holdings()
             self._loaded = True
-            logger.info(f"Algorithm '{self.name}' loaded: {len(self._instruments)} instruments")
+            self.state = PluginState.LOADED
+            logger.info(f"Plugin '{self.name}' loaded: {len(self._instruments)} instruments")
             return True
         except Exception as e:
-            logger.error(f"Failed to load algorithm '{self.name}': {e}")
+            logger.error(f"Failed to load plugin '{self.name}': {e}")
+            self.state = PluginState.ERROR
             return False
 
     def _load_instruments(self):
@@ -532,7 +854,7 @@ class AlgorithmBase(ABC):
 
         self._instruments.clear()
         for inst_data in data.get("instruments", []):
-            inst = AlgorithmInstrument.from_dict(inst_data)
+            inst = PluginInstrument.from_dict(inst_data)
             self._instruments[inst.symbol] = inst
 
     def _load_holdings(self):
@@ -540,7 +862,7 @@ class AlgorithmBase(ABC):
         if not self._holdings_file.exists():
             # Create default holdings
             self._holdings = Holdings(
-                algorithm_name=self.name,
+                plugin_name=self.name,
                 created_at=datetime.now(),
             )
             return
@@ -571,7 +893,7 @@ class AlgorithmBase(ABC):
         self._base_path.mkdir(parents=True, exist_ok=True)
 
         data = {
-            "algorithm": self.name,
+            "plugin": self.name,
             "description": self.description,
             "instruments": [i.to_dict() for i in self._instruments.values()],
         }
@@ -582,22 +904,22 @@ class AlgorithmBase(ABC):
         logger.info(f"Saved instruments for '{self.name}'")
 
     # =========================================================================
-    # Instrument Management
+    # Instrument Management (preserved from AlgorithmBase)
     # =========================================================================
 
-    def get_instrument(self, symbol: str) -> Optional[AlgorithmInstrument]:
+    def get_instrument(self, symbol: str) -> Optional[PluginInstrument]:
         """Get an instrument by symbol"""
         return self._instruments.get(symbol.upper())
 
-    def add_instrument(self, instrument: AlgorithmInstrument) -> bool:
-        """Add an instrument to the algorithm"""
+    def add_instrument(self, instrument: PluginInstrument) -> bool:
+        """Add an instrument to the plugin"""
         if instrument.symbol in self._instruments:
             return False
         self._instruments[instrument.symbol] = instrument
         return True
 
     def remove_instrument(self, symbol: str) -> bool:
-        """Remove an instrument from the algorithm"""
+        """Remove an instrument from the plugin"""
         if symbol.upper() not in self._instruments:
             return False
         del self._instruments[symbol.upper()]
@@ -608,7 +930,7 @@ class AlgorithmBase(ABC):
         return [i.to_contract() for i in self.enabled_instruments]
 
     # =========================================================================
-    # Market Data Management
+    # Market Data Management (preserved from AlgorithmBase)
     # =========================================================================
 
     def set_market_data(self, symbol: str, bars: List[Dict]):
@@ -630,25 +952,33 @@ class AlgorithmBase(ABC):
         self._market_data.clear()
 
     # =========================================================================
-    # Execution
+    # Execution (preserved from AlgorithmBase)
     # =========================================================================
 
-    def run(self, market_data: Optional[Dict[str, List[Dict]]] = None) -> AlgorithmResult:
+    def run(self, market_data: Optional[Dict[str, List[Dict]]] = None) -> PluginResult:
         """
-        Run the algorithm and generate signals.
+        Run the plugin and generate signals.
 
         Args:
             market_data: Optional market data (uses stored data if not provided)
 
         Returns:
-            AlgorithmResult with signals and metrics
+            PluginResult with signals and metrics
         """
         if not self._loaded:
-            return AlgorithmResult(
-                algorithm_name=self.name,
+            return PluginResult(
+                plugin_name=self.name,
                 timestamp=datetime.now(),
                 success=False,
-                error="Algorithm not loaded",
+                error="Plugin not loaded",
+            )
+
+        if self._state not in (PluginState.LOADED, PluginState.STARTED):
+            return PluginResult(
+                plugin_name=self.name,
+                timestamp=datetime.now(),
+                success=False,
+                error=f"Plugin in {self._state.value} state, cannot run",
             )
 
         # Use provided data or stored data
@@ -669,17 +999,17 @@ class AlgorithmBase(ABC):
 
             self._last_run = datetime.now()
 
-            return AlgorithmResult(
-                algorithm_name=self.name,
+            return PluginResult(
+                plugin_name=self.name,
                 timestamp=self._last_run,
                 signals=signals,
                 success=True,
             )
 
         except Exception as e:
-            logger.error(f"Algorithm '{self.name}' failed: {e}")
-            return AlgorithmResult(
-                algorithm_name=self.name,
+            logger.error(f"Plugin '{self.name}' failed: {e}")
+            return PluginResult(
+                plugin_name=self.name,
                 timestamp=datetime.now(),
                 success=False,
                 error=str(e),
@@ -689,16 +1019,16 @@ class AlgorithmBase(ABC):
         self,
         signals: Optional[List[TradeSignal]] = None,
         dry_run: bool = True,
-    ) -> AlgorithmResult:
+    ) -> PluginResult:
         """
         Execute trading signals.
 
         Args:
-            signals: Signals to execute (runs algorithm if not provided)
+            signals: Signals to execute (runs plugin if not provided)
             dry_run: If True, don't actually place trades
 
         Returns:
-            AlgorithmResult with execution details
+            PluginResult with execution details
         """
         if signals is None:
             result = self.run()
@@ -709,8 +1039,8 @@ class AlgorithmBase(ABC):
         actionable = [s for s in signals if s.is_actionable]
 
         if not actionable:
-            return AlgorithmResult(
-                algorithm_name=self.name,
+            return PluginResult(
+                plugin_name=self.name,
                 timestamp=datetime.now(),
                 signals=signals,
                 notes="No actionable signals",
@@ -743,8 +1073,8 @@ class AlgorithmBase(ABC):
                     "dry_run": False,
                 })
 
-        return AlgorithmResult(
-            algorithm_name=self.name,
+        return PluginResult(
+            plugin_name=self.name,
             timestamp=datetime.now(),
             signals=signals,
             executed_trades=executed,
@@ -752,7 +1082,7 @@ class AlgorithmBase(ABC):
         )
 
     # =========================================================================
-    # Utility Methods
+    # Utility Methods (preserved from AlgorithmBase)
     # =========================================================================
 
     def calculate_target_quantities(
@@ -786,8 +1116,35 @@ class AlgorithmBase(ABC):
 
         return targets
 
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Get plugin status information.
+
+        Returns:
+            Dict with plugin status details
+        """
+        return {
+            "name": self.name,
+            "version": self.VERSION,
+            "state": self._state.value,
+            "loaded": self._loaded,
+            "instruments": len(self._instruments),
+            "enabled_instruments": len(self.enabled_instruments),
+            "subscribed_channels": self._subscriptions,
+            "last_run": self._last_run.isoformat() if self._last_run else None,
+        }
+
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(name='{self.name}', "
-            f"instruments={len(self._instruments)}, loaded={self._loaded})"
+            f"state={self._state.value}, instruments={len(self._instruments)})"
         )
+
+
+# =============================================================================
+# Backward Compatibility Aliases
+# =============================================================================
+
+# Allow existing code using AlgorithmInstrument to work
+AlgorithmInstrument = PluginInstrument
+AlgorithmResult = PluginResult

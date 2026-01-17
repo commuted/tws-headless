@@ -15,6 +15,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, Optional, Any, List
 
+from .auth import TokenStore, Authenticator
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,6 +29,7 @@ class CommandStatus(Enum):
     SUCCESS = "success"
     ERROR = "error"
     PENDING = "pending"
+    UNAUTHORIZED = "unauthorized"
 
 
 @dataclass
@@ -66,6 +69,7 @@ class CommandServer:
         self,
         socket_path: str = DEFAULT_SOCKET_PATH,
         tcp_port: Optional[int] = None,
+        token_file: Optional[Path] = None,
     ):
         """
         Initialize the command server.
@@ -73,6 +77,7 @@ class CommandServer:
         Args:
             socket_path: Path to Unix domain socket
             tcp_port: Optional TCP port (if set, uses TCP instead of Unix socket)
+            token_file: Path to authentication token file (None = no auth)
         """
         self.socket_path = socket_path
         self.tcp_port = tcp_port
@@ -81,6 +86,21 @@ class CommandServer:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._lock = threading.Lock()
+
+        # Authentication
+        self._token_store: Optional[TokenStore] = None
+        self._authenticator: Authenticator
+        if token_file:
+            self._token_store = TokenStore(token_file)
+            if not self._token_store.exists():
+                logger.warning(
+                    f"Token file {token_file} does not exist. "
+                    "Authentication enabled but no token configured."
+                )
+            self._authenticator = Authenticator(self._token_store)
+            logger.info(f"Authentication enabled with token file: {token_file}")
+        else:
+            self._authenticator = Authenticator()  # Auth disabled
 
         # Register built-in commands
         self.register_handler("help", self._handle_help)
@@ -108,6 +128,11 @@ class CommandServer:
     def commands(self) -> List[str]:
         """List of registered commands"""
         return sorted(self._handlers.keys())
+
+    @property
+    def auth_enabled(self) -> bool:
+        """Check if authentication is enabled"""
+        return self._authenticator.is_enabled
 
     def start(self) -> bool:
         """
@@ -255,8 +280,18 @@ class CommandServer:
                 pass
 
     def _execute_command(self, command_line: str) -> CommandResult:
-        """Parse and execute a command"""
-        parts = command_line.split()
+        """Parse, authenticate, and execute a command"""
+        # Authenticate first
+        auth_result, remaining_command = self._authenticator.parse_command(command_line)
+
+        if not auth_result.is_success:
+            return CommandResult(
+                status=CommandStatus.UNAUTHORIZED,
+                message=auth_result.error or "Authentication failed",
+            )
+
+        # Parse the actual command
+        parts = remaining_command.split()
         if not parts:
             return CommandResult(
                 status=CommandStatus.ERROR,
@@ -306,6 +341,7 @@ def send_command(
     socket_path: str = DEFAULT_SOCKET_PATH,
     tcp_port: Optional[int] = None,
     timeout: float = 10.0,
+    token: Optional[str] = None,
 ) -> CommandResult:
     """
     Send a command to the running server.
@@ -315,6 +351,7 @@ def send_command(
         socket_path: Path to Unix socket
         tcp_port: TCP port (if using TCP instead of Unix socket)
         timeout: Connection timeout in seconds
+        token: Authentication token (if server requires auth)
 
     Returns:
         CommandResult from server
@@ -329,8 +366,14 @@ def send_command(
 
         sock.settimeout(timeout)
 
+        # Wrap command with auth token if provided
+        if token:
+            full_command = f"AUTH {token} {command}"
+        else:
+            full_command = command
+
         # Send command
-        sock.sendall((command + "\n").encode("utf-8"))
+        sock.sendall((full_command + "\n").encode("utf-8"))
 
         # Receive response
         data = b""
