@@ -17,7 +17,16 @@ from ibapi.account_summary_tags import AccountSummaryTags
 from ibapi.order import Order
 
 from .client import IBClient
-from .models import Position, AssetType, AccountSummary, Bar, BarSize, OrderRecord, OrderStatus
+from .models import (
+    Position,
+    AssetType,
+    AccountSummary,
+    Bar,
+    BarSize,
+    OrderRecord,
+    OrderStatus,
+    CommissionAndFeesReport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +110,10 @@ class Portfolio(IBClient):
         self._orders_lock = Lock()
         self._pending_orders: Dict[int, Event] = {}  # orderId -> completion event
         self._on_order_status: Optional[Callable[[OrderRecord], None]] = None
+
+        # Commission tracking - maps exec_id to commission report
+        self._commission_reports: Dict[str, "CommissionAndFeesReport"] = {}
+        self._on_commission: Optional[Callable[[str, float, float], None]] = None
 
     @property
     def positions(self) -> List[Position]:
@@ -1084,6 +1097,70 @@ class Portfolio(IBClient):
 
         if "execDetails" in self._callbacks:
             self._callbacks["execDetails"](reqId, contract, execution)
+
+    def commissionReport(self, commissionReport):
+        """
+        Handle commission report from IB.
+
+        This callback is called after each execution fill with commission
+        and fee details. The exec_id links this to the corresponding execution.
+
+        Args:
+            commissionReport: IB CommissionReport object containing:
+                - execId: Execution ID linking to execDetails
+                - commission: Commission amount
+                - currency: Commission currency
+                - realizedPNL: Realized P&L for closing trades
+                - yield_: Yield for bonds
+                - yieldRedemptionDate: Redemption date for bonds
+        """
+        exec_id = commissionReport.execId
+        commission = commissionReport.commission
+        realized_pnl = commissionReport.realizedPNL
+
+        logger.debug(
+            f"Commission report: exec_id={exec_id}, "
+            f"commission=${commission:.4f}, realized_pnl=${realized_pnl:.2f}"
+        )
+
+        # Store the commission report keyed by execution ID
+        report = CommissionAndFeesReport(
+            execId=exec_id,
+            commissionAndFees=commission,
+            currency=getattr(commissionReport, "currency", "USD"),
+            realizedPNL=realized_pnl,
+            yield_=getattr(commissionReport, "yield_", 0.0),
+            yieldRedemptionDate=getattr(commissionReport, "yieldRedemptionDate", 0),
+        )
+        self._commission_reports[exec_id] = report
+
+        # Notify callback if registered
+        if self._on_commission:
+            self._on_commission(exec_id, commission, realized_pnl)
+
+        if "commissionReport" in self._callbacks:
+            self._callbacks["commissionReport"](commissionReport)
+
+    def get_commission_report(self, exec_id: str) -> Optional[CommissionAndFeesReport]:
+        """
+        Get commission report for a specific execution.
+
+        Args:
+            exec_id: The execution ID
+
+        Returns:
+            CommissionAndFeesReport if found, None otherwise
+        """
+        return self._commission_reports.get(exec_id)
+
+    def get_all_commission_reports(self) -> Dict[str, CommissionAndFeesReport]:
+        """
+        Get all stored commission reports.
+
+        Returns:
+            Dictionary mapping exec_id to CommissionAndFeesReport
+        """
+        return self._commission_reports.copy()
 
 
 def quick_load(

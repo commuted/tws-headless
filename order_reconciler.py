@@ -64,6 +64,15 @@ class ExecutionAllocation:
     total_filled: int
     avg_price: float
     allocations: Dict[str, int] = field(default_factory=dict)  # algo_name -> shares
+    allocation_pcts: Dict[str, float] = field(default_factory=dict)  # algo_name -> percentage (0.0-1.0)
+
+    def get_allocation_pct(self, algorithm_name: str) -> float:
+        """Get allocation percentage for a specific algorithm"""
+        return self.allocation_pcts.get(algorithm_name, 0.0)
+
+    def is_combined_order(self) -> bool:
+        """Check if this order combines signals from multiple algorithms"""
+        return len(self.allocations) > 1
 
 
 class ReconciliationMode(Enum):
@@ -310,6 +319,7 @@ class OrderReconciler:
                 proportion = ps.signal.quantity / total_qty if total_qty > 0 else 0
                 allocated = int(reconciled_order.net_quantity * proportion)
                 allocation.allocations[ps.algorithm_name] = allocated
+                allocation.allocation_pcts[ps.algorithm_name] = proportion
 
             self._execution_allocations[order_id] = allocation
 
@@ -362,6 +372,39 @@ class OrderReconciler:
         """Get allocation details for an order"""
         with self._lock:
             return self._execution_allocations.get(order_id)
+
+    def get_allocation_percentages(self, order_id: int) -> Dict[str, float]:
+        """
+        Get allocation percentages for an order.
+
+        Used for commission apportionment in multi-algorithm orders.
+
+        Args:
+            order_id: The IB order ID
+
+        Returns:
+            Dict mapping algorithm_name -> allocation percentage (0.0-1.0)
+            Returns empty dict if order not found.
+        """
+        with self._lock:
+            allocation = self._execution_allocations.get(order_id)
+            if allocation:
+                return allocation.allocation_pcts.copy()
+            return {}
+
+    def is_combined_order(self, order_id: int) -> bool:
+        """
+        Check if an order combines signals from multiple algorithms.
+
+        Args:
+            order_id: The IB order ID
+
+        Returns:
+            True if order has multiple contributing algorithms
+        """
+        with self._lock:
+            allocation = self._execution_allocations.get(order_id)
+            return allocation.is_combined_order() if allocation else False
 
     def create_ib_order(self, reconciled: ReconciledOrder) -> Order:
         """

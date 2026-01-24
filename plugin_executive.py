@@ -31,6 +31,7 @@ from .models import Bar
 from .message_bus import MessageBus
 from .order_reconciler import OrderReconciler, ReconciledOrder, ReconciliationMode
 from .rate_limiter import OrderRateLimiter
+from .plugin_execution_log import PluginExecutionLog, ExecutionLogWriter
 
 logger = logging.getLogger(__name__)
 
@@ -342,6 +343,15 @@ class PluginExecutive:
         self.on_error: Optional[Callable[[str, Exception], None]] = None
         self.on_circuit_breaker_trip: Optional[Callable[[str], None]] = None
         self.on_plugin_state_change: Optional[Callable[[str, PluginState], None]] = None
+
+        # Execution logging with commission tracking
+        self._execution_log_writer = ExecutionLogWriter()
+        self._pending_commissions: Dict[int, Dict] = {}  # order_id -> execution info
+        self._exec_id_to_order: Dict[str, int] = {}  # exec_id -> order_id
+
+        # Register commission callback with portfolio if available
+        if portfolio and hasattr(portfolio, "_on_commission"):
+            portfolio._on_commission = self._handle_commission_report
 
         # Statistics
         self._stats = {
@@ -1379,6 +1389,7 @@ class PluginExecutive:
 
             if order_id:
                 self._reconciler.register_execution(order_id, reconciled)
+                self._register_pending_execution(order_id, reconciled)
                 self._stats["total_orders"] += 1
 
                 for ps in reconciled.contributing_signals:
@@ -1618,3 +1629,204 @@ class PluginExecutive:
     def get_rate_limiter_stats(self) -> Dict[str, Any]:
         """Get rate limiter statistics"""
         return self._order_rate_limiter.stats
+
+    # =========================================================================
+    # Commission Tracking and Execution Logging
+    # =========================================================================
+
+    def _register_pending_execution(
+        self,
+        order_id: int,
+        reconciled: ReconciledOrder,
+    ):
+        """
+        Register an order execution for commission tracking.
+
+        Called when an order is placed to track the execution details
+        needed when the commission report arrives.
+
+        Args:
+            order_id: The IB order ID
+            reconciled: The reconciled order details
+        """
+        with self._lock:
+            self._pending_commissions[order_id] = {
+                "symbol": reconciled.symbol,
+                "action": reconciled.action,
+                "net_quantity": reconciled.net_quantity,
+                "contributing_signals": reconciled.contributing_signals,
+                "created_at": datetime.now(),
+            }
+
+    def _handle_commission_report(
+        self,
+        exec_id: str,
+        commission: float,
+        realized_pnl: float,
+    ):
+        """
+        Handle commission report from Portfolio.
+
+        This is called when Portfolio receives a commissionReport callback
+        from IB. We use this to create PluginExecutionLog entries with
+        commission apportionment for multi-plugin orders.
+
+        Args:
+            exec_id: The execution ID
+            commission: Commission amount
+            realized_pnl: Realized P&L for closing trades
+        """
+        logger.debug(
+            f"Commission report received: exec_id={exec_id}, "
+            f"commission=${commission:.4f}, pnl=${realized_pnl:.2f}"
+        )
+
+        # Find the order associated with this execution
+        order_id = self._exec_id_to_order.get(exec_id)
+        if not order_id:
+            # Try to find by checking pending orders
+            # This is a fallback if exec_id wasn't pre-registered
+            logger.debug(f"No order found for exec_id={exec_id}, commission logged without allocation")
+            return
+
+        self._process_commission_for_order(order_id, exec_id, commission, realized_pnl)
+
+    def _process_commission_for_order(
+        self,
+        order_id: int,
+        exec_id: str,
+        commission: float,
+        realized_pnl: float,
+    ):
+        """
+        Process commission for an order and write execution logs.
+
+        Apportions commission among contributing plugins based on their
+        allocation percentages.
+
+        Args:
+            order_id: The IB order ID
+            exec_id: The execution ID
+            commission: Total commission
+            realized_pnl: Total realized P&L
+        """
+        with self._lock:
+            pending = self._pending_commissions.get(order_id)
+            if not pending:
+                logger.debug(f"No pending commission info for order {order_id}")
+                return
+
+            # Get allocation percentages from reconciler
+            allocation_pcts = self._reconciler.get_allocation_percentages(order_id)
+            is_combined = len(allocation_pcts) > 1
+
+            # Get order details
+            symbol = pending["symbol"]
+            action = pending["action"]
+            total_qty = pending["net_quantity"]
+            contributing_signals = pending["contributing_signals"]
+
+            # Get fill price from portfolio if available
+            fill_price = 0.0
+            if self.portfolio and hasattr(self.portfolio, "_orders"):
+                order_record = self.portfolio._orders.get(order_id)
+                if order_record:
+                    fill_price = order_record.avg_fill_price
+
+            # Create execution log for each contributing plugin
+            for ps in contributing_signals:
+                plugin_name = ps.algorithm_name
+                alloc_pct = allocation_pcts.get(plugin_name, 0.0)
+
+                # If no allocation percentages, fall back to even split
+                if alloc_pct == 0.0 and len(contributing_signals) > 0:
+                    alloc_pct = 1.0 / len(contributing_signals)
+
+                # Apportion commission and P&L
+                plugin_commission = commission * alloc_pct
+                plugin_pnl = realized_pnl * alloc_pct
+                plugin_qty = int(total_qty * alloc_pct)
+
+                # Get plugin's position info if available
+                pos_before = 0
+                pos_after = 0
+                avg_cost_before = 0.0
+                avg_cost_after = 0.0
+
+                plugin_config = self._plugins.get(plugin_name)
+                if plugin_config and plugin_config.plugin.holdings:
+                    holdings = plugin_config.plugin.holdings
+                    position = holdings.get_position(symbol)
+                    if position:
+                        # These would be the values after the trade
+                        pos_after = position.quantity
+                        avg_cost_after = position.cost_basis / position.quantity if position.quantity else 0.0
+
+                # Create and write log entry
+                log_entry = PluginExecutionLog(
+                    timestamp=datetime.now(),
+                    plugin_name=plugin_name,
+                    order_id=order_id,
+                    exec_id=exec_id,
+                    symbol=symbol,
+                    action=action,
+                    quantity=plugin_qty,
+                    fill_price=fill_price,
+                    commission=plugin_commission,
+                    fees=0.0,  # IB includes fees in commission
+                    realized_pnl=plugin_pnl,
+                    is_combined_order=is_combined,
+                    allocation_pct=alloc_pct,
+                    total_order_quantity=total_qty,
+                    position_before=pos_before,
+                    position_after=pos_after,
+                    avg_cost_before=avg_cost_before,
+                    avg_cost_after=avg_cost_after,
+                )
+
+                # Write to log file
+                if self._execution_log_writer.write(log_entry):
+                    logger.debug(
+                        f"Logged execution for {plugin_name}: {action} {plugin_qty} {symbol} "
+                        f"@ ${fill_price:.2f}, commission=${plugin_commission:.4f}"
+                    )
+                else:
+                    logger.error(f"Failed to write execution log for {plugin_name}")
+
+    def register_execution_for_commission(
+        self,
+        order_id: int,
+        exec_id: str,
+    ):
+        """
+        Register an execution ID for commission tracking.
+
+        Call this when execDetails callback is received to link
+        the exec_id to the order_id for later commission processing.
+
+        Args:
+            order_id: The IB order ID
+            exec_id: The execution ID from IB
+        """
+        with self._lock:
+            self._exec_id_to_order[exec_id] = order_id
+
+    def get_execution_logs(
+        self,
+        plugin_name: Optional[str] = None,
+    ) -> List[PluginExecutionLog]:
+        """
+        Get execution logs from the log file.
+
+        Args:
+            plugin_name: Filter by plugin name (None = all plugins)
+
+        Returns:
+            List of PluginExecutionLog entries
+        """
+        from .plugin_execution_log import ExecutionLogReader
+
+        reader = ExecutionLogReader()
+        if plugin_name:
+            return reader.read_plugin(plugin_name)
+        return reader.read_all()
