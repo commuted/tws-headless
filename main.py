@@ -18,7 +18,7 @@ import sys
 import time
 from datetime import datetime
 from threading import Event
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .portfolio import Portfolio
 from .rebalancer import (
@@ -220,6 +220,7 @@ class CommandHandler:
         """Register all command handlers with the server"""
         server.register_handler("status", self.handle_status)
         server.register_handler("positions", self.handle_positions)
+        server.register_handler("summary", self.handle_summary)
         server.register_handler("liquidate", self.handle_liquidate)
         server.register_handler("stop", self.handle_stop)
         server.register_handler("shutdown", self.handle_stop)
@@ -1166,6 +1167,269 @@ class CommandHandler:
                 "error": result.error,
             },
         )
+
+    def handle_summary(self, args: List[str]) -> CommandResult:
+        """
+        Handle 'summary' command - executive account summary with holdings by plugin.
+
+        Usage:
+            summary              - Full account summary with plugin breakdown
+            summary --json       - Output as formatted JSON
+            summary plugins      - Show only plugin holdings
+            summary unassigned   - Show only unassigned holdings
+        """
+        try:
+            output_json = "--json" in args
+            args = [a for a in args if a != "--json"]
+
+            subcommand = args[0].lower() if args else "full"
+
+            if subcommand == "full":
+                return self._summary_full(output_json)
+            elif subcommand == "plugins":
+                return self._summary_plugins_only(output_json)
+            elif subcommand == "unassigned":
+                return self._summary_unassigned_only(output_json)
+            else:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message="Usage: summary [full|plugins|unassigned] [--json]",
+                )
+        except Exception as e:
+            logger.error(f"Summary command failed: {e}")
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Summary failed: {e}",
+            )
+
+    def _summary_full(self, output_json: bool = False) -> CommandResult:
+        """Generate full executive account summary"""
+        # Get account info
+        account = self.portfolio.get_account_summary()
+        positions = self.portfolio.positions
+        total_portfolio_value = self.portfolio.total_value
+        total_pnl = self.portfolio.total_pnl
+
+        # Build account summary
+        account_data = {}
+        if account and account.is_valid:
+            account_data = {
+                "account_id": account.account_id,
+                "net_liquidation": account.net_liquidation,
+                "available_funds": account.available_funds,
+                "buying_power": account.buying_power,
+                "cash": getattr(account, "total_cash", 0.0),
+            }
+
+        # Get plugin holdings
+        plugin_holdings = self._get_plugin_holdings()
+
+        # Calculate unassigned value
+        total_plugin_value = sum(p["total_value"] for p in plugin_holdings.values())
+        unassigned_value = total_portfolio_value - total_plugin_value
+
+        # Build position map for unassigned calculation
+        position_map = {p.symbol: p for p in positions}
+        plugin_positions = set()
+        for plugin_data in plugin_holdings.values():
+            for pos in plugin_data.get("positions", []):
+                plugin_positions.add(pos["symbol"])
+
+        # Find unassigned positions
+        unassigned_positions = []
+        for symbol, pos in position_map.items():
+            if symbol not in plugin_positions:
+                unassigned_positions.append({
+                    "symbol": symbol,
+                    "quantity": pos.quantity,
+                    "market_value": pos.market_value,
+                    "unrealized_pnl": pos.unrealized_pnl,
+                })
+
+        # Build response data
+        data = {
+            "account": account_data,
+            "portfolio": {
+                "total_value": total_portfolio_value,
+                "total_pnl": total_pnl,
+                "position_count": len(positions),
+            },
+            "plugins": plugin_holdings,
+            "plugin_total_value": total_plugin_value,
+            "unassigned": {
+                "value": unassigned_value,
+                "positions": unassigned_positions,
+            },
+        }
+
+        if output_json:
+            import json
+            message = json.dumps(data, indent=2)
+        else:
+            # Build human-readable summary
+            lines = []
+            lines.append("=" * 70)
+            lines.append("EXECUTIVE ACCOUNT SUMMARY")
+            lines.append("=" * 70)
+
+            if account_data:
+                lines.append(f"\nAccount: {account_data.get('account_id', 'N/A')}")
+                lines.append(f"  Net Liquidation:  ${account_data.get('net_liquidation', 0):>15,.2f}")
+                lines.append(f"  Available Funds:  ${account_data.get('available_funds', 0):>15,.2f}")
+                lines.append(f"  Buying Power:     ${account_data.get('buying_power', 0):>15,.2f}")
+
+            lines.append(f"\nPortfolio Summary:")
+            lines.append(f"  Total Value:      ${total_portfolio_value:>15,.2f}")
+            lines.append(f"  Total P&L:        ${total_pnl:>15,.2f}")
+            lines.append(f"  Positions:        {len(positions):>15}")
+
+            lines.append("\n" + "-" * 70)
+            lines.append("HOLDINGS BY PLUGIN")
+            lines.append("-" * 70)
+
+            if plugin_holdings:
+                for name, holdings in sorted(plugin_holdings.items()):
+                    pct = (holdings["total_value"] / total_portfolio_value * 100) if total_portfolio_value else 0
+                    lines.append(f"\n  {name}:")
+                    lines.append(f"    Total Value:    ${holdings['total_value']:>15,.2f}  ({pct:>5.1f}%)")
+                    lines.append(f"    Cash:           ${holdings['cash']:>15,.2f}")
+                    if holdings.get("positions"):
+                        lines.append(f"    Positions:")
+                        for pos in holdings["positions"]:
+                            lines.append(f"      {pos['symbol']:>6}: {pos['quantity']:>8} shares  ${pos['market_value']:>12,.2f}")
+            else:
+                lines.append("\n  No plugins with holdings registered")
+
+            lines.append("\n" + "-" * 70)
+            lines.append("UNASSIGNED HOLDINGS")
+            lines.append("-" * 70)
+
+            unassigned_pct = (unassigned_value / total_portfolio_value * 100) if total_portfolio_value else 0
+            lines.append(f"\n  Unassigned Value: ${unassigned_value:>15,.2f}  ({unassigned_pct:>5.1f}%)")
+
+            if unassigned_positions:
+                lines.append(f"  Positions not claimed by any plugin:")
+                for pos in unassigned_positions:
+                    lines.append(f"    {pos['symbol']:>6}: {pos['quantity']:>8} shares  ${pos['market_value']:>12,.2f}")
+            else:
+                lines.append("  All positions are assigned to plugins")
+
+            lines.append("\n" + "=" * 70)
+            message = "\n".join(lines)
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=message,
+            data=data,
+        )
+
+    def _summary_plugins_only(self, output_json: bool = False) -> CommandResult:
+        """Show only plugin holdings"""
+        plugin_holdings = self._get_plugin_holdings()
+        total_value = sum(p["total_value"] for p in plugin_holdings.values())
+
+        data = {
+            "plugins": plugin_holdings,
+            "total_value": total_value,
+        }
+
+        if output_json:
+            import json
+            message = json.dumps(data, indent=2)
+        else:
+            lines = ["PLUGIN HOLDINGS", "-" * 50]
+            for name, holdings in sorted(plugin_holdings.items()):
+                lines.append(f"\n{name}:")
+                lines.append(f"  Value: ${holdings['total_value']:,.2f}")
+                lines.append(f"  Cash:  ${holdings['cash']:,.2f}")
+                for pos in holdings.get("positions", []):
+                    lines.append(f"  {pos['symbol']}: {pos['quantity']} @ ${pos['market_value']:,.2f}")
+            lines.append(f"\nTotal Plugin Value: ${total_value:,.2f}")
+            message = "\n".join(lines)
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=message,
+            data=data,
+        )
+
+    def _summary_unassigned_only(self, output_json: bool = False) -> CommandResult:
+        """Show only unassigned holdings"""
+        positions = self.portfolio.positions
+        total_value = self.portfolio.total_value
+        plugin_holdings = self._get_plugin_holdings()
+
+        # Calculate assigned positions
+        plugin_positions = set()
+        plugin_value = sum(p["total_value"] for p in plugin_holdings.values())
+        for plugin_data in plugin_holdings.values():
+            for pos in plugin_data.get("positions", []):
+                plugin_positions.add(pos["symbol"])
+
+        # Find unassigned
+        unassigned_positions = []
+        for pos in positions:
+            if pos.symbol not in plugin_positions:
+                unassigned_positions.append({
+                    "symbol": pos.symbol,
+                    "quantity": pos.quantity,
+                    "market_value": pos.market_value,
+                    "unrealized_pnl": pos.unrealized_pnl,
+                })
+
+        unassigned_value = total_value - plugin_value
+
+        data = {
+            "unassigned_value": unassigned_value,
+            "positions": unassigned_positions,
+        }
+
+        if output_json:
+            import json
+            message = json.dumps(data, indent=2)
+        else:
+            lines = ["UNASSIGNED HOLDINGS", "-" * 50]
+            lines.append(f"Unassigned Value: ${unassigned_value:,.2f}")
+            if unassigned_positions:
+                lines.append("\nPositions:")
+                for pos in unassigned_positions:
+                    lines.append(f"  {pos['symbol']}: {pos['quantity']} shares @ ${pos['market_value']:,.2f}")
+            else:
+                lines.append("\nNo unassigned positions")
+            message = "\n".join(lines)
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=message,
+            data=data,
+        )
+
+    def _get_plugin_holdings(self) -> Dict[str, Dict]:
+        """Get holdings for all registered plugins"""
+        holdings = {}
+
+        if not self.plugin_executive:
+            return holdings
+
+        # Get all registered plugins
+        try:
+            all_status = self.plugin_executive.get_all_plugin_status()
+            for name, status in all_status.items():
+                plugin_config = self.plugin_executive._plugins.get(name)
+                if plugin_config and plugin_config.plugin:
+                    plugin = plugin_config.plugin
+                    effective_holdings = plugin.get_effective_holdings()
+
+                    holdings[name] = {
+                        "state": status.get("state", "unknown"),
+                        "total_value": effective_holdings.get("total_value", 0.0),
+                        "cash": effective_holdings.get("cash", 0.0),
+                        "positions": effective_holdings.get("positions", []),
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to get plugin holdings: {e}")
+
+        return holdings
 
     def handle_stop(self, args: List[str]) -> CommandResult:
         """Handle 'stop' or 'shutdown' command - initiate graceful shutdown"""
