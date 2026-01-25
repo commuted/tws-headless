@@ -1830,3 +1830,171 @@ class PluginExecutive:
         if plugin_name:
             return reader.read_plugin(plugin_name)
         return reader.read_all()
+
+    # =========================================================================
+    # Manual Trade Execution with Plugin Attribution
+    # =========================================================================
+
+    def execute_manual_trade(
+        self,
+        plugin_name: str,
+        symbol: str,
+        action: str,
+        quantity: int,
+        reason: str = "manual_trade",
+        dry_run: bool = True,
+    ) -> Tuple[bool, Optional[int], str]:
+        """
+        Execute a manual trade attributed to a specific plugin.
+
+        Routes the trade through the OrderReconciler to maintain full
+        plugin attribution for commission tracking and P&L reporting.
+
+        Args:
+            plugin_name: Name of the plugin to attribute the trade to
+            symbol: Trading symbol (e.g., "SPY")
+            action: Trade action ("BUY" or "SELL")
+            quantity: Number of shares
+            reason: Reason for the trade (logged with signal)
+            dry_run: If True, simulate only; if False, execute
+
+        Returns:
+            Tuple of (success, order_id, message)
+            - success: True if trade was executed/simulated successfully
+            - order_id: IB order ID if executed, None for dry run
+            - message: Status message
+        """
+        action = action.upper()
+
+        # Validate action
+        if action not in ("BUY", "SELL"):
+            return False, None, f"Invalid action: {action}. Must be BUY or SELL."
+
+        # Validate plugin exists
+        with self._lock:
+            if plugin_name not in self._plugins:
+                available = list(self._plugins.keys())
+                return False, None, f"Plugin '{plugin_name}' not found. Available: {available}"
+
+        # Validate quantity
+        if quantity <= 0:
+            return False, None, f"Invalid quantity: {quantity}. Must be positive."
+
+        # Get contract for symbol
+        contract = self._get_contract(plugin_name, symbol)
+        if not contract:
+            # Try to build a basic stock contract
+            contract = self._build_stock_contract(symbol)
+            if not contract:
+                return False, None, f"Cannot get contract for symbol: {symbol}"
+
+        # Create trade signal with attribution
+        signal = TradeSignal(
+            symbol=symbol,
+            action=action,
+            quantity=quantity,
+            reason=f"[MANUAL] {reason}",
+            confidence=1.0,
+            urgency="Normal",
+        )
+
+        # Get current price for value estimate
+        price_estimate = 0.0
+        pos = self.portfolio.get_position(symbol) if self.portfolio else None
+        if pos:
+            price_estimate = pos.current_price
+        value_estimate = quantity * price_estimate
+
+        if dry_run:
+            # Dry run - just return what would happen
+            message = (
+                f"[DRY RUN] Would execute for plugin '{plugin_name}':\n"
+                f"  Action: {action} {quantity} {symbol}\n"
+                f"  Estimated Value: ${value_estimate:,.2f}\n"
+                f"  Use --confirm to execute"
+            )
+            return True, None, message
+
+        # Add signal to reconciler with plugin attribution
+        self._reconciler.add_signal(plugin_name, signal, contract)
+
+        # Execute immediately (bypass normal batch window)
+        reconciled_orders = self._reconciler.reconcile(symbol)
+
+        if not reconciled_orders:
+            return False, None, "No orders generated after reconciliation"
+
+        # Execute the reconciled order
+        order_id = None
+        for reconciled in reconciled_orders:
+            if self.order_mode == OrderExecutionMode.DRY_RUN:
+                # System-level dry run mode
+                self._log_dry_run_reconciled(reconciled)
+                message = (
+                    f"[DRY RUN - System Mode] Trade for plugin '{plugin_name}':\n"
+                    f"  Action: {action} {quantity} {symbol}\n"
+                    f"  System is in dry-run mode"
+                )
+                return True, None, message
+
+            # Execute the order
+            try:
+                ib_order = self._reconciler.create_ib_order(reconciled)
+                order_id = self.portfolio.place_order(
+                    reconciled.contract,
+                    reconciled.action,
+                    reconciled.net_quantity,
+                    order_type="MKT",
+                )
+
+                if order_id:
+                    self._reconciler.register_execution(order_id, reconciled)
+                    self._register_pending_execution(order_id, reconciled)
+                    self._stats["total_orders"] += 1
+
+                    # Log execution for each contributing plugin
+                    for ps in reconciled.contributing_signals:
+                        result = ExecutionResult(
+                            plugin_name=ps.algorithm_name,
+                            symbol=reconciled.symbol,
+                            action=reconciled.action,
+                            quantity=ps.signal.quantity,
+                            order_id=order_id,
+                            success=True,
+                        )
+                        self._add_to_history(result)
+
+                        if self.on_execution:
+                            try:
+                                self.on_execution(result)
+                            except Exception as e:
+                                logger.error(f"Error in execution callback: {e}")
+
+                    message = (
+                        f"[EXECUTED] Trade for plugin '{plugin_name}':\n"
+                        f"  Order ID: {order_id}\n"
+                        f"  Action: {action} {quantity} {symbol}\n"
+                        f"  Status: Submitted"
+                    )
+                    return True, order_id, message
+                else:
+                    return False, None, f"Failed to place order for {symbol}"
+
+            except Exception as e:
+                logger.error(f"Error executing manual trade: {e}")
+                return False, None, f"Execution error: {e}"
+
+        return False, None, "No orders executed"
+
+    def _build_stock_contract(self, symbol: str) -> Optional[Contract]:
+        """Build a basic stock contract for a symbol"""
+        try:
+            contract = Contract()
+            contract.symbol = symbol
+            contract.secType = "STK"
+            contract.currency = "USD"
+            contract.exchange = "SMART"
+            return contract
+        except Exception as e:
+            logger.error(f"Failed to build contract for {symbol}: {e}")
+            return None

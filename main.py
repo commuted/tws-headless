@@ -226,6 +226,7 @@ class CommandHandler:
         server.register_handler("shutdown", self.handle_stop)
         server.register_handler("sell", self.handle_sell)
         server.register_handler("buy", self.handle_buy)
+        server.register_handler("trade", self.handle_trade)
         server.register_handler("algo", self.handle_algo)
         server.register_handler("plugin", self.handle_plugin)
 
@@ -1403,6 +1404,105 @@ class CommandHandler:
             message=message,
             data=data,
         )
+
+    def handle_trade(self, args: List[str]) -> CommandResult:
+        """
+        Handle 'trade' command - execute trade with plugin attribution.
+
+        Usage:
+            trade PLUGIN ACTION SYMBOL QTY [--confirm] [--reason "text"]
+
+        Examples:
+            trade momentum_5day BUY SPY 100              # Dry run
+            trade momentum_5day BUY SPY 100 --confirm    # Execute
+            trade manual SELL QQQ 50 --confirm --reason "Taking profits"
+        """
+        if self.plugin_executive is None:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Plugin executive not configured",
+            )
+
+        if len(args) < 4:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Usage: trade PLUGIN ACTION SYMBOL QTY [--confirm] [--reason \"text\"]",
+            )
+
+        # Parse arguments
+        plugin_name = args[0]
+        action = args[1].upper()
+        symbol = args[2].upper()
+
+        try:
+            quantity = int(args[3])
+        except ValueError:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Invalid quantity: {args[3]}. Must be an integer.",
+            )
+
+        # Parse flags
+        confirm = "--confirm" in args
+        reason = "manual_trade"
+
+        # Parse --reason flag
+        for i, arg in enumerate(args):
+            if arg == "--reason" and i + 1 < len(args):
+                reason = args[i + 1]
+                break
+
+        # Validate action
+        if action not in ("BUY", "SELL"):
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Invalid action: {action}. Must be BUY or SELL.",
+            )
+
+        # Validate quantity
+        if quantity <= 0:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Invalid quantity: {quantity}. Must be positive.",
+            )
+
+        try:
+            # Execute the trade through plugin executive
+            dry_run = not confirm
+            success, order_id, message = self.plugin_executive.execute_manual_trade(
+                plugin_name=plugin_name,
+                symbol=symbol,
+                action=action,
+                quantity=quantity,
+                reason=reason,
+                dry_run=dry_run,
+            )
+
+            if success:
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=message,
+                    data={
+                        "plugin": plugin_name,
+                        "action": action,
+                        "symbol": symbol,
+                        "quantity": quantity,
+                        "order_id": order_id,
+                        "dry_run": dry_run,
+                    },
+                )
+            else:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=message,
+                )
+
+        except Exception as e:
+            logger.error(f"Trade command failed: {e}")
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Trade failed: {e}",
+            )
 
     def _get_plugin_holdings(self) -> Dict[str, Dict]:
         """Get holdings for all registered plugins"""
