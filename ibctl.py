@@ -5,14 +5,20 @@ ibctl.py - Command-line client for IB Portfolio Rebalancer
 Send commands to a running main.py instance via Unix socket.
 
 Usage:
-    ibctl status              # Get portfolio status
-    ibctl positions           # List all positions
-    ibctl liquidate           # Preview liquidation (dry run)
-    ibctl liquidate --confirm # Execute full liquidation
-    ibctl sell SPY 10         # Preview selling 10 shares of SPY
-    ibctl sell SPY all --confirm  # Sell entire SPY position
-    ibctl stop                # Shutdown the server
-    ibctl help                # List available commands
+    ibctl status                          # Get portfolio status
+    ibctl positions                       # List all positions
+    ibctl summary                         # Executive account summary
+    ibctl liquidate                       # Preview liquidation (dry run)
+    ibctl liquidate --confirm             # Execute full liquidation
+    ibctl sell SPY 10                     # Preview selling 10 shares of SPY
+    ibctl sell SPY all --confirm          # Sell entire SPY position
+    ibctl buy SPY 10 --confirm            # Buy 10 shares of SPY
+    ibctl trade PLUGIN BUY SPY 100        # Preview plugin-attributed trade
+    ibctl trade PLUGIN BUY SPY 100 --confirm  # Execute plugin-attributed trade
+    ibctl plugin list                     # List all plugins
+    ibctl plugin status NAME              # Get plugin status
+    ibctl algo list                       # List all algorithms
+    ibctl stop                            # Shutdown the server
 """
 
 import argparse
@@ -56,23 +62,56 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  help                 List available commands
-  ping                 Test connection to server
   status               Get portfolio status
   positions            List all positions with details
-  liquidate [SYMBOL]   Liquidate positions (add --confirm to execute)
+  summary [--json]     Executive account summary with plugin breakdown
+  summary plugins      Show only plugin holdings
+  summary unassigned   Show only unassigned holdings
+
   sell SYMBOL QTY      Sell shares (use 'all' for entire position, --confirm to execute)
   buy SYMBOL QTY       Buy shares (--confirm to execute)
+  liquidate [SYMBOL]   Liquidate positions (add --confirm to execute)
+
+  trade PLUGIN ACTION SYMBOL QTY [--confirm] [--reason "text"]
+                       Execute trade with plugin attribution
+                       ACTION: BUY or SELL
+
+  plugin list          List all plugins
+  plugin status NAME   Get plugin status
+  plugin start NAME    Start a plugin
+  plugin stop NAME     Stop a plugin
+  plugin freeze NAME   Freeze a plugin (pause with state save)
+  plugin resume NAME   Resume a frozen plugin
+  plugin enable NAME   Enable plugin for execution
+  plugin disable NAME  Disable plugin
+  plugin trigger NAME  Manually trigger plugin run
+  plugin params NAME   Get plugin parameters
+  plugin param NAME KEY VALUE  Set plugin parameter
+
+  algo list            List all algorithms
+  algo status NAME     Get algorithm status
+  algo enable NAME     Enable algorithm
+  algo disable NAME    Disable algorithm
+  algo trigger NAME    Manually trigger algorithm
+
   stop                 Shutdown the server gracefully
 
 Examples:
   ibctl status
   ibctl positions
+  ibctl summary
+  ibctl summary --json
   ibctl liquidate
   ibctl liquidate --confirm
-  ibctl liquidate SPY --confirm
   ibctl sell SPY 10
   ibctl sell SPY all --confirm
+  ibctl trade momentum_5day BUY SPY 100
+  ibctl trade momentum_5day BUY SPY 100 --confirm
+  ibctl trade manual SELL QQQ 50 --confirm --reason "Taking profits"
+  ibctl plugin list
+  ibctl plugin status momentum_5day
+  ibctl plugin trigger momentum_5day
+  ibctl algo list
   ibctl stop
         """,
     )
