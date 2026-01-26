@@ -2,38 +2,139 @@
 """
 ibctl.py - Command-line client for IB Portfolio Rebalancer
 
-Send commands to a running main.py instance via Unix socket.
+Send commands to a running main.py or run_engine.py instance via Unix socket.
 
 Usage:
-    ibctl status                          # Get portfolio status
-    ibctl positions                       # List all positions
-    ibctl summary                         # Executive account summary
-    ibctl liquidate                       # Preview liquidation (dry run)
-    ibctl liquidate --confirm             # Execute full liquidation
-    ibctl sell SPY 10                     # Preview selling 10 shares of SPY
-    ibctl sell SPY all --confirm          # Sell entire SPY position
-    ibctl buy SPY 10 --confirm            # Buy 10 shares of SPY
-    ibctl trade PLUGIN BUY SPY 100        # Preview plugin-attributed trade
-    ibctl trade PLUGIN BUY SPY 100 --confirm  # Execute plugin-attributed trade
-    ibctl plugin list                     # List all plugins
-    ibctl plugin status NAME              # Get plugin status
-    ibctl algo list                       # List all algorithms
-    ibctl stop                            # Shutdown the server
+    ./ibctl.py status                          # Get portfolio status
+    ./ibctl.py positions                       # List all positions
+    ./ibctl.py summary                         # Executive account summary
+    ./ibctl.py liquidate                       # Preview liquidation (dry run)
+    ./ibctl.py liquidate --confirm             # Execute full liquidation
+    ./ibctl.py sell SPY 10                     # Preview selling 10 shares of SPY
+    ./ibctl.py sell SPY all --confirm          # Sell entire SPY position
+    ./ibctl.py buy SPY 10 --confirm            # Buy 10 shares of SPY
+    ./ibctl.py trade PLUGIN BUY SPY 100        # Preview plugin-attributed trade
+    ./ibctl.py trade PLUGIN BUY SPY 100 --confirm  # Execute plugin-attributed trade
+    ./ibctl.py plugin list                     # List all plugins
+    ./ibctl.py plugin status NAME              # Get plugin status
+    ./ibctl.py algo list                       # List all algorithms
+    ./ibctl.py stop                            # Shutdown the server
 """
 
 import argparse
 import json
+import socket
 import sys
-from .command_server import send_command, DEFAULT_SOCKET_PATH, CommandStatus
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, Any, Optional
 
 
-def format_result(result, verbose: bool = False):
+# Default socket path - must match command_server.py
+DEFAULT_SOCKET_PATH = "/tmp/ib_portfolio.sock"
+
+
+class CommandStatus(Enum):
+    """Command execution status"""
+    SUCCESS = "success"
+    ERROR = "error"
+    PENDING = "pending"
+    UNAUTHORIZED = "unauthorized"
+
+
+@dataclass
+class CommandResult:
+    """Result of a command execution"""
+    status: CommandStatus
+    message: str = ""
+    data: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status.value,
+            "message": self.message,
+            "data": self.data,
+        }
+
+
+def send_command(
+    command: str,
+    socket_path: str = DEFAULT_SOCKET_PATH,
+    timeout: float = 10.0,
+    token: Optional[str] = None,
+) -> CommandResult:
+    """
+    Send a command to the running server.
+
+    Args:
+        command: Command string to send
+        socket_path: Path to Unix socket
+        timeout: Connection timeout in seconds
+        token: Authentication token (if server requires auth)
+
+    Returns:
+        CommandResult from server
+    """
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(socket_path)
+        sock.settimeout(timeout)
+
+        # Wrap command with auth token if provided
+        if token:
+            full_command = f"AUTH {token} {command}"
+        else:
+            full_command = command
+
+        # Send command
+        sock.sendall((full_command + "\n").encode("utf-8"))
+
+        # Receive response
+        data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if b"\n" in data:
+                break
+
+        sock.close()
+
+        # Parse response
+        response = json.loads(data.decode("utf-8").strip())
+        return CommandResult(
+            status=CommandStatus(response.get("status", "error")),
+            message=response.get("message", ""),
+            data=response.get("data", {}),
+        )
+
+    except FileNotFoundError:
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Server not running (socket not found: {socket_path})",
+        )
+    except ConnectionRefusedError:
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message="Connection refused - server may not be running",
+        )
+    except Exception as e:
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=f"Failed to send command: {e}",
+        )
+
+
+def format_result(result: CommandResult, verbose: bool = False):
     """Format the command result for display"""
     # Status indicator
     if result.status == CommandStatus.SUCCESS:
         status_str = "[OK]"
     elif result.status == CommandStatus.ERROR:
         status_str = "[ERROR]"
+    elif result.status == CommandStatus.UNAUTHORIZED:
+        status_str = "[UNAUTHORIZED]"
     else:
         status_str = "[PENDING]"
 
@@ -94,25 +195,27 @@ Commands:
   algo disable NAME    Disable algorithm
   algo trigger NAME    Manually trigger algorithm
 
+  pause                Pause algorithm/plugin execution
+  resume               Resume algorithm/plugin execution
   stop                 Shutdown the server gracefully
 
 Examples:
-  ibctl status
-  ibctl positions
-  ibctl summary
-  ibctl summary --json
-  ibctl liquidate
-  ibctl liquidate --confirm
-  ibctl sell SPY 10
-  ibctl sell SPY all --confirm
-  ibctl trade momentum_5day BUY SPY 100
-  ibctl trade momentum_5day BUY SPY 100 --confirm
-  ibctl trade manual SELL QQQ 50 --confirm --reason "Taking profits"
-  ibctl plugin list
-  ibctl plugin status momentum_5day
-  ibctl plugin trigger momentum_5day
-  ibctl algo list
-  ibctl stop
+  ./ibctl.py status
+  ./ibctl.py positions
+  ./ibctl.py summary
+  ./ibctl.py summary --json
+  ./ibctl.py liquidate
+  ./ibctl.py liquidate --confirm
+  ./ibctl.py sell SPY 10
+  ./ibctl.py sell SPY all --confirm
+  ./ibctl.py trade momentum_5day BUY SPY 100
+  ./ibctl.py trade momentum_5day BUY SPY 100 --confirm
+  ./ibctl.py trade manual SELL QQQ 50 --confirm --reason "Taking profits"
+  ./ibctl.py plugin list
+  ./ibctl.py plugin status momentum_5day
+  ./ibctl.py plugin trigger momentum_5day
+  ./ibctl.py algo list
+  ./ibctl.py stop
         """,
     )
 
@@ -142,6 +245,10 @@ Examples:
         action="store_true",
         help="Output raw JSON response",
     )
+    parser.add_argument(
+        "--token",
+        help="Authentication token (if server requires auth)",
+    )
 
     args = parser.parse_args()
 
@@ -157,6 +264,7 @@ Examples:
         command=command_str,
         socket_path=args.socket,
         timeout=args.timeout,
+        token=args.token,
     )
 
     # Output result
@@ -166,7 +274,7 @@ Examples:
         format_result(result, verbose=args.verbose)
 
     # Exit with error code if command failed
-    if result.status == CommandStatus.ERROR:
+    if result.status in (CommandStatus.ERROR, CommandStatus.UNAUTHORIZED):
         sys.exit(1)
 
 
