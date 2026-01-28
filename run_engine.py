@@ -320,28 +320,46 @@ class EngineCommandHandler:
             total_pnl = portfolio.total_pnl
             positions = portfolio.positions
 
-            account_data = {}
+            # Get cash from account or plugin executive
+            cash_balance = 0.0
             if account and account.is_valid:
-                account_data = {
+                cash_balance = account.available_funds or 0.0
+
+            account_data = {
+                "total_value": total_value,
+                "cash": cash_balance,
+                "positions_value": total_value - cash_balance,
+                "total_pnl": total_pnl,
+            }
+            if account and account.is_valid:
+                account_data.update({
                     "account_id": account.account_id,
                     "net_liquidation": account.net_liquidation,
                     "available_funds": account.available_funds,
                     "buying_power": account.buying_power,
-                }
+                })
 
-            # Get plugin holdings if using plugin executive
+            # Get plugin holdings breakdown if using plugin executive
             plugin_holdings = {}
+            unassigned = None
             if self.engine.plugin_executive:
-                plugin_holdings = self._get_plugin_holdings()
+                holdings_summary = self.engine.plugin_executive.get_holdings_summary()
+                plugin_holdings = holdings_summary.get("plugins", {})
+                unassigned = holdings_summary.get("unassigned")
+
+                # Sync unassigned holdings with current portfolio state
+                self.engine.plugin_executive.sync_unassigned_holdings()
 
             data = {
                 "account": account_data,
                 "portfolio": {
                     "total_value": total_value,
+                    "cash": cash_balance,
                     "total_pnl": total_pnl,
                     "position_count": len(positions),
                 },
                 "plugins": plugin_holdings,
+                "unassigned": unassigned,
             }
 
             if output_json:
@@ -352,12 +370,35 @@ class EngineCommandHandler:
                     "ACCOUNT SUMMARY",
                     "=" * 50,
                     f"Total Value:    ${total_value:>12,.2f}",
+                    f"Cash:           ${cash_balance:>12,.2f}",
+                    f"Positions Value: ${total_value - cash_balance:>11,.2f}",
                     f"Total P&L:      ${total_pnl:>12,.2f}",
                     f"Positions:      {len(positions):>12}",
                 ]
-                if account_data:
-                    lines.append(f"Net Liquidation: ${account_data.get('net_liquidation', 0):>11,.2f}")
-                    lines.append(f"Buying Power:    ${account_data.get('buying_power', 0):>11,.2f}")
+                if account_data.get("buying_power"):
+                    lines.append(f"Buying Power:   ${account_data.get('buying_power', 0):>12,.2f}")
+
+                # Show plugin breakdown if available
+                if plugin_holdings:
+                    lines.append("")
+                    lines.append("PLUGIN HOLDINGS:")
+                    lines.append("-" * 50)
+                    for name, info in plugin_holdings.items():
+                        plugin_value = info.get("total_value", 0.0)
+                        plugin_cash = info.get("cash", 0.0)
+                        lines.append(f"  {name}: ${plugin_value:,.2f} (cash: ${plugin_cash:,.2f})")
+
+                # Show unassigned
+                if unassigned:
+                    lines.append("")
+                    lines.append("UNASSIGNED:")
+                    lines.append("-" * 50)
+                    unassigned_cash = unassigned.get("cash", 0.0)
+                    unassigned_value = unassigned.get("total_value", 0.0)
+                    unassigned_positions = unassigned.get("positions", [])
+                    lines.append(f"  Cash: ${unassigned_cash:,.2f}")
+                    lines.append(f"  Positions: {len(unassigned_positions)} (${unassigned_value - unassigned_cash:,.2f})")
+
                 lines.append("=" * 50)
                 message = "\n".join(lines)
 
@@ -374,24 +415,14 @@ class EngineCommandHandler:
 
     def _get_plugin_holdings(self):
         """Get holdings for all registered plugins"""
-        holdings = {}
         if not self.engine.plugin_executive:
-            return holdings
+            return {}
 
         try:
-            exec_status = self.engine.plugin_executive.get_status()
-            for name in exec_status.get("plugins", {}):
-                plugin_status = self.engine.plugin_executive.get_plugin_status(name)
-                if plugin_status:
-                    holdings[name] = {
-                        "state": plugin_status.get("state", "unknown"),
-                        "enabled": plugin_status.get("enabled", False),
-                        "run_count": plugin_status.get("run_count", 0),
-                    }
+            return self.engine.plugin_executive.get_holdings_summary()
         except Exception as e:
             logger.warning(f"Failed to get plugin holdings: {e}")
-
-        return holdings
+            return {}
 
     def handle_liquidate(self, args: List[str]):
         """Handle 'liquidate' command"""

@@ -298,6 +298,10 @@ class PluginBase(ABC):
     # Plugin version (override in subclasses)
     VERSION = "1.0.0"
 
+    # System plugin marker - if True, plugin is managed by the system
+    # and cannot be unloaded/deleted by user commands
+    IS_SYSTEM_PLUGIN = False
+
     def __init__(
         self,
         name: str,
@@ -777,6 +781,11 @@ class PluginBase(ABC):
     def is_loaded(self) -> bool:
         """Whether plugin data has been loaded"""
         return self._loaded
+
+    @property
+    def is_system_plugin(self) -> bool:
+        """Whether this is a system-managed plugin (cannot be unloaded by user)"""
+        return self.IS_SYSTEM_PLUGIN
 
     # =========================================================================
     # Runtime Parameters Interface (preserved from AlgorithmBase)

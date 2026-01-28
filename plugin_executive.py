@@ -26,6 +26,7 @@ from ibapi.contract import Contract
 from ibapi.order import Order
 
 from .plugins.base import PluginBase, PluginResult, TradeSignal, PluginState
+from .plugins.unassigned import UnassignedPlugin, UNASSIGNED_PLUGIN_NAME
 from .data_feed import DataFeed, DataType, TickData
 from .models import Bar
 from .message_bus import MessageBus
@@ -369,6 +370,10 @@ class PluginExecutive:
             "plugins_unloaded": 0,
         }
 
+        # Initialize the system unassigned plugin for tracking unattributed
+        # positions and cash
+        self._init_unassigned_plugin()
+
     # =========================================================================
     # Properties
     # =========================================================================
@@ -393,6 +398,162 @@ class PluginExecutive:
     def stats(self) -> Dict[str, Any]:
         """Get executive statistics"""
         return self._stats.copy()
+
+    @property
+    def unassigned_plugin(self) -> Optional[UnassignedPlugin]:
+        """Get the system unassigned plugin"""
+        with self._lock:
+            config = self._plugins.get(UNASSIGNED_PLUGIN_NAME)
+            if config:
+                return config.plugin
+            return None
+
+    @property
+    def account_cash(self) -> float:
+        """Get account cash balance from unassigned plugin"""
+        plugin = self.unassigned_plugin
+        if plugin:
+            return plugin.cash_balance
+        return 0.0
+
+    # =========================================================================
+    # Unassigned Plugin Management
+    # =========================================================================
+
+    def _init_unassigned_plugin(self):
+        """Initialize the system unassigned plugin"""
+        try:
+            plugin = UnassignedPlugin(
+                portfolio=self.portfolio,
+                message_bus=self.message_bus,
+            )
+
+            if plugin.load():
+                # Register with MANUAL execution mode - it doesn't generate signals
+                self.register_plugin(
+                    plugin,
+                    execution_mode=ExecutionMode.MANUAL,
+                    enabled=True,
+                )
+                plugin.start()
+                logger.info("Initialized system unassigned plugin")
+            else:
+                logger.error("Failed to load unassigned plugin")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize unassigned plugin: {e}")
+
+    def sync_unassigned_holdings(self) -> bool:
+        """
+        Sync unassigned plugin with current portfolio state.
+
+        Calculates which symbols are claimed by other plugins and
+        syncs the remainder (plus cash) to the unassigned plugin.
+
+        Returns:
+            True if sync successful
+        """
+        plugin = self.unassigned_plugin
+        if not plugin:
+            logger.warning("No unassigned plugin to sync")
+            return False
+
+        # Collect claimed symbols from all other plugins
+        claimed_symbols = self._get_claimed_symbols()
+
+        # Calculate claimed cash (sum of cash in other plugin holdings)
+        claimed_cash = self._get_claimed_cash()
+
+        # Sync unassigned plugin
+        return plugin.sync_from_portfolio(claimed_symbols, claimed_cash)
+
+    def _get_claimed_symbols(self) -> Set[str]:
+        """Get all symbols claimed by non-system plugins"""
+        claimed = set()
+
+        with self._lock:
+            for name, config in self._plugins.items():
+                plugin = config.plugin
+
+                # Skip system plugins
+                if plugin.is_system_plugin:
+                    continue
+
+                # Add symbols from plugin instruments
+                for inst in plugin.instruments:
+                    claimed.add(inst.symbol.upper())
+
+                # Add symbols from plugin holdings
+                if plugin.holdings:
+                    for pos in plugin.holdings.current_positions:
+                        claimed.add(pos.symbol.upper())
+
+        return claimed
+
+    def _get_claimed_cash(self) -> float:
+        """Get total cash claimed by non-system plugins"""
+        total = 0.0
+
+        with self._lock:
+            for name, config in self._plugins.items():
+                plugin = config.plugin
+
+                # Skip system plugins
+                if plugin.is_system_plugin:
+                    continue
+
+                # Add cash from plugin holdings
+                if plugin.holdings:
+                    total += plugin.holdings.current_cash
+
+        return total
+
+    def get_holdings_summary(self) -> Dict[str, Any]:
+        """
+        Get a summary of holdings across all plugins including cash.
+
+        Returns:
+            Dict with account overview, plugin breakdown, and unassigned
+        """
+        summary = {
+            "account": {
+                "total_value": 0.0,
+                "total_cash": 0.0,
+                "total_positions_value": 0.0,
+            },
+            "plugins": {},
+            "unassigned": None,
+        }
+
+        # Get account totals from portfolio
+        if self.portfolio:
+            summary["account"]["total_value"] = self.portfolio.total_value
+            summary["account"]["total_positions_value"] = sum(
+                p.market_value for p in self.portfolio.positions
+            )
+            account = self.portfolio.get_account_summary()
+            if account and account.is_valid:
+                summary["account"]["total_cash"] = account.available_funds or 0.0
+
+        with self._lock:
+            for name, config in self._plugins.items():
+                plugin = config.plugin
+                holdings = plugin.get_effective_holdings()
+
+                plugin_summary = {
+                    "is_system_plugin": plugin.is_system_plugin,
+                    "state": plugin.state.value,
+                    "cash": holdings.get("cash", 0.0),
+                    "positions": holdings.get("positions", []),
+                    "total_value": holdings.get("total_value", 0.0),
+                }
+
+                if plugin.is_system_plugin:
+                    summary["unassigned"] = plugin_summary
+                else:
+                    summary["plugins"][name] = plugin_summary
+
+        return summary
 
     # =========================================================================
     # Dynamic Plugin Loading
@@ -466,6 +627,7 @@ class PluginExecutive:
         Unload a plugin.
 
         Stops the plugin if running, then removes it from the executive.
+        System plugins cannot be unloaded.
 
         Args:
             name: Plugin name
@@ -479,6 +641,11 @@ class PluginExecutive:
                 return False
 
             config = self._plugins[name]
+
+            # Prevent unloading system plugins
+            if config.plugin.is_system_plugin:
+                logger.warning(f"Cannot unload system plugin '{name}'")
+                return False
 
             # Stop plugin if running
             if config.plugin.state in (PluginState.STARTED, PluginState.FROZEN):
