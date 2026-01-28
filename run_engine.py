@@ -245,13 +245,10 @@ class EngineCommandHandler:
         server.register_handler("pause", self.handle_pause)
         server.register_handler("resume", self.handle_resume)
 
-        # Plugin commands if using plugin executive
-        if self.engine.plugin_executive:
-            server.register_handler("plugin", self.handle_plugin)
-
-        # Algorithm commands if using algorithm runner
-        if self.engine.runner:
-            server.register_handler("algo", self.handle_algo)
+        # Always register plugin and algo commands - they return helpful
+        # errors if the feature isn't enabled
+        server.register_handler("plugin", self.handle_plugin)
+        server.register_handler("algo", self.handle_algo)
 
     def handle_status(self, args: List[str]):
         """Handle 'status' command"""
