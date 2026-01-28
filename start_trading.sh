@@ -15,4 +15,4 @@ export MODE="${2:-dry_run}"
 
 # Run from parent directory as a module to fix imports
 cd "$SCRIPT_DIR/.."
-exec python3 -m ib.run_engine
+exec python3 -m ib.run_engine --plugins

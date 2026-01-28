@@ -111,6 +111,64 @@ class Holdings:
                 return pos
         return None
 
+    def add_cash(self, amount: float) -> None:
+        """Add cash to holdings (can be negative to subtract)"""
+        self.current_cash += amount
+        self.last_updated = datetime.now()
+
+    def add_position(
+        self,
+        symbol: str,
+        quantity: float,
+        cost_basis: float = 0.0,
+        current_price: float = 0.0,
+    ) -> None:
+        """
+        Add to a position (or create new one).
+
+        If position exists, adds quantity and averages cost basis.
+        """
+        existing = self.get_position(symbol)
+        if existing:
+            # Average the cost basis
+            total_qty = existing.quantity + quantity
+            if total_qty > 0:
+                existing.cost_basis = (
+                    (existing.quantity * existing.cost_basis + quantity * cost_basis)
+                    / total_qty
+                )
+            existing.quantity = total_qty
+            existing.current_price = current_price or existing.current_price
+        else:
+            self.current_positions.append(HoldingPosition(
+                symbol=symbol,
+                quantity=quantity,
+                cost_basis=cost_basis,
+                current_price=current_price,
+            ))
+        self.last_updated = datetime.now()
+
+    def remove_position(self, symbol: str, quantity: float) -> bool:
+        """
+        Remove quantity from a position.
+
+        Returns True if successful, False if insufficient quantity.
+        """
+        pos = self.get_position(symbol)
+        if not pos:
+            return False
+        if pos.quantity < quantity:
+            return False
+
+        pos.quantity -= quantity
+
+        # Remove position entirely if zero
+        if pos.quantity <= 0:
+            self.current_positions = [p for p in self.current_positions if p.symbol != symbol]
+
+        self.last_updated = datetime.now()
+        return True
+
     def to_dict(self) -> Dict:
         return {
             "plugin": self.plugin_name,

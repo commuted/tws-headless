@@ -159,8 +159,38 @@ def main():
         handler = EngineCommandHandler(engine)
         handler.register_commands(command_server)
 
-    # Setup example algorithm (if not using plugins)
-    if not args.plugins:
+    # Setup example algorithm or plugin
+    if args.plugins:
+        # Load orders system plugin for socket order execution
+        try:
+            from .plugins.orders import OrdersPlugin
+            from .plugin_executive import ExecutionMode
+
+            orders_plugin = OrdersPlugin(
+                portfolio=engine.portfolio,
+                message_bus=engine.message_bus if hasattr(engine, 'message_bus') else None,
+            )
+            if engine.plugin_executive:
+                engine.plugin_executive.register_plugin(
+                    orders_plugin,
+                    execution_mode=ExecutionMode.MANUAL,
+                    enabled=True,
+                )
+                logger.info(f"Added system plugin: {orders_plugin.name}")
+        except ImportError as e:
+            logger.warning(f"Could not load orders plugin: {e}")
+
+        # Load example plugin when using plugin executive
+        try:
+            from .plugins.momentum_5day import create_default_momentum_5day
+
+            plugin = create_default_momentum_5day()
+            if engine.plugin_executive:
+                engine.plugin_executive.register_plugin(plugin, enabled=True)
+                logger.info(f"Added plugin: {plugin.name}")
+        except ImportError as e:
+            logger.warning(f"Could not load example plugin: {e}")
+    else:
         try:
             from .algorithms.base import AlgorithmInstrument
             from .algorithms import DummyAlgorithm
@@ -244,6 +274,8 @@ class EngineCommandHandler:
         server.register_handler("trade", self.handle_trade)
         server.register_handler("pause", self.handle_pause)
         server.register_handler("resume", self.handle_resume)
+        server.register_handler("order", self.handle_order)
+        server.register_handler("transfer", self.handle_transfer)
 
         # Always register plugin and algo commands - they return helpful
         # errors if the feature isn't enabled
@@ -340,12 +372,13 @@ class EngineCommandHandler:
             plugin_holdings = {}
             unassigned = None
             if self.engine.plugin_executive:
+                # Sync unassigned holdings with current portfolio state FIRST
+                self.engine.plugin_executive.sync_unassigned_holdings()
+
+                # Then get holdings summary (now includes synced unassigned data)
                 holdings_summary = self.engine.plugin_executive.get_holdings_summary()
                 plugin_holdings = holdings_summary.get("plugins", {})
                 unassigned = holdings_summary.get("unassigned")
-
-                # Sync unassigned holdings with current portfolio state
-                self.engine.plugin_executive.sync_unassigned_holdings()
 
             data = {
                 "account": account_data,
@@ -706,6 +739,429 @@ class EngineCommandHandler:
                 message=f"Trade failed: {e}",
             )
 
+    def handle_order(self, args: List[str]):
+        """
+        Handle 'order' command - execute any IB order type.
+
+        Usage:
+            order ACTION SYMBOL QTY [TYPE] [options] [--confirm]
+
+        Examples:
+            order buy SPY 100                      # Market order (dry run)
+            order buy SPY 100 --confirm            # Market order (execute)
+            order buy SPY 100 limit 450.00         # Limit order
+            order sell QQQ 50 stop 380.00          # Stop order
+            order buy AAPL 25 stop-limit 175 170   # Stop-limit order
+            order sell MSFT 30 trail 2.00          # Trailing stop $2
+            order sell MSFT 30 trail 1%            # Trailing stop 1%
+            order buy SPY 100 moc                  # Market on Close
+            order sell QQQ 50 loc 380.00           # Limit on Close
+        """
+        from .command_server import CommandResult, CommandStatus
+        from .plugins.orders import OrdersPlugin, OrderType, TimeInForce
+
+        # Get orders plugin
+        orders_plugin = None
+        if self.engine.plugin_executive:
+            from .plugins.orders.plugin import ORDERS_PLUGIN_NAME
+            config = self.engine.plugin_executive._plugins.get(ORDERS_PLUGIN_NAME)
+            if config:
+                orders_plugin = config.plugin
+
+        if not orders_plugin:
+            # Try to execute directly through portfolio if no plugin
+            return self._handle_order_direct(args)
+
+        # Parse arguments
+        if len(args) < 3:
+            from .plugins.orders.plugin import get_order_help
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Usage: order ACTION SYMBOL QTY [TYPE] [options] [--confirm]\n\n{get_order_help()}",
+            )
+
+        action = args[0].upper()
+        symbol = args[1].upper()
+
+        try:
+            quantity = float(args[2])
+        except ValueError:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Invalid quantity: {args[2]}",
+            )
+
+        # Parse remaining arguments
+        confirm = "--confirm" in args
+        remaining = [a for a in args[3:] if a != "--confirm"]
+
+        # Default order type is market
+        order_type = OrderType.MARKET
+        limit_price = None
+        stop_price = None
+        trail_amount = None
+        trail_percent = None
+        tif = TimeInForce.DAY
+
+        i = 0
+        while i < len(remaining):
+            arg = remaining[i].lower()
+
+            # Check for --tif option
+            if arg == "--tif" and i + 1 < len(remaining):
+                tif_parsed = orders_plugin.parse_tif(remaining[i + 1])
+                if tif_parsed:
+                    tif = tif_parsed
+                i += 2
+                continue
+
+            # Check for order type
+            parsed_type = orders_plugin.parse_order_type(arg)
+            if parsed_type:
+                order_type = parsed_type
+
+                # Handle types that need prices
+                if order_type == OrderType.LIMIT:
+                    if i + 1 < len(remaining):
+                        try:
+                            limit_price = float(remaining[i + 1])
+                            i += 1
+                        except ValueError:
+                            pass
+
+                elif order_type == OrderType.STOP:
+                    if i + 1 < len(remaining):
+                        try:
+                            stop_price = float(remaining[i + 1])
+                            i += 1
+                        except ValueError:
+                            pass
+
+                elif order_type == OrderType.STOP_LIMIT:
+                    # Expects: stop-limit STOP_PRICE LIMIT_PRICE
+                    if i + 2 < len(remaining):
+                        try:
+                            stop_price = float(remaining[i + 1])
+                            limit_price = float(remaining[i + 2])
+                            i += 2
+                        except ValueError:
+                            pass
+
+                elif order_type in (OrderType.TRAILING_STOP, OrderType.TRAILING_STOP_LIMIT):
+                    # Expects: trail AMOUNT or trail PERCENT%
+                    if i + 1 < len(remaining):
+                        trail_str = remaining[i + 1]
+                        if trail_str.endswith('%'):
+                            try:
+                                trail_percent = float(trail_str[:-1])
+                            except ValueError:
+                                pass
+                        else:
+                            try:
+                                trail_amount = float(trail_str)
+                            except ValueError:
+                                pass
+                        i += 1
+                    # For trail limit, also get limit price
+                    if order_type == OrderType.TRAILING_STOP_LIMIT and i + 1 < len(remaining):
+                        try:
+                            limit_price = float(remaining[i + 1])
+                            i += 1
+                        except ValueError:
+                            pass
+
+                elif order_type in (OrderType.LIMIT_ON_CLOSE, OrderType.LIMIT_ON_OPEN):
+                    if i + 1 < len(remaining):
+                        try:
+                            limit_price = float(remaining[i + 1])
+                            i += 1
+                        except ValueError:
+                            pass
+
+            i += 1
+
+        # Execute the order
+        try:
+            success, order_id, message = orders_plugin.execute_order(
+                symbol=symbol,
+                action=action,
+                quantity=quantity,
+                order_type=order_type,
+                limit_price=limit_price,
+                stop_price=stop_price,
+                trail_amount=trail_amount,
+                trail_percent=trail_percent,
+                tif=tif,
+                dry_run=not confirm,
+            )
+
+            if success:
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=message,
+                    data={
+                        "action": action,
+                        "symbol": symbol,
+                        "quantity": quantity,
+                        "order_type": order_type.name,
+                        "order_id": order_id,
+                        "dry_run": not confirm,
+                    },
+                )
+            else:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=message,
+                )
+
+        except Exception as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Order failed: {e}",
+            )
+
+    def _handle_order_direct(self, args: List[str]):
+        """Handle order command directly through portfolio (fallback)"""
+        from .command_server import CommandResult, CommandStatus
+
+        if len(args) < 3:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Usage: order ACTION SYMBOL QTY [limit PRICE] [stop PRICE] [--confirm]",
+            )
+
+        action = args[0].upper()
+        symbol = args[1].upper()
+
+        try:
+            quantity = float(args[2])
+        except ValueError:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Invalid quantity: {args[2]}",
+            )
+
+        confirm = "--confirm" in args
+
+        # Parse order type from remaining args
+        order_type = "MKT"
+        limit_price = 0.0
+        stop_price = 0.0
+
+        remaining = [a for a in args[3:] if a != "--confirm"]
+        i = 0
+        while i < len(remaining):
+            arg = remaining[i].lower()
+            if arg == "limit" and i + 1 < len(remaining):
+                order_type = "LMT"
+                try:
+                    limit_price = float(remaining[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            elif arg == "stop" and i + 1 < len(remaining):
+                order_type = "STP"
+                try:
+                    stop_price = float(remaining[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            elif arg == "stop-limit" and i + 2 < len(remaining):
+                order_type = "STP LMT"
+                try:
+                    stop_price = float(remaining[i + 1])
+                    limit_price = float(remaining[i + 2])
+                except ValueError:
+                    pass
+                i += 3
+            else:
+                i += 1
+
+        # Get contract
+        portfolio = self.engine.portfolio
+        pos = portfolio.get_position(symbol)
+        if pos and pos.contract:
+            contract = pos.contract
+        else:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"No existing position for {symbol}. Cannot determine contract.",
+            )
+
+        # Build description
+        desc = f"{action} {quantity:.0f} {symbol} {order_type}"
+        if limit_price > 0:
+            desc += f" @ ${limit_price:.2f}"
+        if stop_price > 0:
+            desc += f" stop ${stop_price:.2f}"
+
+        if not confirm:
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"[DRY RUN] Would place: {desc}. Use --confirm to execute.",
+                data={"dry_run": True},
+            )
+
+        order_id = portfolio.place_order(
+            contract=contract,
+            action=action,
+            quantity=quantity,
+            order_type=order_type,
+            limit_price=limit_price,
+            stop_price=stop_price,
+        )
+
+        if order_id:
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"[EXECUTED] Order {order_id}: {desc}",
+                data={"order_id": order_id},
+            )
+        else:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Failed to place order: {desc}",
+            )
+
+    def handle_transfer(self, args: List[str]):
+        """
+        Handle 'transfer' command - move cash or positions between plugins.
+
+        This is internal bookkeeping only - no actual trades are placed.
+
+        Usage:
+            transfer cash FROM_PLUGIN TO_PLUGIN AMOUNT [--confirm]
+            transfer position FROM_PLUGIN TO_PLUGIN SYMBOL QTY [--confirm]
+            transfer list PLUGIN                  # Show transferable assets
+
+        Examples:
+            transfer cash _unassigned momentum_5day 10000
+            transfer position _unassigned momentum_5day SPY 100
+            transfer list _unassigned
+        """
+        from .command_server import CommandResult, CommandStatus
+
+        if not self.engine.plugin_executive:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Transfer command requires plugin executive (use --plugins flag)",
+            )
+
+        if not args:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=(
+                    "Usage:\n"
+                    "  transfer cash FROM TO AMOUNT [--confirm]\n"
+                    "  transfer position FROM TO SYMBOL QTY [--confirm]\n"
+                    "  transfer list PLUGIN"
+                ),
+            )
+
+        subcommand = args[0].lower()
+        pe = self.engine.plugin_executive
+
+        if subcommand == "list":
+            # List transferable assets from a plugin
+            if len(args) < 2:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message="Usage: transfer list PLUGIN",
+                )
+
+            plugin_name = args[1]
+            cash = pe.get_transferable_cash(plugin_name)
+            positions = pe.get_transferable_positions(plugin_name)
+
+            lines = [f"Transferable from '{plugin_name}':", f"  Cash: ${cash:,.2f}"]
+            if positions:
+                lines.append("  Positions:")
+                for p in positions:
+                    lines.append(f"    {p['symbol']}: {p['quantity']:.2f} (${p['value']:,.2f})")
+            else:
+                lines.append("  Positions: (none)")
+
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message="\n".join(lines),
+                data={"cash": cash, "positions": positions},
+            )
+
+        elif subcommand == "cash":
+            # Transfer cash between plugins
+            if len(args) < 4:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message="Usage: transfer cash FROM TO AMOUNT [--confirm]",
+                )
+
+            from_plugin = args[1]
+            to_plugin = args[2]
+            confirm = "--confirm" in args
+
+            try:
+                amount = float(args[3])
+            except ValueError:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Invalid amount: {args[3]}",
+                )
+
+            if not confirm:
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=f"[DRY RUN] Would transfer ${amount:,.2f} from '{from_plugin}' to '{to_plugin}'. Use --confirm to execute.",
+                    data={"dry_run": True, "from": from_plugin, "to": to_plugin, "amount": amount},
+                )
+
+            success, message = pe.transfer_cash(from_plugin, to_plugin, amount)
+            return CommandResult(
+                status=CommandStatus.SUCCESS if success else CommandStatus.ERROR,
+                message=message,
+                data={"from": from_plugin, "to": to_plugin, "amount": amount} if success else {},
+            )
+
+        elif subcommand == "position":
+            # Transfer position between plugins
+            if len(args) < 5:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message="Usage: transfer position FROM TO SYMBOL QTY [--confirm]",
+                )
+
+            from_plugin = args[1]
+            to_plugin = args[2]
+            symbol = args[3].upper()
+            confirm = "--confirm" in args
+
+            try:
+                quantity = float(args[4])
+            except ValueError:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Invalid quantity: {args[4]}",
+                )
+
+            if not confirm:
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=f"[DRY RUN] Would transfer {quantity:.2f} {symbol} from '{from_plugin}' to '{to_plugin}'. Use --confirm to execute.",
+                    data={"dry_run": True, "from": from_plugin, "to": to_plugin, "symbol": symbol, "quantity": quantity},
+                )
+
+            success, message = pe.transfer_position(from_plugin, to_plugin, symbol, quantity)
+            return CommandResult(
+                status=CommandStatus.SUCCESS if success else CommandStatus.ERROR,
+                message=message,
+                data={"from": from_plugin, "to": to_plugin, "symbol": symbol, "quantity": quantity} if success else {},
+            )
+
+        else:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Unknown transfer subcommand: {subcommand}. Use 'cash', 'position', or 'list'.",
+            )
+
     def handle_pause(self, args: List[str]):
         """Handle 'pause' command - pause algorithm/plugin execution"""
         from .command_server import CommandResult, CommandStatus
@@ -838,19 +1294,34 @@ class EngineCommandHandler:
         pe = self.engine.plugin_executive
 
         if subcommand == "list":
-            plugins = pe.plugins
+            plugin_names = pe.plugins  # List of plugin names
             status_list = {}
-            for name in plugins:
+            lines = []
+            for name in sorted(plugin_names):
                 status = pe.get_plugin_status(name)
                 if status:
+                    is_system = status.get("is_system_plugin", False)
+                    state = status["state"]
+                    enabled = status["enabled"]
+
+                    # Format: name [STATE] (system) enabled/disabled
+                    parts = [f"  {name:<20} [{state}]"]
+                    if is_system:
+                        parts.append("(system)")
+                    parts.append("enabled" if enabled else "disabled")
+                    lines.append(" ".join(parts))
+
                     status_list[name] = {
-                        "state": status["state"],
-                        "enabled": status["enabled"],
+                        "state": state,
+                        "is_system_plugin": is_system,
+                        "enabled": enabled,
                         "run_count": status["run_count"],
                     }
+
+            message = f"{len(plugin_names)} plugins:\n" + "\n".join(lines)
             return CommandResult(
                 status=CommandStatus.SUCCESS,
-                message=f"{len(plugins)} plugins",
+                message=message,
                 data={"plugins": status_list},
             )
 

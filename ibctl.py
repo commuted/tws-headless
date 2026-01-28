@@ -7,17 +7,40 @@ Send commands to a running main.py or run_engine.py instance via Unix socket.
 Usage:
     ./ibctl.py status                          # Get portfolio status
     ./ibctl.py positions                       # List all positions
-    ./ibctl.py summary                         # Executive account summary
-    ./ibctl.py liquidate                       # Preview liquidation (dry run)
-    ./ibctl.py liquidate --confirm             # Execute full liquidation
+    ./ibctl.py summary                         # Account summary with plugin breakdown
+    ./ibctl.py summary --json                  # Account summary as JSON
+
+    # Simple orders (market only)
     ./ibctl.py sell SPY 10                     # Preview selling 10 shares of SPY
     ./ibctl.py sell SPY all --confirm          # Sell entire SPY position
     ./ibctl.py buy SPY 10 --confirm            # Buy 10 shares of SPY
+    ./ibctl.py liquidate --confirm             # Liquidate all positions
+
+    # Advanced orders (all IB order types)
+    ./ibctl.py order buy SPY 100               # Market order (dry run)
+    ./ibctl.py order buy SPY 100 --confirm     # Market order (execute)
+    ./ibctl.py order buy SPY 100 limit 450     # Limit order at $450
+    ./ibctl.py order sell QQQ 50 stop 380      # Stop order at $380
+    ./ibctl.py order buy AAPL 25 stop-limit 175 170   # Stop-limit order
+    ./ibctl.py order sell MSFT 30 trail 2.00   # Trailing stop $2
+    ./ibctl.py order sell MSFT 30 trail 1%     # Trailing stop 1%
+    ./ibctl.py order buy SPY 100 moc           # Market on Close
+    ./ibctl.py order sell QQQ 50 loc 380       # Limit on Close
+
+    # Plugin-attributed trades
     ./ibctl.py trade PLUGIN BUY SPY 100        # Preview plugin-attributed trade
-    ./ibctl.py trade PLUGIN BUY SPY 100 --confirm  # Execute plugin-attributed trade
+    ./ibctl.py trade PLUGIN BUY SPY 100 --confirm  # Execute trade
+
+    # Internal transfers (bookkeeping only, no actual trades)
+    ./ibctl.py transfer list _unassigned       # Show transferable assets
+    ./ibctl.py transfer cash _unassigned momentum_5day 10000 --confirm
+    ./ibctl.py transfer position _unassigned momentum_5day SPY 50 --confirm
+
+    # Plugin/algorithm management
     ./ibctl.py plugin list                     # List all plugins
     ./ibctl.py plugin status NAME              # Get plugin status
-    ./ibctl.py algo list                       # List all algorithms
+    ./ibctl.py pause                           # Pause execution
+    ./ibctl.py resume                          # Resume execution
     ./ibctl.py stop                            # Shutdown the server
 """
 
@@ -165,18 +188,33 @@ def main():
 Commands:
   status               Get portfolio status
   positions            List all positions with details
-  summary [--json]     Executive account summary with plugin breakdown
-  summary plugins      Show only plugin holdings
-  summary unassigned   Show only unassigned holdings
+  summary [--json]     Account summary with plugin breakdown
 
+  Simple orders (market only, requires existing position):
   sell SYMBOL QTY      Sell shares (use 'all' for entire position, --confirm to execute)
   buy SYMBOL QTY       Buy shares (--confirm to execute)
   liquidate [SYMBOL]   Liquidate positions (add --confirm to execute)
 
+  Advanced orders (all IB order types):
+  order ACTION SYMBOL QTY [TYPE] [options] [--confirm]
+                       ACTION: buy or sell
+                       TYPE: market (default), limit PRICE, stop PRICE,
+                             stop-limit STOP LIMIT, trail AMOUNT|PERCENT,
+                             moc, loc PRICE, moo, loo PRICE
+                       --tif TIF: day (default), gtc, ioc, fok
+
+  Plugin-attributed trades:
   trade PLUGIN ACTION SYMBOL QTY [--confirm] [--reason "text"]
                        Execute trade with plugin attribution
-                       ACTION: BUY or SELL
 
+  Internal transfers (bookkeeping only, no actual trades):
+  transfer cash FROM TO AMOUNT [--confirm]
+                       Transfer cash between plugins
+  transfer position FROM TO SYMBOL QTY [--confirm]
+                       Transfer position between plugins
+  transfer list PLUGIN Show transferable assets in a plugin
+
+  Plugin commands (require server started with --plugins):
   plugin list          List all plugins
   plugin status NAME   Get plugin status
   plugin start NAME    Start a plugin
@@ -186,8 +224,6 @@ Commands:
   plugin enable NAME   Enable plugin for execution
   plugin disable NAME  Disable plugin
   plugin trigger NAME  Manually trigger plugin run
-  plugin params NAME   Get plugin parameters
-  plugin param NAME KEY VALUE  Set plugin parameter
 
   algo list            List all algorithms
   algo status NAME     Get algorithm status
@@ -202,20 +238,21 @@ Commands:
 Examples:
   ./ibctl.py status
   ./ibctl.py positions
-  ./ibctl.py summary
   ./ibctl.py summary --json
-  ./ibctl.py liquidate
-  ./ibctl.py liquidate --confirm
-  ./ibctl.py sell SPY 10
-  ./ibctl.py sell SPY all --confirm
-  ./ibctl.py trade momentum_5day BUY SPY 100
+  ./ibctl.py order buy SPY 100                      # Market order (dry run)
+  ./ibctl.py order buy SPY 100 --confirm            # Market order (execute)
+  ./ibctl.py order buy SPY 100 limit 450.00         # Limit order
+  ./ibctl.py order sell QQQ 50 stop 380             # Stop order
+  ./ibctl.py order buy AAPL 25 stop-limit 175 170   # Stop-limit order
+  ./ibctl.py order sell MSFT 30 trail 2.00          # Trailing stop $2
+  ./ibctl.py order buy SPY 100 moc --confirm        # Market on Close
+  ./ibctl.py order buy SPY 100 limit 450 --tif gtc  # Good till cancelled
   ./ibctl.py trade momentum_5day BUY SPY 100 --confirm
-  ./ibctl.py trade manual SELL QQQ 50 --confirm --reason "Taking profits"
+  ./ibctl.py transfer list _unassigned              # Show transferable assets
+  ./ibctl.py transfer cash _unassigned momentum_5day 10000 --confirm
+  ./ibctl.py transfer position _unassigned momentum_5day SPY 50 --confirm
   ./ibctl.py plugin list
   ./ibctl.py plugin status momentum_5day
-  ./ibctl.py plugin trigger momentum_5day
-  ./ibctl.py algo list
-  ./ibctl.py stop
         """,
     )
 

@@ -556,6 +556,198 @@ class PluginExecutive:
         return summary
 
     # =========================================================================
+    # Internal Transfers (Bookkeeping Only - No Actual Trades)
+    # =========================================================================
+
+    def transfer_cash(
+        self,
+        from_plugin: str,
+        to_plugin: str,
+        amount: float,
+    ) -> Tuple[bool, str]:
+        """
+        Transfer cash between plugins (internal bookkeeping only).
+
+        Args:
+            from_plugin: Source plugin name
+            to_plugin: Destination plugin name
+            amount: Amount to transfer (positive)
+
+        Returns:
+            Tuple of (success, message)
+        """
+        if amount <= 0:
+            return False, "Transfer amount must be positive"
+
+        with self._lock:
+            # Get source plugin
+            from_config = self._plugins.get(from_plugin)
+            if not from_config:
+                return False, f"Source plugin '{from_plugin}' not found"
+
+            # Get destination plugin
+            to_config = self._plugins.get(to_plugin)
+            if not to_config:
+                return False, f"Destination plugin '{to_plugin}' not found"
+
+            from_plugin_obj = from_config.plugin
+            to_plugin_obj = to_config.plugin
+
+            # Check source has sufficient cash
+            source_cash = from_plugin_obj.get_effective_cash()
+            if source_cash < amount:
+                return False, f"Insufficient cash in '{from_plugin}': ${source_cash:,.2f} < ${amount:,.2f}"
+
+            # Perform transfer
+            # For plugins with Holdings object
+            if from_plugin_obj.holdings:
+                from_plugin_obj.holdings.add_cash(-amount)
+                from_plugin_obj.save_holdings()
+            elif hasattr(from_plugin_obj, '_cash_balance'):
+                # For UnassignedPlugin
+                from_plugin_obj._cash_balance -= amount
+
+            if to_plugin_obj.holdings:
+                to_plugin_obj.holdings.add_cash(amount)
+                to_plugin_obj.save_holdings()
+            elif hasattr(to_plugin_obj, '_cash_balance'):
+                to_plugin_obj._cash_balance += amount
+
+            logger.info(f"Transferred ${amount:,.2f} cash: {from_plugin} -> {to_plugin}")
+            return True, f"Transferred ${amount:,.2f} from '{from_plugin}' to '{to_plugin}'"
+
+    def transfer_position(
+        self,
+        from_plugin: str,
+        to_plugin: str,
+        symbol: str,
+        quantity: float,
+        price: Optional[float] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Transfer a position between plugins (internal bookkeeping only).
+
+        Args:
+            from_plugin: Source plugin name
+            to_plugin: Destination plugin name
+            symbol: Symbol to transfer
+            quantity: Quantity to transfer (positive)
+            price: Current price (optional, will use portfolio price if available)
+
+        Returns:
+            Tuple of (success, message)
+        """
+        if quantity <= 0:
+            return False, "Transfer quantity must be positive"
+
+        symbol = symbol.upper()
+
+        with self._lock:
+            # Get source plugin
+            from_config = self._plugins.get(from_plugin)
+            if not from_config:
+                return False, f"Source plugin '{from_plugin}' not found"
+
+            # Get destination plugin
+            to_config = self._plugins.get(to_plugin)
+            if not to_config:
+                return False, f"Destination plugin '{to_plugin}' not found"
+
+            from_plugin_obj = from_config.plugin
+            to_plugin_obj = to_config.plugin
+
+            # Get current price from portfolio if not provided
+            if price is None and self.portfolio:
+                pos = self.portfolio.get_position(symbol)
+                if pos:
+                    price = pos.current_price
+                else:
+                    price = 0.0
+
+            # Check source has sufficient quantity
+            source_qty, _ = from_plugin_obj.get_effective_position(symbol)
+            if source_qty < quantity:
+                return False, f"Insufficient {symbol} in '{from_plugin}': {source_qty:.2f} < {quantity:.2f}"
+
+            # Get cost basis from source
+            cost_basis = 0.0
+            if from_plugin_obj.holdings:
+                pos = from_plugin_obj.holdings.get_position(symbol)
+                if pos:
+                    cost_basis = pos.cost_basis
+            elif hasattr(from_plugin_obj, '_holdings') and from_plugin_obj._holdings:
+                # For UnassignedPlugin with _holdings list
+                for hp in from_plugin_obj._holdings.current_positions:
+                    if hp.symbol == symbol:
+                        cost_basis = hp.cost_basis
+                        break
+
+            # Perform transfer - remove from source
+            if from_plugin_obj.holdings:
+                if not from_plugin_obj.holdings.remove_position(symbol, quantity):
+                    return False, f"Failed to remove {quantity} {symbol} from '{from_plugin}'"
+                from_plugin_obj.save_holdings()
+            elif hasattr(from_plugin_obj, '_holdings') and from_plugin_obj._holdings:
+                # UnassignedPlugin uses _holdings directly
+                if not from_plugin_obj._holdings.remove_position(symbol, quantity):
+                    return False, f"Failed to remove {quantity} {symbol} from '{from_plugin}'"
+
+            # Add to destination
+            if to_plugin_obj.holdings:
+                to_plugin_obj.holdings.add_position(
+                    symbol=symbol,
+                    quantity=quantity,
+                    cost_basis=cost_basis,
+                    current_price=price or 0.0,
+                )
+                to_plugin_obj.save_holdings()
+            elif hasattr(to_plugin_obj, '_holdings') and to_plugin_obj._holdings:
+                to_plugin_obj._holdings.add_position(
+                    symbol=symbol,
+                    quantity=quantity,
+                    cost_basis=cost_basis,
+                    current_price=price or 0.0,
+                )
+
+            value = quantity * (price or 0.0)
+            logger.info(f"Transferred {quantity} {symbol} (${value:,.2f}): {from_plugin} -> {to_plugin}")
+            return True, f"Transferred {quantity:.2f} {symbol} from '{from_plugin}' to '{to_plugin}'"
+
+    def get_transferable_positions(self, plugin_name: str) -> List[Dict[str, Any]]:
+        """
+        Get positions that can be transferred from a plugin.
+
+        Returns list of dicts with symbol, quantity, value.
+        """
+        with self._lock:
+            config = self._plugins.get(plugin_name)
+            if not config:
+                return []
+
+            plugin = config.plugin
+            holdings = plugin.get_effective_holdings()
+            positions = holdings.get("positions", [])
+
+            return [
+                {
+                    "symbol": p.get("symbol", p.get("symbol")),
+                    "quantity": p.get("quantity", 0),
+                    "value": p.get("market_value", p.get("quantity", 0) * p.get("current_price", 0)),
+                }
+                for p in positions
+                if p.get("quantity", 0) > 0
+            ]
+
+    def get_transferable_cash(self, plugin_name: str) -> float:
+        """Get available cash that can be transferred from a plugin."""
+        with self._lock:
+            config = self._plugins.get(plugin_name)
+            if not config:
+                return 0.0
+
+            return config.plugin.get_effective_cash()
+
+    # =========================================================================
     # Dynamic Plugin Loading
     # =========================================================================
 
@@ -1130,6 +1322,9 @@ class PluginExecutive:
             name="PluginExecutive-Health"
         )
         self._health_thread.start()
+
+        # Initial sync of unassigned holdings
+        self.sync_unassigned_holdings()
 
         logger.info(f"Plugin executive started with {len(self._plugins)} plugins")
         return True
@@ -1722,6 +1917,7 @@ class PluginExecutive:
                 "name": name,
                 "version": plugin.VERSION,
                 "state": plugin.state.value,
+                "is_system_plugin": plugin.is_system_plugin,
                 "enabled": config.enabled,
                 "execution_mode": config.execution_mode.value,
                 "bar_timeframe": config.bar_timeframe.value,
