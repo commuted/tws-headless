@@ -917,3 +917,160 @@ class TestEngineCommandHandlerErrorHandling:
         result = self.handler.handle_summary([])
         assert result.status == CommandStatus.ERROR
         assert "Failed to get summary" in result.message
+
+
+class TestEnginePluginDump:
+    """Tests for 'plugin dump' command in EngineCommandHandler"""
+
+    def setup_method(self):
+        self.engine = MockEngine()
+        self.engine.plugin_executive = MockPluginExecutive()
+
+        # Set up _pending_orders (not in default MockPluginExecutive)
+        self.engine.plugin_executive._pending_orders = {}
+
+        # Set up plugin objects with get_effective_holdings
+        mock_plugin = Mock()
+        mock_plugin.get_effective_holdings.return_value = {
+            "plugin": "momentum_5day",
+            "cash": 5000.0,
+            "positions": [
+                {
+                    "symbol": "SPY",
+                    "quantity": 100,
+                    "cost_basis": 44000.0,
+                    "current_price": 450.0,
+                    "market_value": 45000.0,
+                },
+            ],
+            "total_value": 50000.0,
+        }
+        self.engine.plugin_executive._plugins["momentum_5day"] = Mock(
+            state="STARTED", enabled=True, run_count=10,
+            is_system_plugin=False, plugin=mock_plugin,
+        )
+
+        mock_plugin2 = Mock()
+        mock_plugin2.get_effective_holdings.return_value = {
+            "plugin": "mean_reversion",
+            "cash": 3000.0,
+            "positions": [],
+            "total_value": 3000.0,
+        }
+        self.engine.plugin_executive._plugins["mean_reversion"] = Mock(
+            state="STOPPED", enabled=False, run_count=5,
+            is_system_plugin=False, plugin=mock_plugin2,
+        )
+
+        self.handler = EngineCommandHandler(self.engine)
+
+    def test_dump_with_positions(self):
+        """Test dump shows plugin positions and cash"""
+        result = self.handler.handle_plugin(["dump", "momentum_5day"])
+        assert result.status == CommandStatus.SUCCESS
+        assert result.data["plugin"] == "momentum_5day"
+        assert result.data["cash"] == 5000.0
+        assert len(result.data["positions"]) == 1
+        assert result.data["positions"][0]["symbol"] == "SPY"
+        assert result.data["positions"][0]["quantity"] == 100
+        assert result.data["positions"][0]["market_value"] == 45000.0
+
+    def test_dump_empty_positions(self):
+        """Test dump with no positions"""
+        result = self.handler.handle_plugin(["dump", "mean_reversion"])
+        assert result.status == CommandStatus.SUCCESS
+        assert result.data["cash"] == 3000.0
+        assert result.data["positions"] == []
+        assert "(none)" in result.message
+
+    def test_dump_with_open_orders(self):
+        """Test dump shows open orders filtered by plugin"""
+        from datetime import datetime
+        pending = Mock()
+        pending.plugin_name = "momentum_5day"
+        pending.signal = Mock(symbol="QQQ", action="BUY", quantity=50)
+        pending.status = "pending"
+        pending.created_at = datetime(2025, 1, 15, 10, 30, 0)
+
+        self.engine.plugin_executive._pending_orders = {101: pending}
+
+        result = self.handler.handle_plugin(["dump", "momentum_5day"])
+        assert result.status == CommandStatus.SUCCESS
+        assert len(result.data["open_orders"]) == 1
+        order = result.data["open_orders"][0]
+        assert order["order_id"] == 101
+        assert order["symbol"] == "QQQ"
+        assert order["action"] == "BUY"
+        assert order["quantity"] == 50
+        assert order["status"] == "pending"
+
+    def test_dump_filters_orders_by_plugin(self):
+        """Test dump only shows orders for the requested plugin"""
+        from datetime import datetime
+        pending1 = Mock()
+        pending1.plugin_name = "momentum_5day"
+        pending1.signal = Mock(symbol="SPY", action="SELL", quantity=10)
+        pending1.status = "pending"
+        pending1.created_at = datetime(2025, 1, 15, 10, 0, 0)
+
+        pending2 = Mock()
+        pending2.plugin_name = "mean_reversion"
+        pending2.signal = Mock(symbol="QQQ", action="BUY", quantity=20)
+        pending2.status = "pending"
+        pending2.created_at = datetime(2025, 1, 15, 11, 0, 0)
+
+        self.engine.plugin_executive._pending_orders = {101: pending1, 102: pending2}
+
+        result = self.handler.handle_plugin(["dump", "momentum_5day"])
+        assert len(result.data["open_orders"]) == 1
+        assert result.data["open_orders"][0]["symbol"] == "SPY"
+
+        result2 = self.handler.handle_plugin(["dump", "mean_reversion"])
+        assert len(result2.data["open_orders"]) == 1
+        assert result2.data["open_orders"][0]["symbol"] == "QQQ"
+
+    def test_dump_no_open_orders(self):
+        """Test dump when no pending orders"""
+        result = self.handler.handle_plugin(["dump", "momentum_5day"])
+        assert result.status == CommandStatus.SUCCESS
+        assert result.data["open_orders"] == []
+        assert "Open orders: (none)" in result.message
+
+    def test_dump_not_found(self):
+        """Test dump with unknown plugin returns error"""
+        result = self.handler.handle_plugin(["dump", "nonexistent"])
+        assert result.status == CommandStatus.ERROR
+        assert "not found" in result.message
+
+    def test_dump_missing_name(self):
+        """Test dump without plugin name"""
+        result = self.handler.handle_plugin(["dump"])
+        assert result.status == CommandStatus.ERROR
+
+    def test_dump_message_includes_cash(self):
+        """Test dump message includes cash balance"""
+        result = self.handler.handle_plugin(["dump", "momentum_5day"])
+        assert "$5,000.00" in result.message
+
+    def test_dump_message_includes_positions(self):
+        """Test dump message includes position details"""
+        result = self.handler.handle_plugin(["dump", "momentum_5day"])
+        assert "SPY" in result.message
+        assert "Positions (1)" in result.message
+
+    def test_dump_message_includes_order_details(self):
+        """Test dump message includes order details when present"""
+        from datetime import datetime
+        pending = Mock()
+        pending.plugin_name = "momentum_5day"
+        pending.signal = Mock(symbol="QQQ", action="BUY", quantity=50)
+        pending.status = "pending"
+        pending.created_at = datetime(2025, 1, 15, 10, 30, 0)
+
+        self.engine.plugin_executive._pending_orders = {101: pending}
+
+        result = self.handler.handle_plugin(["dump", "momentum_5day"])
+        assert "Open orders (1)" in result.message
+        assert "#101" in result.message
+        assert "BUY" in result.message
+        assert "QQQ" in result.message

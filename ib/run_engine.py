@@ -213,6 +213,18 @@ def main():
                 logger.info(f"Command server listening on {args.socket}")
             else:
                 logger.warning("Failed to start command server")
+
+        # Reconcile plugin holdings with account on startup
+        if engine.plugin_executive:
+            logger.info("Reconciling plugin holdings with account...")
+            report = engine.plugin_executive.reconcile_with_account()
+            if report.get("discrepancies"):
+                formatted = engine.plugin_executive.format_reconciliation_report(report)
+                for line in formatted.split("\n"):
+                    logger.info(line)
+            else:
+                logger.info("Reconciliation complete: holdings match account")
+
         logger.info("Streaming data - press Ctrl+C 3x to stop")
 
     def on_stopped():
@@ -276,6 +288,7 @@ class EngineCommandHandler:
         server.register_handler("resume", self.handle_resume)
         server.register_handler("order", self.handle_order)
         server.register_handler("transfer", self.handle_transfer)
+        server.register_handler("reconcile", self.handle_reconcile)
 
         # Always register plugin and algo commands - they return helpful
         # errors if the feature isn't enabled
@@ -1160,6 +1173,56 @@ class EngineCommandHandler:
             return CommandResult(
                 status=CommandStatus.ERROR,
                 message=f"Unknown transfer subcommand: {subcommand}. Use 'cash', 'position', or 'list'.",
+            )
+
+    def handle_reconcile(self, args: List[str]):
+        """
+        Handle 'reconcile' command - sync plugin holdings with account.
+
+        Compares plugin holdings against actual account positions and cash.
+        Reports discrepancies and adjusts plugin holdings to match reality.
+
+        Usage:
+            reconcile              # Run reconciliation and show report
+            reconcile --json       # Output report as JSON
+        """
+        from .command_server import CommandResult, CommandStatus
+        import json
+
+        if not self.engine.plugin_executive:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Reconcile command requires plugin executive (use --plugins flag)",
+            )
+
+        output_json = "--json" in args
+
+        try:
+            pe = self.engine.plugin_executive
+            report = pe.reconcile_with_account()
+
+            if output_json:
+                message = json.dumps(report, indent=2)
+            else:
+                message = pe.format_reconciliation_report(report)
+
+            discrepancy_count = len(report.get("discrepancies", []))
+            adjustment_count = len(report.get("adjustments", []))
+
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=message,
+                data={
+                    "discrepancies": discrepancy_count,
+                    "adjustments": adjustment_count,
+                    "report": report,
+                },
+            )
+
+        except Exception as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Reconciliation failed: {e}",
             )
 
     def handle_pause(self, args: List[str]):

@@ -1432,3 +1432,150 @@ class TestSetAlgorithmRunner:
 
         assert handler._algorithm_runner is mock_runner
 
+
+class TestCommandHandlerPluginDump:
+    """Tests for _plugin_dump method"""
+
+    @pytest.fixture
+    def handler(self, mock_ibapi):
+        """Create CommandHandler with plugin executive for testing"""
+        from main import CommandHandler
+
+        mock_portfolio = MagicMock()
+        mock_shutdown = MagicMock()
+        handler = CommandHandler(mock_portfolio, mock_shutdown)
+
+        # Create mock plugin executive
+        mock_pe = MagicMock()
+
+        mock_plugin = MagicMock()
+        mock_plugin.get_effective_holdings.return_value = {
+            "plugin": "test_plugin",
+            "cash": 10000.0,
+            "positions": [
+                {
+                    "symbol": "SPY",
+                    "quantity": 100,
+                    "cost_basis": 44000.0,
+                    "current_price": 450.0,
+                    "market_value": 45000.0,
+                },
+            ],
+            "total_value": 55000.0,
+        }
+
+        mock_pe._plugins = {
+            "test_plugin": MagicMock(plugin=mock_plugin),
+        }
+        mock_pe._pending_orders = {}
+
+        handler.plugin_executive = mock_pe
+        return handler
+
+    def test_plugin_dump_success(self, handler):
+        """Test _plugin_dump returns positions and orders"""
+        from command_server import CommandStatus
+
+        result = handler.handle_plugin(["dump", "test_plugin"])
+
+        assert result.status == CommandStatus.SUCCESS
+        assert result.data["plugin"] == "test_plugin"
+        assert result.data["cash"] == 10000.0
+        assert len(result.data["positions"]) == 1
+        assert result.data["positions"][0]["symbol"] == "SPY"
+        assert result.data["open_orders"] == []
+
+    def test_plugin_dump_not_found(self, handler):
+        """Test _plugin_dump with unknown plugin"""
+        from command_server import CommandStatus
+
+        result = handler.handle_plugin(["dump", "nonexistent"])
+
+        assert result.status == CommandStatus.ERROR
+        assert "not found" in result.message
+
+    def test_plugin_dump_missing_name(self, handler):
+        """Test plugin dump without name"""
+        from command_server import CommandStatus
+
+        result = handler.handle_plugin(["dump"])
+
+        assert result.status == CommandStatus.ERROR
+        assert "Usage" in result.message
+
+    def test_plugin_dump_with_open_orders(self, handler):
+        """Test _plugin_dump includes open orders"""
+        from datetime import datetime
+        from command_server import CommandStatus
+
+        pending = MagicMock()
+        pending.plugin_name = "test_plugin"
+        pending.signal.symbol = "QQQ"
+        pending.signal.action = "BUY"
+        pending.signal.quantity = 50
+        pending.status = "pending"
+        pending.created_at = datetime(2025, 1, 15, 10, 30, 0)
+
+        handler.plugin_executive._pending_orders = {201: pending}
+
+        result = handler.handle_plugin(["dump", "test_plugin"])
+
+        assert result.status == CommandStatus.SUCCESS
+        assert len(result.data["open_orders"]) == 1
+        order = result.data["open_orders"][0]
+        assert order["order_id"] == 201
+        assert order["symbol"] == "QQQ"
+        assert order["action"] == "BUY"
+        assert order["quantity"] == 50
+
+    def test_plugin_dump_filters_orders_by_plugin(self, handler):
+        """Test _plugin_dump only returns orders for target plugin"""
+        from datetime import datetime
+        from command_server import CommandStatus
+
+        own_order = MagicMock()
+        own_order.plugin_name = "test_plugin"
+        own_order.signal.symbol = "SPY"
+        own_order.signal.action = "SELL"
+        own_order.signal.quantity = 10
+        own_order.status = "pending"
+        own_order.created_at = datetime(2025, 1, 15, 10, 0, 0)
+
+        other_order = MagicMock()
+        other_order.plugin_name = "other_plugin"
+        other_order.signal.symbol = "AAPL"
+        other_order.signal.action = "BUY"
+        other_order.signal.quantity = 20
+        other_order.status = "pending"
+        other_order.created_at = datetime(2025, 1, 15, 11, 0, 0)
+
+        handler.plugin_executive._pending_orders = {301: own_order, 302: other_order}
+
+        result = handler.handle_plugin(["dump", "test_plugin"])
+
+        assert len(result.data["open_orders"]) == 1
+        assert result.data["open_orders"][0]["symbol"] == "SPY"
+
+    def test_plugin_dump_message_format(self, handler):
+        """Test dump message contains expected text"""
+        from command_server import CommandStatus
+
+        result = handler.handle_plugin(["dump", "test_plugin"])
+
+        assert "test_plugin" in result.message
+        assert "$10,000.00" in result.message
+        assert "SPY" in result.message
+
+    def test_plugin_dump_no_executive(self, mock_ibapi):
+        """Test plugin dump when executive not configured"""
+        from main import CommandHandler
+        from command_server import CommandStatus
+
+        handler = CommandHandler(MagicMock(), MagicMock())
+        handler.plugin_executive = None
+
+        result = handler.handle_plugin(["dump", "test_plugin"])
+
+        assert result.status == CommandStatus.ERROR
+        assert "not configured" in result.message.lower()
+

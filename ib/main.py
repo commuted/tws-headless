@@ -35,6 +35,12 @@ from .command_server import (
     CommandStatus,
     DEFAULT_SOCKET_PATH,
 )
+from .execution_db import (
+    ExecutionDatabase,
+    ExecutionRecord,
+    CommissionRecord,
+    get_execution_db,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -229,6 +235,7 @@ class CommandHandler:
         server.register_handler("trade", self.handle_trade)
         server.register_handler("algo", self.handle_algo)
         server.register_handler("plugin", self.handle_plugin)
+        server.register_handler("db", self.handle_db)
 
     def handle_status(self, args: List[str]) -> CommandResult:
         """Handle 'status' command - return portfolio status"""
@@ -795,6 +802,7 @@ class CommandHandler:
             plugin params <name>                 - Get plugin parameters
             plugin feeds                         - List MessageBus channels
             plugin history <channel> [count]     - Get channel message history
+            plugin dump <name>                   - Dump positions and open orders
         """
         if self.plugin_executive is None:
             return CommandResult(
@@ -1236,6 +1244,298 @@ class CommandHandler:
             message="\n".join(lines),
             data=data,
         )
+
+    def handle_db(self, args: List[str]) -> CommandResult:
+        """
+        Handle 'db' command - execution database operations.
+
+        Usage:
+            db status                           - Show database stats
+            db executions [SYMBOL] [--limit N]  - List executions
+            db commissions [--limit N]          - List commissions
+            db summary SYMBOL                   - Position summary from executions
+            db insert exec <json>               - Insert execution record
+            db insert comm <json>               - Insert commission record
+            db sql <query>                      - Execute raw SQL (read-only)
+        """
+        if not args:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Usage: db <command> [args]. Commands: status, executions, commissions, summary, insert, sql",
+            )
+
+        subcommand = args[0].lower()
+        subargs = args[1:]
+
+        try:
+            db = get_execution_db()
+
+            if subcommand == "status":
+                return self._db_status(db)
+
+            elif subcommand == "executions":
+                symbol = None
+                limit = 50
+                skip_next = False
+                for i, arg in enumerate(subargs):
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    if arg == "--limit" and i + 1 < len(subargs):
+                        limit = int(subargs[i + 1])
+                        skip_next = True
+                    elif not arg.startswith("--"):
+                        symbol = arg
+                return self._db_executions(db, symbol, limit)
+
+            elif subcommand == "commissions":
+                limit = 50
+                for i, arg in enumerate(subargs):
+                    if arg == "--limit" and i + 1 < len(subargs):
+                        limit = int(subargs[i + 1])
+                return self._db_commissions(db, limit)
+
+            elif subcommand == "summary":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: db summary <symbol>",
+                    )
+                return self._db_summary(db, subargs[0])
+
+            elif subcommand == "insert":
+                if len(subargs) < 2:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: db insert <exec|comm> <json>",
+                    )
+                record_type = subargs[0].lower()
+                json_data = " ".join(subargs[1:])
+                return self._db_insert(db, record_type, json_data)
+
+            elif subcommand == "sql":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: db sql <query>",
+                    )
+                query = " ".join(subargs)
+                return self._db_sql(db, query)
+
+            else:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Unknown db command: {subcommand}",
+                )
+
+        except Exception as e:
+            logger.error(f"Database command failed: {e}")
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Database error: {e}",
+            )
+
+    def _db_status(self, db: ExecutionDatabase) -> CommandResult:
+        """Get database status and statistics"""
+        exec_count = db.get_execution_count()
+        comm_count = db.get_commission_count()
+        total_comm = db.get_total_commission()
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"Executions: {exec_count}, Commissions: {comm_count}, Total fees: ${total_comm:.2f}",
+            data={
+                "execution_count": exec_count,
+                "commission_count": comm_count,
+                "total_commission": total_comm,
+                "db_path": str(db.db_path),
+            },
+        )
+
+    def _db_executions(self, db: ExecutionDatabase, symbol: Optional[str], limit: int) -> CommandResult:
+        """List executions from database"""
+        if symbol:
+            executions = db.get_executions_by_symbol(symbol)[:limit]
+        else:
+            executions = db.get_all_executions(limit=limit)
+
+        exec_list = [e.to_dict() for e in executions]
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"{len(executions)} executions" + (f" for {symbol}" if symbol else ""),
+            data={"executions": exec_list},
+        )
+
+    def _db_commissions(self, db: ExecutionDatabase, limit: int) -> CommandResult:
+        """List commissions from database"""
+        import sqlite3
+
+        try:
+            with sqlite3.connect(db.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT c.*, e.symbol, e.side, e.shares
+                    FROM commissions c
+                    LEFT JOIN executions e ON c.exec_id = e.exec_id
+                    ORDER BY c.timestamp DESC
+                    LIMIT ?
+                """, (limit,))
+                rows = cursor.fetchall()
+
+                comm_list = []
+                for row in rows:
+                    comm_list.append({
+                        "exec_id": row["exec_id"],
+                        "symbol": row["symbol"],
+                        "side": row["side"],
+                        "shares": row["shares"],
+                        "commission": row["commission"],
+                        "currency": row["currency"],
+                        "realized_pnl": row["realized_pnl"],
+                        "timestamp": row["timestamp"],
+                    })
+
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=f"{len(comm_list)} commission records",
+                    data={"commissions": comm_list},
+                )
+        except Exception as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Failed to get commissions: {e}",
+            )
+
+    def _db_summary(self, db: ExecutionDatabase, symbol: str) -> CommandResult:
+        """Get position summary from executions"""
+        summary = db.get_position_summary(symbol)
+        if not summary:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"No executions found for {symbol}",
+            )
+
+        cost_basis = db.get_cost_basis(symbol)
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"{symbol}: {summary['net_position']:.0f} shares, avg cost ${summary['avg_buy_price']:.2f}",
+            data={
+                "summary": summary,
+                "cost_basis": cost_basis,
+            },
+        )
+
+    def _db_insert(self, db: ExecutionDatabase, record_type: str, json_data: str) -> CommandResult:
+        """Insert a record into the database"""
+        import json
+
+        try:
+            data = json.loads(json_data)
+        except json.JSONDecodeError as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Invalid JSON: {e}",
+            )
+
+        if record_type == "exec":
+            # Parse and insert execution record
+            required = ["exec_id", "order_id", "symbol", "sec_type", "shares", "avg_price", "side"]
+            for field in required:
+                if field not in data:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message=f"Missing required field: {field}",
+                    )
+
+            record = ExecutionRecord(
+                exec_id=data["exec_id"],
+                order_id=int(data["order_id"]),
+                symbol=data["symbol"],
+                sec_type=data["sec_type"],
+                exchange=data.get("exchange", ""),
+                currency=data.get("currency", "USD"),
+                local_symbol=data.get("local_symbol", ""),
+                shares=float(data["shares"]),
+                cum_qty=float(data.get("cum_qty", data["shares"])),
+                avg_price=float(data["avg_price"]),
+                side=data["side"],
+                account=data.get("account", ""),
+                timestamp=datetime.fromisoformat(data["timestamp"]) if "timestamp" in data else datetime.now(),
+            )
+
+            success = db.insert_execution(record)
+            return CommandResult(
+                status=CommandStatus.SUCCESS if success else CommandStatus.ERROR,
+                message=f"Execution {'inserted' if success else 'already exists'}: {record.exec_id}",
+            )
+
+        elif record_type == "comm":
+            # Parse and insert commission record
+            required = ["exec_id", "commission"]
+            for field in required:
+                if field not in data:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message=f"Missing required field: {field}",
+                    )
+
+            record = CommissionRecord(
+                exec_id=data["exec_id"],
+                commission=float(data["commission"]),
+                currency=data.get("currency", "USD"),
+                realized_pnl=float(data["realized_pnl"]) if "realized_pnl" in data else None,
+                timestamp=datetime.fromisoformat(data["timestamp"]) if "timestamp" in data else datetime.now(),
+            )
+
+            success = db.insert_commission(record)
+            return CommandResult(
+                status=CommandStatus.SUCCESS if success else CommandStatus.ERROR,
+                message=f"Commission {'inserted' if success else 'already exists'}: {record.exec_id}",
+            )
+
+        else:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Unknown record type: {record_type}. Use 'exec' or 'comm'.",
+            )
+
+    def _db_sql(self, db: ExecutionDatabase, query: str) -> CommandResult:
+        """Execute raw SQL query (read-only)"""
+        import sqlite3
+
+        # Security: only allow SELECT queries
+        query_lower = query.strip().lower()
+        if not query_lower.startswith("select"):
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Only SELECT queries are allowed for safety",
+            )
+
+        try:
+            with sqlite3.connect(db.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute(query)
+                rows = cursor.fetchall()
+
+                # Convert rows to list of dicts
+                results = []
+                for row in rows:
+                    results.append(dict(row))
+
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=f"{len(results)} rows returned",
+                    data={"rows": results, "query": query},
+                )
+        except Exception as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"SQL error: {e}",
+            )
 
     def handle_summary(self, args: List[str]) -> CommandResult:
         """

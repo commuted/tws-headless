@@ -39,6 +39,7 @@ Usage:
     # Plugin/algorithm management
     ./ibctl.py plugin list                     # List all plugins
     ./ibctl.py plugin status NAME              # Get plugin status
+    ./ibctl.py plugin dump NAME                # Dump positions & open orders
     ./ibctl.py pause                           # Pause execution
     ./ibctl.py resume                          # Resume execution
     ./ibctl.py stop                            # Shutdown the server
@@ -169,7 +170,36 @@ def format_result(result: CommandResult, verbose: bool = False):
         print(json.dumps(result.data, indent=2))
     elif result.data:
         # Special formatting for certain data types
-        if "positions" in result.data:
+        if "open_orders" in result.data:
+            # Plugin dump output
+            cash = result.data.get("cash", 0.0)
+            positions = result.data.get("positions", [])
+            open_orders = result.data["open_orders"]
+
+            print(f"\n  Cash: ${cash:,.2f}")
+
+            if positions:
+                print(f"\n  {'Symbol':<8} {'Qty':>10} {'Cost Basis':>12} {'Price':>12} {'Value':>14}")
+                print(f"  {'-' * 60}")
+                for p in positions:
+                    print(f"  {p['symbol']:<8} {p['quantity']:>10,.0f} "
+                          f"${p.get('cost_basis', 0):>10,.2f} "
+                          f"${p.get('current_price', 0):>10,.2f} "
+                          f"${p.get('market_value', 0):>12,.2f}")
+            else:
+                print("\n  Positions: (none)")
+
+            if open_orders:
+                print(f"\n  {'Order ID':>10} {'Symbol':<8} {'Action':<6} {'Qty':>8} {'Status':<10} {'Created'}")
+                print(f"  {'-' * 70}")
+                for o in open_orders:
+                    created = o.get("created_at", "")[:19]
+                    print(f"  {o['order_id']:>10} {o['symbol']:<8} {o['action']:<6} "
+                          f"{o['quantity']:>8} {o['status']:<10} {created}")
+            else:
+                print("\n  Open orders: (none)")
+
+        elif "positions" in result.data:
             positions = result.data["positions"]
             if positions:
                 print(f"\n{'Symbol':<8} {'Qty':>10} {'Price':>12} {'Value':>14} {'P&L':>12} {'Alloc':>8}")
@@ -224,6 +254,7 @@ Commands:
   plugin enable NAME   Enable plugin for execution
   plugin disable NAME  Disable plugin
   plugin trigger NAME  Manually trigger plugin run
+  plugin dump NAME     Dump plugin positions and open orders
 
   algo list            List all algorithms
   algo status NAME     Get algorithm status

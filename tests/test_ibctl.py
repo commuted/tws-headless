@@ -120,6 +120,130 @@ class TestFormatResult:
         assert any("SPY" in c for c in calls)
         assert any("BND" in c for c in calls)
 
+    def test_format_result_dump_with_positions_and_orders(self):
+        """Test format_result formats plugin dump data with positions and orders"""
+        from ibctl import format_result
+        from ibctl import CommandStatus, CommandResult
+
+        result = CommandResult(
+            status=CommandStatus.SUCCESS,
+            message="Plugin 'test' dump:",
+            data={
+                "plugin": "test",
+                "cash": 10000.0,
+                "positions": [
+                    {
+                        "symbol": "SPY",
+                        "quantity": 100,
+                        "cost_basis": 44000.0,
+                        "current_price": 450.0,
+                        "market_value": 45000.0,
+                    },
+                ],
+                "open_orders": [
+                    {
+                        "order_id": 101,
+                        "symbol": "QQQ",
+                        "action": "BUY",
+                        "quantity": 50,
+                        "status": "pending",
+                        "created_at": "2025-01-15T10:30:00",
+                    },
+                ],
+            },
+        )
+
+        with patch('builtins.print') as mock_print:
+            format_result(result, verbose=False)
+
+        calls = [str(call) for call in mock_print.call_args_list]
+        # Should show cash
+        assert any("10,000.00" in c for c in calls)
+        # Should show position
+        assert any("SPY" in c for c in calls)
+        # Should show order
+        assert any("QQQ" in c for c in calls)
+        assert any("BUY" in c for c in calls)
+        assert any("101" in c for c in calls)
+
+    def test_format_result_dump_empty_positions_and_orders(self):
+        """Test format_result formats plugin dump with no positions or orders"""
+        from ibctl import format_result
+        from ibctl import CommandStatus, CommandResult
+
+        result = CommandResult(
+            status=CommandStatus.SUCCESS,
+            message="Plugin 'test' dump:",
+            data={
+                "plugin": "test",
+                "cash": 5000.0,
+                "positions": [],
+                "open_orders": [],
+            },
+        )
+
+        with patch('builtins.print') as mock_print:
+            format_result(result, verbose=False)
+
+        calls = [str(call) for call in mock_print.call_args_list]
+        # Should show (none) for both
+        none_count = sum(1 for c in calls if "(none)" in c)
+        assert none_count == 2
+
+    def test_format_result_dump_only_positions(self):
+        """Test format_result formats dump with positions but no orders"""
+        from ibctl import format_result
+        from ibctl import CommandStatus, CommandResult
+
+        result = CommandResult(
+            status=CommandStatus.SUCCESS,
+            message="Plugin 'test' dump:",
+            data={
+                "plugin": "test",
+                "cash": 8000.0,
+                "positions": [
+                    {
+                        "symbol": "AAPL",
+                        "quantity": 50,
+                        "cost_basis": 8500.0,
+                        "current_price": 175.0,
+                        "market_value": 8750.0,
+                    },
+                ],
+                "open_orders": [],
+            },
+        )
+
+        with patch('builtins.print') as mock_print:
+            format_result(result, verbose=False)
+
+        calls = [str(call) for call in mock_print.call_args_list]
+        assert any("AAPL" in c for c in calls)
+        # Orders should show (none)
+        assert any("Open orders: (none)" in c for c in calls)
+
+    def test_format_result_dump_verbose_shows_json(self):
+        """Test format_result in verbose mode shows JSON for dump data"""
+        from ibctl import format_result
+        from ibctl import CommandStatus, CommandResult
+
+        result = CommandResult(
+            status=CommandStatus.SUCCESS,
+            message="Plugin 'test' dump:",
+            data={
+                "plugin": "test",
+                "cash": 5000.0,
+                "positions": [],
+                "open_orders": [],
+            },
+        )
+
+        with patch('builtins.print') as mock_print:
+            format_result(result, verbose=True)
+
+        # In verbose mode, should print JSON data (not table format)
+        assert mock_print.call_count >= 2
+
     def test_format_result_empty_positions(self):
         """Test format_result with empty positions"""
         from ibctl import format_result
