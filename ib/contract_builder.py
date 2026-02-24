@@ -297,8 +297,8 @@ class ContractBuilder:
             Configured Contract object
         """
         contract = Contract()
-        contract.conId = con_id
         contract.secType = "BOND"
+        contract.conId = con_id
         contract.exchange = exchange
         return contract
 

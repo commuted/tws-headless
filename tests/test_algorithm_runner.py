@@ -659,9 +659,10 @@ class TestCooldown:
         runner = AlgorithmRunner(portfolio, feed)
 
         algo = create_mock_algorithm()
-        runner.register_algorithm(algo, cooldown_seconds=1.0)
+        runner.register_algorithm(algo)
 
         config = runner._algorithms[algo.name]
+        config.cooldown_seconds = 1.0
         config.last_run = datetime.now()
 
         # Should not schedule due to cooldown
@@ -1598,6 +1599,7 @@ class TestAlgorithmParameters:
         runner = AlgorithmRunner(portfolio, feed)
 
         algo = create_mock_algorithm()
+        algo.get_parameters = Mock(return_value=None)
         runner.register_algorithm(algo)
         runner._algorithms[algo.name].parameters = {"lookback": 20, "threshold": 0.5}
 
@@ -1663,9 +1665,9 @@ class TestRateLimiterIntegration:
         stats = runner.get_rate_limiter_stats()
 
         assert stats is not None
-        assert "allowed" in stats
-        assert "rejected" in stats
-        assert "rate" in stats
+        assert "requests_allowed" in stats
+        assert "orders_rejected" in stats
+        assert "orders_per_second_limit" in stats
 
     def test_stats_includes_rate_limit_metrics(self):
         """Test stats includes rate limiting metrics"""

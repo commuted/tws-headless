@@ -258,6 +258,7 @@ class TestSubscription:
         """Test subscribing with specific data types"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
+            engine._data_feed = Mock()
             contract = Contract()
 
             engine.subscribe("SPY", contract, {DataType.TICK, DataType.BAR_5MIN})
@@ -316,6 +317,8 @@ class TestStartStop:
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
             engine._connection_manager.start = Mock(return_value=True)
+            engine._runner = Mock()
+            engine._data_feed = Mock()
 
             algo = create_mock_algorithm()
             engine.add_algorithm(algo)
@@ -345,6 +348,9 @@ class TestStartStop:
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
             engine._state = EngineState.RUNNING
+            engine._runner = Mock()
+            engine._data_feed = Mock()
+            engine._connection_manager = Mock()
 
             engine.stop()
 
@@ -383,6 +389,7 @@ class TestPauseResume:
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
             engine._state = EngineState.RUNNING
+            engine._runner = Mock()
 
             engine.pause()
 
@@ -404,6 +411,7 @@ class TestPauseResume:
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
             engine._state = EngineState.PAUSED
+            engine._runner = Mock()
 
             engine.resume()
 
@@ -486,17 +494,18 @@ class TestGetStatus:
             engine = TradingEngine()
             engine._subscribed_symbols.add("SPY")
 
-            # Mock connection manager status
+            # Replace components with mocks
+            engine._connection_manager = Mock()
             engine._connection_manager.get_status = Mock(return_value={
                 "state": "connected",
                 "connected": True,
             })
             engine._connection_manager.is_connected = True
 
-            # Mock data feed status
+            engine._data_feed = Mock()
             engine._data_feed.get_status = Mock(return_value={"running": True})
 
-            # Mock runner status
+            engine._runner = Mock()
             engine._runner.get_status = Mock(return_value={"running": True})
 
             status = engine.get_status()
@@ -531,6 +540,7 @@ class TestDataAccess:
         """Test getting bars"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
+            engine._data_feed = Mock()
 
             bars = engine.get_bars("SPY", DataType.BAR_1MIN, count=100)
 
@@ -572,7 +582,10 @@ class TestOnConnected:
         """Test data feed is started on connection"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
+            engine._data_feed = Mock()
             engine._data_feed.is_running = False
+            engine._runner = Mock()
+            engine._runner.is_running = False
 
             engine._on_connected()
 
@@ -582,6 +595,9 @@ class TestOnConnected:
         """Test runner is started on connection"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
+            engine._data_feed = Mock()
+            engine._data_feed.is_running = False
+            engine._runner = Mock()
             engine._runner.is_running = False
 
             engine._on_connected()
@@ -708,6 +724,7 @@ class TestResubscribeInstruments:
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
             engine._subscribed_symbols.add("SPY")
+            engine._data_feed = Mock()
 
             # Mock portfolio position
             mock_pos = Mock()
@@ -727,6 +744,7 @@ class TestSubscribeAlgorithmInstruments:
         """Test subscribing to algorithm instruments"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
+            engine._data_feed = Mock()
             algo = create_mock_algorithm()
 
             engine._subscribe_algorithm_instruments(algo)

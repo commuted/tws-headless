@@ -609,7 +609,7 @@ class TestAlgoParamsVWAP:
 
         assert order.algoStrategy == "Vwap"
         params = {p.tag: p.value for p in order.algoParams}
-        assert params["maxPctVol"] == 0.1
+        assert params["maxPctVol"] == str(0.1)
 
     def test_vwap_alias(self):
         """Test VWAP convenience alias"""
@@ -654,7 +654,7 @@ class TestAlgoParamsPctVol:
 
         assert order.algoStrategy == "PctVol"
         params = {p.tag: p.value for p in order.algoParams}
-        assert params["pctVol"] == 0.05
+        assert params["pctVol"] == str(0.05)
 
     def test_pct_vol_alias(self):
         """Test PctVol convenience alias"""
@@ -692,7 +692,7 @@ class TestAlgoParamsMinImpact:
 
         assert order.algoStrategy == "MinImpact"
         params = {p.tag: p.value for p in order.algoParams}
-        assert params["maxPctVol"] == 0.05
+        assert params["maxPctVol"] == str(0.05)
 
     def test_min_impact_alias(self):
         """Test MinImpact convenience alias"""
@@ -711,7 +711,7 @@ class TestAlgoParamsDarkIce:
 
         assert order.algoStrategy == "DarkIce"
         params = {p.tag: p.value for p in order.algoParams}
-        assert params["displaySize"] == 100
+        assert params["displaySize"] == str(100)
 
     def test_dark_ice_alias(self):
         """Test DarkIce convenience alias"""
@@ -755,10 +755,10 @@ class TestAlgoParamsAccumulateDistribute:
 
         assert order.algoStrategy == "AD"
         params = {p.tag: p.value for p in order.algoParams}
-        assert params["componentSize"] == 100
-        assert params["timeBetweenOrders"] == 60
-        assert params["randomizeTime20"] == 1
-        assert params["randomizeSize55"] == 1
+        assert params["componentSize"] == str(100)
+        assert params["timeBetweenOrders"] == str(60)
+        assert params["randomizeTime20"] == str(1)
+        assert params["randomizeSize55"] == str(1)
 
 
 class TestAlgoParamsScale:

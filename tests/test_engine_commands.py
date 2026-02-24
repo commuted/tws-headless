@@ -65,8 +65,8 @@ class MockPluginExecutive:
 
     def __init__(self):
         self._plugins = {
-            "momentum_5day": Mock(state="STARTED", enabled=True, run_count=10),
-            "mean_reversion": Mock(state="STOPPED", enabled=False, run_count=5),
+            "momentum_5day": Mock(state="STARTED", enabled=True, run_count=10, is_system_plugin=False),
+            "mean_reversion": Mock(state="STOPPED", enabled=False, run_count=5, is_system_plugin=False),
         }
         self.execute_manual_trade_calls = []
 
