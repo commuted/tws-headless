@@ -6,7 +6,7 @@ import pytest
 from unittest.mock import Mock, MagicMock, patch
 from typing import Optional
 
-from ib.plugins.orders.plugin import (
+from plugins.orders.plugin import (
     OrdersPlugin,
     OrderType,
     TimeInForce,
@@ -15,7 +15,7 @@ from ib.plugins.orders.plugin import (
     TIF_ALIASES,
     ORDERS_PLUGIN_NAME,
 )
-from ib.plugins.base import PluginState
+from plugins.base import PluginState
 
 
 class MockContract:

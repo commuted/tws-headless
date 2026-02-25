@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime
 from unittest.mock import Mock, patch, MagicMock
 
-from ib.plugins.base import (
+from plugins.base import (
     PluginBase,
     PluginState,
     HoldingPosition,

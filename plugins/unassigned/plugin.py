@@ -237,7 +237,7 @@ class UnassignedPlugin(PluginBase):
                     unassigned_positions.append(HoldingPosition(
                         symbol=pos.symbol,
                         quantity=pos.quantity,
-                        cost_basis=pos.average_cost,
+                        cost_basis=pos.avg_cost,
                         current_price=pos.current_price,
                         market_value=pos.market_value,
                     ))

@@ -11,13 +11,13 @@ from ib.plugin_loader import (
     PluginLoader,
     load_plugin,
 )
-from ib.plugins.base import PluginBase
+from plugins.base import PluginBase
 
 
 # Sample plugin code for testing
 VALID_PLUGIN_CODE = '''
 """Test plugin"""
-from ib.plugins.base import PluginBase, TradeSignal
+from plugins.base import PluginBase, TradeSignal
 
 class TestPlugin(PluginBase):
     """A valid test plugin"""
@@ -133,7 +133,7 @@ class TestPluginLoaderDirectory:
             # Create multiple plugin files
             for i in range(3):
                 plugin_code = f'''
-from ib.plugins.base import PluginBase, TradeSignal
+from plugins.base import PluginBase, TradeSignal
 
 class Plugin{i}(PluginBase):
     def __init__(self, **kwargs):

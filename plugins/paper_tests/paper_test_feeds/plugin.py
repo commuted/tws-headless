@@ -14,7 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 
-from ib.plugins.base import PluginBase, TradeSignal
+from ib.data_feed import DataType
+from plugins.base import PluginBase, TradeSignal
 
 from .feed_test_specs import DEFAULT_TEST_PAIRS, FeedTestSpec, FeedTestPair
 
@@ -53,6 +54,10 @@ class PaperTestFeedsPlugin(PluginBase):
     Tests feed subscriptions in pairs, verifying both ticks and bars
     arrive with valid data. Refuses to run on live accounts.
 
+    Uses the StreamManager (via request_stream/cancel_stream) to
+    subscribe to market data, avoiding direct portfolio callback
+    manipulation.
+
     Usage:
         result = plugin.handle_request("run_tests", {})
     """
@@ -78,7 +83,7 @@ class PaperTestFeedsPlugin(PluginBase):
         self._results: List[FeedTestResult] = []
         self._running = False
 
-        # Capture state for callback interception
+        # Capture state for stream callbacks
         self._captured_ticks: Dict[str, List[Dict]] = {}
         self._captured_bars: Dict[str, List[Dict]] = {}
         self._capture_lock = threading.Lock()
@@ -209,6 +214,13 @@ class PaperTestFeedsPlugin(PluginBase):
         if self._running:
             return {"success": False, "message": "Tests already running"}
 
+        # Verify we have a stream manager available
+        if not self._executive:
+            return {
+                "success": False,
+                "message": "No executive/stream manager - plugin must be registered with PluginExecutive",
+            }
+
         self._running = True
         self._results = []
 
@@ -234,13 +246,18 @@ class PaperTestFeedsPlugin(PluginBase):
                 f"Feed tests complete: {summary['passed']}/{summary['total']} passed"
             )
 
-            return {
+            result = {
                 "success": True,
                 "data": {
                     "results": [r.to_dict() for r in self._results],
                     "summary": summary,
                 },
             }
+
+            # One-shot plugin: request unload now that tests are done
+            self.request_unload()
+
+            return result
 
         except Exception as e:
             logger.error(f"Feed test error: {e}", exc_info=True)
@@ -270,9 +287,6 @@ class PaperTestFeedsPlugin(PluginBase):
 
     def _run_tick_test(self, specs: List[FeedTestSpec]):
         """Test tick data for a list of specs simultaneously."""
-        # Save original callback
-        original_on_tick = self.portfolio._on_tick
-
         # Reset capture state
         with self._capture_lock:
             self._captured_ticks = {}
@@ -281,21 +295,18 @@ class PaperTestFeedsPlugin(PluginBase):
                 self._captured_ticks[spec.symbol] = []
                 self._tick_events[spec.symbol] = threading.Event()
 
-        # Install capture callback
-        self.portfolio._on_tick = self._tick_capture_callback(original_on_tick)
-
-        # Track which symbols we start vs pre-existing
-        started_symbols = []
-
         try:
-            # Subscribe
+            # Request streams via StreamManager
             for spec in specs:
-                if spec.symbol in self.portfolio._stream_req_ids:
-                    logger.info(f"  {spec.symbol} already streaming ticks (pre-existing)")
-                else:
-                    logger.info(f"  Subscribing tick stream: {spec.symbol}")
-                    self.portfolio.stream_symbol(spec.symbol, spec.contract)
-                    started_symbols.append(spec.symbol)
+                logger.info(f"  Requesting tick stream: {spec.symbol}")
+                self.request_stream(
+                    symbol=spec.symbol,
+                    contract=spec.contract,
+                    data_types={DataType.TICK},
+                    on_tick=self._on_test_tick,
+                    what_to_show=spec.what_to_show,
+                    use_rth=spec.use_rth,
+                )
 
             # Wait for data using the max timeout across specs
             max_timeout = max(s.tick_timeout for s in specs)
@@ -319,36 +330,22 @@ class PaperTestFeedsPlugin(PluginBase):
                 self._log_result(result)
 
         finally:
-            # Unsubscribe only symbols we started
-            for symbol in started_symbols:
-                logger.info(f"  Unsubscribing tick stream: {symbol}")
-                self.portfolio.unstream_symbol(symbol)
+            # Cancel streams via StreamManager (ref-counting handles cleanup)
+            for spec in specs:
+                logger.info(f"  Cancelling tick stream: {spec.symbol}")
+                self.cancel_stream(spec.symbol)
 
-            # Restore original callback
-            self.portfolio._on_tick = original_on_tick
-
-    def _tick_capture_callback(self, original_callback):
-        """Create a tick capture callback that chains to the original."""
-        def callback(symbol, price, tick_type):
-            with self._capture_lock:
-                if symbol in self._captured_ticks:
-                    self._captured_ticks[symbol].append({
-                        "price": price,
-                        "tick_type": tick_type,
-                        "timestamp": datetime.now().isoformat(),
-                    })
-                    # Signal that we got data for this symbol
-                    if symbol in self._tick_events:
-                        self._tick_events[symbol].set()
-
-            # Chain to original callback
-            if original_callback:
-                try:
-                    original_callback(symbol, price, tick_type)
-                except Exception as e:
-                    logger.error(f"Error in chained tick callback: {e}")
-
-        return callback
+    def _on_test_tick(self, symbol, price, tick_type):
+        """Capture callback for tick testing."""
+        with self._capture_lock:
+            if symbol in self._captured_ticks:
+                self._captured_ticks[symbol].append({
+                    "price": price,
+                    "tick_type": tick_type,
+                    "timestamp": datetime.now().isoformat(),
+                })
+                if symbol in self._tick_events:
+                    self._tick_events[symbol].set()
 
     def _validate_tick_result(self, spec: FeedTestSpec) -> FeedTestResult:
         """Validate tick test results for a spec."""
@@ -377,9 +374,10 @@ class PaperTestFeedsPlugin(PluginBase):
 
         error_message = ""
         if not passed:
-            # Add diagnostic state
-            last_prices = self.portfolio._last_prices.get(spec.symbol, {})
-            details["portfolio_last_prices"] = dict(last_prices)
+            # Add diagnostic state (read-only access is OK)
+            if self.portfolio and hasattr(self.portfolio, "_last_prices"):
+                last_prices = self.portfolio._last_prices.get(spec.symbol, {})
+                details["portfolio_last_prices"] = dict(last_prices)
             error_message = (
                 f"Timeout: received {len(valid_ticks)} valid ticks in "
                 f"{spec.tick_timeout}s (need {spec.min_tick_count})"
@@ -401,9 +399,6 @@ class PaperTestFeedsPlugin(PluginBase):
 
     def _run_bar_test(self, specs: List[FeedTestSpec]):
         """Test bar data for a list of specs simultaneously."""
-        # Save original callback
-        original_on_bar = self.portfolio._on_bar
-
         # Reset capture state
         with self._capture_lock:
             self._captured_bars = {}
@@ -412,31 +407,21 @@ class PaperTestFeedsPlugin(PluginBase):
                 self._captured_bars[spec.symbol] = []
                 self._bar_events[spec.symbol] = threading.Event()
 
-        # Install capture callback
-        self.portfolio._on_bar = self._bar_capture_callback(original_on_bar)
-
-        # Track which symbols we start vs pre-existing
-        started_symbols = []
-
         try:
-            # Subscribe
+            # Request streams via StreamManager
             for spec in specs:
-                if spec.symbol in self.portfolio._bar_req_ids:
-                    logger.info(
-                        f"  {spec.symbol} already streaming bars (pre-existing)"
-                    )
-                else:
-                    logger.info(
-                        f"  Subscribing bar stream: {spec.symbol} "
-                        f"(what_to_show={spec.what_to_show}, use_rth={spec.use_rth})"
-                    )
-                    self.portfolio.bar_stream_symbol(
-                        spec.symbol,
-                        spec.contract,
-                        spec.what_to_show,
-                        spec.use_rth,
-                    )
-                    started_symbols.append(spec.symbol)
+                logger.info(
+                    f"  Requesting bar stream: {spec.symbol} "
+                    f"(what_to_show={spec.what_to_show}, use_rth={spec.use_rth})"
+                )
+                self.request_stream(
+                    symbol=spec.symbol,
+                    contract=spec.contract,
+                    data_types={DataType.BAR_5SEC},
+                    on_bar=self._on_test_bar,
+                    what_to_show=spec.what_to_show,
+                    use_rth=spec.use_rth,
+                )
 
             # Wait for data using the max timeout across specs
             max_timeout = max(s.bar_timeout for s in specs)
@@ -459,39 +444,26 @@ class PaperTestFeedsPlugin(PluginBase):
                 self._log_result(result)
 
         finally:
-            # Unsubscribe only symbols we started
-            for symbol in started_symbols:
-                logger.info(f"  Unsubscribing bar stream: {symbol}")
-                self.portfolio.unstream_bar_symbol(symbol)
+            # Cancel streams via StreamManager
+            for spec in specs:
+                logger.info(f"  Cancelling bar stream: {spec.symbol}")
+                self.cancel_stream(spec.symbol)
 
-            # Restore original callback
-            self.portfolio._on_bar = original_on_bar
-
-    def _bar_capture_callback(self, original_callback):
-        """Create a bar capture callback that chains to the original."""
-        def callback(bar):
-            symbol = bar.symbol
-            with self._capture_lock:
-                if symbol in self._captured_bars:
-                    self._captured_bars[symbol].append({
-                        "open": bar.open,
-                        "high": bar.high,
-                        "low": bar.low,
-                        "close": bar.close,
-                        "volume": bar.volume,
-                        "timestamp": bar.timestamp,
-                    })
-                    if symbol in self._bar_events:
-                        self._bar_events[symbol].set()
-
-            # Chain to original callback
-            if original_callback:
-                try:
-                    original_callback(bar)
-                except Exception as e:
-                    logger.error(f"Error in chained bar callback: {e}")
-
-        return callback
+    def _on_test_bar(self, bar):
+        """Capture callback for bar testing."""
+        symbol = bar.symbol
+        with self._capture_lock:
+            if symbol in self._captured_bars:
+                self._captured_bars[symbol].append({
+                    "open": bar.open,
+                    "high": bar.high,
+                    "low": bar.low,
+                    "close": bar.close,
+                    "volume": bar.volume,
+                    "timestamp": bar.timestamp,
+                })
+                if symbol in self._bar_events:
+                    self._bar_events[symbol].set()
 
     def _validate_bar_result(self, spec: FeedTestSpec) -> FeedTestResult:
         """Validate bar test results for a spec."""
@@ -532,16 +504,17 @@ class PaperTestFeedsPlugin(PluginBase):
 
         error_message = ""
         if not passed:
-            # Add diagnostic state
-            last_bar = self.portfolio._last_bars.get(spec.symbol)
-            if last_bar:
-                details["portfolio_last_bar"] = {
-                    "open": last_bar.open,
-                    "high": last_bar.high,
-                    "low": last_bar.low,
-                    "close": last_bar.close,
-                    "timestamp": last_bar.timestamp,
-                }
+            # Add diagnostic state (read-only access is OK)
+            if self.portfolio and hasattr(self.portfolio, "_last_bars"):
+                last_bar = self.portfolio._last_bars.get(spec.symbol)
+                if last_bar:
+                    details["portfolio_last_bar"] = {
+                        "open": last_bar.open,
+                        "high": last_bar.high,
+                        "low": last_bar.low,
+                        "close": last_bar.close,
+                        "timestamp": last_bar.timestamp,
+                    }
             error_message = (
                 f"Timeout: received {len(valid_bars)} valid bars in "
                 f"{spec.bar_timeout}s (need 1). "

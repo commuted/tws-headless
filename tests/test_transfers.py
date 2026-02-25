@@ -7,7 +7,7 @@ from unittest.mock import Mock, MagicMock, patch
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
-from ib.plugins.base import Holdings, HoldingPosition, PluginBase, PluginState
+from plugins.base import Holdings, HoldingPosition, PluginBase, PluginState
 
 
 class TestHoldingsTransferMethods:

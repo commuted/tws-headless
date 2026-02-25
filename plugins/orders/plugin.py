@@ -177,6 +177,17 @@ class OrdersPlugin(PluginBase):
         self._state = PluginState.STOPPED
         return True
 
+    def freeze(self) -> bool:
+        """Freeze plugin (same as stop for system plugin)"""
+        self._state = PluginState.FROZEN
+        return True
+
+    def resume(self) -> bool:
+        """Resume plugin from frozen state"""
+        if self._state == PluginState.FROZEN:
+            self._state = PluginState.STARTED
+        return True
+
     def parse_order_type(self, type_str: str) -> Optional[OrderType]:
         """Parse order type from string"""
         return ORDER_TYPE_ALIASES.get(type_str.lower())

@@ -11,12 +11,14 @@ Provides the foundation for implementing trading plugins with:
 
 import json
 import logging
+import os
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Tuple, Callable
+from typing import List, Dict, Optional, Any, Set, Tuple, Callable
 
 from ibapi.contract import Contract
 
@@ -379,6 +381,8 @@ class PluginBase(ABC):
             message_bus: Optional MessageBus instance for pub/sub communication
         """
         self.name = name
+        self.instance_id = str(uuid.uuid4())
+        self.descriptor = None  # Opaque data set at load time
         self.portfolio = portfolio
         self._shared_holdings = shared_holdings
         self._message_bus = message_bus
@@ -387,7 +391,8 @@ class PluginBase(ABC):
         if base_path:
             self._base_path = Path(base_path)
         else:
-            self._base_path = Path(__file__).parent / name
+            plugin_dir = Path(os.environ.get("IB_PLUGIN_DIR", Path(__file__).parent))
+            self._base_path = plugin_dir / name
 
         self._instruments_file = self._base_path / "instruments.json"
         self._holdings_file = self._base_path / "holdings.json"
@@ -405,6 +410,9 @@ class PluginBase(ABC):
 
         # MessageBus subscriptions tracking
         self._subscriptions: List[str] = []
+
+        # PluginExecutive reference (set on registration)
+        self._executive = None
 
     # =========================================================================
     # Lifecycle State Property
@@ -514,6 +522,18 @@ class PluginBase(ABC):
                 return {"success": False, "message": f"Unknown request: {request_type}"}
         """
         pass
+
+    def on_unload(self) -> str:
+        """
+        Called when the plugin is about to be removed from the executive.
+
+        Override to provide a meaningful departure message — final metrics,
+        summary of results, goodbye, etc.
+
+        Returns:
+            Human-readable departure status string
+        """
+        return f"Plugin '{self.name}' unloaded"
 
     # =========================================================================
     # TRADING INTERFACE - Must be implemented
@@ -634,6 +654,69 @@ class PluginBase(ABC):
     def set_message_bus(self, message_bus) -> None:
         """Set the MessageBus instance for pub/sub communication"""
         self._message_bus = message_bus
+
+    def set_executive(self, executive) -> None:
+        """Set the PluginExecutive reference for stream management"""
+        self._executive = executive
+
+    # =========================================================================
+    # Stream Management (via PluginExecutive's StreamManager)
+    # =========================================================================
+
+    def request_stream(
+        self,
+        symbol: str,
+        contract: Contract,
+        data_types: Optional[Set] = None,
+        on_tick: Optional[Callable] = None,
+        on_bar: Optional[Callable] = None,
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+    ) -> bool:
+        """
+        Request a data stream through the executive's stream manager.
+
+        Args:
+            symbol: Symbol to stream
+            contract: IB Contract
+            data_types: Set of DataType values (defaults to TICK + BAR_5SEC)
+            on_tick: Callback(symbol, price, tick_type) for tick data
+            on_bar: Callback(bar) for bar data
+            what_to_show: TRADES, MIDPOINT, BID, ASK
+            use_rth: Regular trading hours only
+
+        Returns:
+            True if stream requested successfully
+        """
+        if not self._executive:
+            logger.warning(f"Plugin '{self.name}' has no executive - cannot request stream")
+            return False
+        return self._executive.stream_manager.request_stream(
+            self.name, symbol, contract, data_types,
+            on_tick, on_bar, what_to_show, use_rth,
+        )
+
+    def cancel_stream(self, symbol: str) -> bool:
+        """Cancel a stream previously requested by this plugin."""
+        if not self._executive:
+            return False
+        return self._executive.stream_manager.cancel_stream(self.name, symbol)
+
+    def request_unload(self) -> bool:
+        """
+        Request that the executive unload this plugin.
+
+        The unload happens asynchronously on a separate thread so it is
+        safe to call from within handle_request() or any plugin callback.
+
+        Returns:
+            True if the request was accepted (executive is available)
+        """
+        if not self._executive:
+            logger.warning(f"Plugin '{self.name}' has no executive - cannot request unload")
+            return False
+        self._executive.deferred_unload_plugin(self.instance_id)
+        return True
 
     def publish(
         self,
@@ -1192,9 +1275,11 @@ class PluginBase(ABC):
         """
         return {
             "name": self.name,
+            "instance_id": self.instance_id,
             "version": self.VERSION,
             "state": self._state.value,
             "loaded": self._loaded,
+            "descriptor": self.descriptor,
             "instruments": len(self._instruments),
             "enabled_instruments": len(self.enabled_instruments),
             "subscribed_channels": self._subscriptions,
@@ -1204,6 +1289,7 @@ class PluginBase(ABC):
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(name='{self.name}', "
+            f"instance_id='{self.instance_id[:8]}', "
             f"state={self._state.value}, instruments={len(self._instruments)})"
         )
 

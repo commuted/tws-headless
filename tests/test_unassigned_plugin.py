@@ -8,8 +8,8 @@ from pathlib import Path
 from datetime import datetime
 from unittest.mock import Mock, MagicMock
 
-from ib.plugins.unassigned.plugin import UnassignedPlugin, UNASSIGNED_PLUGIN_NAME
-from ib.plugins.base import PluginState, Holdings, HoldingPosition
+from plugins.unassigned.plugin import UnassignedPlugin, UNASSIGNED_PLUGIN_NAME
+from plugins.base import PluginState, Holdings, HoldingPosition
 
 
 class MockPosition:
@@ -19,6 +19,7 @@ class MockPosition:
         self.quantity = quantity
         self.current_price = price
         self.average_cost = cost or price
+        self.avg_cost = cost or price
         self.market_value = quantity * price
 
 
@@ -200,13 +201,14 @@ class TestUnassignedPluginCashTracking:
 
     def test_cash_in_holdings(self):
         """Test cash appears in holdings"""
-        plugin = UnassignedPlugin()
-        plugin.load()
-        plugin.set_cash_balance(5000.0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin = UnassignedPlugin(base_path=Path(tmpdir) / "_unassigned")
+            plugin.load()
+            plugin.set_cash_balance(5000.0)
 
-        holdings = plugin.get_effective_holdings()
-        assert holdings["cash"] == 5000.0
-        assert holdings["total_value"] == 5000.0
+            holdings = plugin.get_effective_holdings()
+            assert holdings["cash"] == 5000.0
+            assert holdings["total_value"] == 5000.0
 
 
 class TestUnassignedPluginClaimedSymbols:

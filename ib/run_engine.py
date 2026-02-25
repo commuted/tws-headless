@@ -25,6 +25,7 @@ import argparse
 import logging
 import sys
 import os
+from pathlib import Path
 from typing import Optional, List
 
 # Setup logging
@@ -79,6 +80,11 @@ Examples:
         "--plugins", action="store_true",
         help="Use plugin executive instead of algorithm runner"
     )
+    parser.add_argument(
+        "--plugin-dir",
+        default=None,
+        help="Plugin directory path (default: from IB_PLUGIN_DIR env or ./plugins)",
+    )
 
     # Command server options
     parser.add_argument(
@@ -111,6 +117,12 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
     elif args.quiet:
         logging.getLogger().setLevel(logging.WARNING)
+
+    # Set plugin directory: CLI arg > env var > default (./plugins relative to project root)
+    if args.plugin_dir:
+        os.environ["IB_PLUGIN_DIR"] = str(Path(args.plugin_dir).resolve())
+    elif not os.environ.get("IB_PLUGIN_DIR"):
+        os.environ["IB_PLUGIN_DIR"] = str(Path(__file__).parent.parent / "plugins")
 
     # Get config from environment, then override with command line
     port = args.port or int(os.environ.get("PORT", "7497"))
@@ -163,7 +175,7 @@ def main():
     if args.plugins:
         # Load orders system plugin for socket order execution
         try:
-            from .plugins.orders import OrdersPlugin
+            from plugins.orders import OrdersPlugin
             from .plugin_executive import ExecutionMode
 
             orders_plugin = OrdersPlugin(
@@ -182,7 +194,7 @@ def main():
 
         # Load example plugin when using plugin executive
         try:
-            from .plugins.momentum_5day import create_default_momentum_5day
+            from plugins.momentum_5day import create_default_momentum_5day
 
             plugin = create_default_momentum_5day()
             if engine.plugin_executive:
@@ -190,6 +202,25 @@ def main():
                 logger.info(f"Added plugin: {plugin.name}")
         except ImportError as e:
             logger.warning(f"Could not load example plugin: {e}")
+
+        # Load paper test feeds plugin
+        try:
+            from plugins.paper_tests.paper_test_feeds import PaperTestFeedsPlugin
+            from .plugin_executive import ExecutionMode
+
+            paper_test_feeds = PaperTestFeedsPlugin(
+                portfolio=engine.portfolio,
+                message_bus=engine.message_bus if hasattr(engine, "message_bus") else None,
+            )
+            if engine.plugin_executive:
+                engine.plugin_executive.register_plugin(
+                    paper_test_feeds,
+                    execution_mode=ExecutionMode.MANUAL,
+                    enabled=True,
+                )
+                logger.info(f"Added plugin: {paper_test_feeds.name}")
+        except ImportError as e:
+            logger.warning(f"Could not load paper_test_feeds plugin: {e}")
     else:
         try:
             from .algorithms.base import AlgorithmInstrument
@@ -771,12 +802,12 @@ class EngineCommandHandler:
             order sell QQQ 50 loc 380.00           # Limit on Close
         """
         from .command_server import CommandResult, CommandStatus
-        from .plugins.orders import OrdersPlugin, OrderType, TimeInForce
+        from plugins.orders import OrdersPlugin, OrderType, TimeInForce
 
         # Get orders plugin
         orders_plugin = None
         if self.engine.plugin_executive:
-            from .plugins.orders.plugin import ORDERS_PLUGIN_NAME
+            from plugins.orders.plugin import ORDERS_PLUGIN_NAME
             config = self.engine.plugin_executive._plugins.get(ORDERS_PLUGIN_NAME)
             if config:
                 orders_plugin = config.plugin
@@ -787,7 +818,7 @@ class EngineCommandHandler:
 
         # Parse arguments
         if len(args) < 3:
-            from .plugins.orders.plugin import get_order_help
+            from plugins.orders.plugin import get_order_help
             return CommandResult(
                 status=CommandStatus.ERROR,
                 message=f"Usage: order ACTION SYMBOL QTY [TYPE] [options] [--confirm]\n\n{get_order_help()}",
