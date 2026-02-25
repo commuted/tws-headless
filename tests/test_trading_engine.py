@@ -16,37 +16,16 @@ from trading_engine import (
     EngineState,
     create_engine,
 )
-from algorithm_runner import ExecutionMode, OrderExecutionMode
+from plugin_executive import ExecutionMode, OrderExecutionMode
 from data_feed import DataType, TickData
-from algorithms.base import AlgorithmBase, AlgorithmResult, TradeSignal, AlgorithmInstrument
 from models import Bar
 
 
-def create_mock_algorithm(name: str = "test_algo", loaded: bool = True):
-    """Create a mock Algorithm for testing"""
-    algo = Mock(spec=AlgorithmBase)
-    algo.name = name
-    algo.is_loaded = loaded
-    algo.load = Mock(return_value=True)
-    algo.required_bars = 10
-
-    # Create mock instruments
-    instrument = Mock(spec=AlgorithmInstrument)
-    instrument.symbol = "SPY"
-    instrument.to_contract = Mock(return_value=Contract())
-    algo.instruments = [instrument]
-    algo.enabled_instruments = [instrument]
-    algo.get_instrument = Mock(return_value=instrument)
-
-    # Default to empty result
-    algo.run = Mock(return_value=AlgorithmResult(
-        algorithm_name=name,
-        timestamp=datetime.now(),
-        success=True,
-        signals=[],
-    ))
-
-    return algo
+@pytest.fixture
+def engine():
+    """Create a TradingEngine with default config for testing"""
+    with patch('trading_engine.Portfolio'):
+        yield TradingEngine()
 
 
 class TestEngineState:
@@ -81,6 +60,7 @@ class TestEngineConfig:
         assert config.default_bar_timeframe == DataType.BAR_1MIN
         assert config.load_portfolio_on_start is True
         assert config.fetch_prices_on_start is True
+        assert config.enable_message_bus is True
 
     def test_custom_values(self):
         """Test custom configuration values"""
@@ -102,14 +82,11 @@ class TestEngineConfig:
 class TestTradingEngineInit:
     """Tests for TradingEngine initialization"""
 
-    def test_default_initialization(self):
+    def test_default_initialization(self, engine):
         """Test default initialization"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-
-            assert engine.state == EngineState.STOPPED
-            assert engine.is_running is False
-            assert engine.config is not None
+        assert engine.state == EngineState.STOPPED
+        assert engine.is_running is False
+        assert engine.config is not None
 
     def test_custom_config(self):
         """Test initialization with custom config"""
@@ -119,186 +96,94 @@ class TestTradingEngineInit:
 
             assert engine.config.port == 4002
 
-    def test_callbacks_initialized_none(self):
+    def test_callbacks_initialized_none(self, engine):
         """Test callbacks are initialized to None"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-
-            assert engine.on_started is None
-            assert engine.on_stopped is None
-            assert engine.on_error is None
-            assert engine.on_signal is None
-            assert engine.on_execution is None
-            assert engine.on_tick is None
-            assert engine.on_bar is None
+        assert engine.on_started is None
+        assert engine.on_stopped is None
+        assert engine.on_error is None
+        assert engine.on_signal is None
+        assert engine.on_execution is None
+        assert engine.on_tick is None
+        assert engine.on_bar is None
 
 
 class TestTradingEngineProperties:
     """Tests for TradingEngine properties"""
 
-    def test_state_property(self):
+    def test_state_property(self, engine):
         """Test state property"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            assert engine.state == EngineState.STOPPED
+        assert engine.state == EngineState.STOPPED
 
-            engine._state = EngineState.RUNNING
-            assert engine.state == EngineState.RUNNING
+        engine._state = EngineState.RUNNING
+        assert engine.state == EngineState.RUNNING
 
-    def test_is_running_property(self):
+    def test_is_running_property(self, engine):
         """Test is_running property"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            assert engine.is_running is False
+        assert engine.is_running is False
 
-            engine._state = EngineState.RUNNING
-            assert engine.is_running is True
+        engine._state = EngineState.RUNNING
+        assert engine.is_running is True
 
-            engine._state = EngineState.PAUSED
-            assert engine.is_running is False
+        engine._state = EngineState.PAUSED
+        assert engine.is_running is False
 
-    def test_portfolio_property(self):
+    def test_portfolio_property(self, engine):
         """Test portfolio property"""
-        with patch('trading_engine.Portfolio') as MockPortfolio:
-            engine = TradingEngine()
-            assert engine.portfolio is engine._portfolio
+        assert engine.portfolio is engine._portfolio
 
-    def test_data_feed_property(self):
+    def test_data_feed_property(self, engine):
         """Test data_feed property"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            assert engine.data_feed is engine._data_feed
-
-    def test_runner_property(self):
-        """Test runner property"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            assert engine.runner is engine._runner
-
-
-class TestAddAlgorithm:
-    """Tests for adding algorithms"""
-
-    def test_add_algorithm_before_start(self):
-        """Test adding algorithm before engine starts"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            algo = create_mock_algorithm()
-
-            result = engine.add_algorithm(algo)
-
-            assert result is True
-            assert len(engine._pending_algorithms) == 1
-
-    def test_add_algorithm_with_execution_mode(self):
-        """Test adding algorithm with custom execution mode"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            algo = create_mock_algorithm()
-
-            engine.add_algorithm(
-                algo,
-                execution_mode=ExecutionMode.ON_TICK,
-                bar_timeframe=DataType.BAR_5MIN,
-            )
-
-            pending = engine._pending_algorithms[0]
-            assert pending[1] == ExecutionMode.ON_TICK
-            assert pending[2] == DataType.BAR_5MIN
-
-    def test_add_unloaded_algorithm(self):
-        """Test adding unloaded algorithm auto-loads it"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            algo = create_mock_algorithm(loaded=False)
-
-            engine.add_algorithm(algo)
-
-            assert algo.load.called
-
-    def test_add_algorithm_load_fails(self):
-        """Test adding algorithm that fails to load"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            algo = create_mock_algorithm(loaded=False)
-            algo.load.return_value = False
-
-            result = engine.add_algorithm(algo)
-
-            assert result is False
-
-    def test_remove_algorithm(self):
-        """Test removing an algorithm"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-
-            # Mock runner's unregister method
-            engine._runner.unregister_algorithm = Mock()
-
-            engine.remove_algorithm("test_algo")
-
-            engine._runner.unregister_algorithm.assert_called_with("test_algo")
-
+        assert engine.data_feed is engine._data_feed
 
 class TestSubscription:
     """Tests for subscription management"""
 
-    def test_subscribe(self):
+    def test_subscribe(self, engine):
         """Test subscribing to a symbol"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            contract = Contract()
-            contract.symbol = "SPY"
+        contract = Contract()
+        contract.symbol = "SPY"
 
-            engine.subscribe("SPY", contract)
+        engine.subscribe("SPY", contract)
 
-            assert "SPY" in engine._subscribed_symbols
+        assert "SPY" in engine._subscribed_symbols
 
-    def test_subscribe_with_data_types(self):
+    def test_subscribe_with_data_types(self, engine):
         """Test subscribing with specific data types"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            engine._data_feed = Mock()
-            contract = Contract()
+        engine._data_feed = Mock()
+        contract = Contract()
 
-            engine.subscribe("SPY", contract, {DataType.TICK, DataType.BAR_5MIN})
+        engine.subscribe("SPY", contract, {DataType.TICK, DataType.BAR_5MIN})
 
-            engine._data_feed.subscribe.assert_called()
+        engine._data_feed.subscribe.assert_called_once()
 
-    def test_unsubscribe(self):
+    def test_unsubscribe(self, engine):
         """Test unsubscribing from a symbol"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            engine._subscribed_symbols.add("SPY")
+        engine._subscribed_symbols.add("SPY")
 
-            engine.unsubscribe("SPY")
+        engine.unsubscribe("SPY")
 
-            assert "SPY" not in engine._subscribed_symbols
+        assert "SPY" not in engine._subscribed_symbols
 
 
 class TestStartStop:
     """Tests for starting and stopping the engine"""
 
-    def test_start_when_stopped(self):
+    def test_start_when_stopped(self, engine):
         """Test starting engine when stopped"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            engine._connection_manager.start = Mock(return_value=True)
+        engine._connection_manager.start = Mock(return_value=True)
 
-            result = engine.start()
+        result = engine.start()
 
-            assert result is True
-            assert engine.state == EngineState.RUNNING
+        assert result is True
+        assert engine.state == EngineState.RUNNING
 
-    def test_start_when_not_stopped(self):
+    def test_start_when_not_stopped(self, engine):
         """Test start fails when not in stopped state"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            engine._state = EngineState.RUNNING
+        engine._state = EngineState.RUNNING
 
-            result = engine.start()
+        result = engine.start()
 
-            assert result is False
+        assert result is False
 
     def test_start_connection_fails_no_auto_reconnect(self):
         """Test start when connection fails and no auto-reconnect"""
@@ -312,73 +197,71 @@ class TestStartStop:
             assert result is False
             assert engine.state == EngineState.ERROR
 
-    def test_start_registers_pending_algorithms(self):
-        """Test that pending algorithms are registered on start"""
+    def test_start_registers_pending_plugins(self):
+        """Test that pending plugins are registered on start"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
             engine._connection_manager.start = Mock(return_value=True)
-            engine._runner = Mock()
+            engine._plugin_executive = Mock()
             engine._data_feed = Mock()
 
-            algo = create_mock_algorithm()
-            engine.add_algorithm(algo)
+            plugin = Mock()
+            plugin.name = "test_plugin"
+            plugin.is_loaded = True
+            plugin.enabled_instruments = []
+            engine._message_bus = None
+            engine.add_plugin(plugin)
 
             engine.start()
 
-            # Pending algorithms should be cleared
-            assert len(engine._pending_algorithms) == 0
-            # Algorithm should be registered with runner
-            engine._runner.register_algorithm.assert_called()
+            # Pending plugins should be cleared
+            assert len(engine._pending_plugins) == 0
+            # Plugin should be registered with plugin executive
+            engine._plugin_executive.register_plugin.assert_called_once()
 
-    def test_start_callback_invoked(self):
+    def test_start_callback_invoked(self, engine):
         """Test on_started callback is invoked"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            engine._connection_manager.start = Mock(return_value=True)
+        engine._connection_manager.start = Mock(return_value=True)
 
-            started = []
-            engine.on_started = lambda: started.append(True)
+        started = []
+        engine.on_started = lambda: started.append(True)
 
-            engine.start()
+        engine.start()
 
-            assert len(started) == 1
+        assert len(started) == 1
 
     def test_stop(self):
         """Test stopping the engine"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
             engine._state = EngineState.RUNNING
-            engine._runner = Mock()
+            engine._plugin_executive = Mock()
             engine._data_feed = Mock()
             engine._connection_manager = Mock()
 
             engine.stop()
 
             assert engine.state == EngineState.STOPPED
-            engine._runner.stop.assert_called()
-            engine._data_feed.stop.assert_called()
-            engine._connection_manager.stop.assert_called()
+            engine._plugin_executive.stop.assert_called_once()
+            engine._data_feed.stop.assert_called_once()
+            engine._connection_manager.stop.assert_called_once()
 
-    def test_stop_when_already_stopped(self):
+    def test_stop_when_already_stopped(self, engine):
         """Test stop when already stopped does nothing"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            engine._state = EngineState.STOPPED
+        engine._state = EngineState.STOPPED
 
-            engine.stop()  # Should not raise
+        engine.stop()  # Should not raise
 
-    def test_stop_callback_invoked(self):
+    def test_stop_callback_invoked(self, engine):
         """Test on_stopped callback is invoked"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            engine._state = EngineState.RUNNING
+        engine._state = EngineState.RUNNING
 
-            stopped = []
-            engine.on_stopped = lambda: stopped.append(True)
+        stopped = []
+        engine.on_stopped = lambda: stopped.append(True)
 
-            engine.stop()
+        engine.stop()
 
-            assert len(stopped) == 1
+        assert len(stopped) == 1
 
 
 class TestPauseResume:
@@ -389,100 +272,87 @@ class TestPauseResume:
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
             engine._state = EngineState.RUNNING
-            engine._runner = Mock()
+            engine._plugin_executive = Mock()
 
             engine.pause()
 
             assert engine.state == EngineState.PAUSED
-            engine._runner.pause.assert_called()
+            engine._plugin_executive.pause.assert_called_once()
 
-    def test_pause_when_not_running(self):
+    def test_pause_when_not_running(self, engine):
         """Test pause when not running does nothing"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            engine._state = EngineState.STOPPED
+        engine._state = EngineState.STOPPED
 
-            engine.pause()
+        engine.pause()
 
-            assert engine.state == EngineState.STOPPED
+        assert engine.state == EngineState.STOPPED
 
     def test_resume(self):
         """Test resuming the engine"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
             engine._state = EngineState.PAUSED
-            engine._runner = Mock()
+            engine._plugin_executive = Mock()
 
             engine.resume()
 
             assert engine.state == EngineState.RUNNING
-            engine._runner.resume.assert_called()
+            engine._plugin_executive.resume.assert_called_once()
 
-    def test_resume_when_not_paused(self):
+    def test_resume_when_not_paused(self, engine):
         """Test resume when not paused does nothing"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            engine._state = EngineState.RUNNING
+        engine._state = EngineState.RUNNING
 
-            engine.resume()
+        engine.resume()
 
-            assert engine.state == EngineState.RUNNING
+        assert engine.state == EngineState.RUNNING
 
 
 class TestCallbackRouting:
     """Tests for callback routing"""
 
-    def test_on_tick_callback(self):
+    def test_on_tick_callback(self, engine):
         """Test tick callback routing"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
+        ticks = []
+        engine.on_tick = lambda s, t: ticks.append((s, t))
 
-            ticks = []
-            engine.on_tick = lambda s, t: ticks.append((s, t))
+        tick = TickData(symbol="SPY", price=450.0, tick_type="LAST")
+        engine._on_tick("SPY", tick)
 
-            tick = TickData(symbol="SPY", price=450.0, tick_type="LAST")
-            engine._on_tick("SPY", tick)
+        assert len(ticks) == 1
+        assert ticks[0][0] == "SPY"
 
-            assert len(ticks) == 1
-            assert ticks[0][0] == "SPY"
-
-    def test_on_bar_callback(self):
+    def test_on_bar_callback(self, engine):
         """Test bar callback routing"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
+        bars = []
+        engine.on_bar = lambda s, b, t: bars.append((s, b, t))
 
-            bars = []
-            engine.on_bar = lambda s, b, t: bars.append((s, b, t))
+        bar = Bar(
+            symbol="SPY",
+            timestamp="2024-01-15T10:00:00",
+            open=450.0,
+            high=451.0,
+            low=449.0,
+            close=450.5,
+            volume=100,
+            wap=0.0,
+            bar_count=1,
+        )
+        engine._on_bar("SPY", bar, DataType.BAR_1MIN)
 
-            bar = Bar(
-                symbol="SPY",
-                timestamp="2024-01-15T10:00:00",
-                open=450.0,
-                high=451.0,
-                low=449.0,
-                close=450.5,
-                volume=100,
-                wap=0.0,
-                bar_count=1,
-            )
-            engine._on_bar("SPY", bar, DataType.BAR_1MIN)
+        assert len(bars) == 1
+        assert bars[0][0] == "SPY"
 
-            assert len(bars) == 1
-            assert bars[0][0] == "SPY"
-
-    def test_callback_error_handled(self):
+    def test_callback_error_handled(self, engine):
         """Test that callback errors are handled"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
+        def bad_callback(s, t):
+            raise Exception("Callback error")
 
-            def bad_callback(s, t):
-                raise Exception("Callback error")
+        engine.on_tick = bad_callback
 
-            engine.on_tick = bad_callback
-
-            tick = TickData(symbol="SPY", price=450.0, tick_type="LAST")
-            # Should not raise
-            engine._on_tick("SPY", tick)
+        tick = TickData(symbol="SPY", price=450.0, tick_type="LAST")
+        # Should not raise
+        engine._on_tick("SPY", tick)
 
 
 class TestGetStatus:
@@ -505,18 +375,17 @@ class TestGetStatus:
             engine._data_feed = Mock()
             engine._data_feed.get_status = Mock(return_value={"running": True})
 
-            engine._runner = Mock()
-            engine._runner.get_status = Mock(return_value={"running": True})
+            engine._plugin_executive = Mock()
+            engine._plugin_executive.get_status = Mock(return_value={"running": True})
 
             status = engine.get_status()
 
-            assert "state" in status
-            assert "connected" in status
+            assert status["state"] == "stopped"
+            assert status["connected"] is True
             assert "connection" in status
             assert "data_feed" in status
-            assert "runner" in status
-            assert "subscribed_symbols" in status
-            assert "SPY" in status["subscribed_symbols"]
+            assert "plugin_executive" in status
+            assert status["subscribed_symbols"] == ["SPY"]
 
 
 class TestDataAccess:
@@ -548,15 +417,13 @@ class TestDataAccess:
                 "SPY", DataType.BAR_1MIN, count=100
             )
 
-    def test_get_last_price(self):
+    def test_get_last_price(self, engine):
         """Test getting last price"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            engine._data_feed.get_last_price = Mock(return_value=450.50)
+        engine._data_feed.get_last_price = Mock(return_value=450.50)
 
-            price = engine.get_last_price("SPY")
+        price = engine.get_last_price("SPY")
 
-            assert price == 450.50
+        assert price == 450.50
 
 
 class TestOnConnected:
@@ -584,25 +451,25 @@ class TestOnConnected:
             engine = TradingEngine()
             engine._data_feed = Mock()
             engine._data_feed.is_running = False
-            engine._runner = Mock()
-            engine._runner.is_running = False
+            engine._plugin_executive = Mock()
+            engine._plugin_executive.is_running = False
 
             engine._on_connected()
 
-            engine._data_feed.start.assert_called()
+            engine._data_feed.start.assert_called_once()
 
-    def test_on_connected_starts_runner(self):
-        """Test runner is started on connection"""
+    def test_on_connected_starts_plugin_executive(self):
+        """Test plugin executive is started on connection"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
             engine._data_feed = Mock()
             engine._data_feed.is_running = False
-            engine._runner = Mock()
-            engine._runner.is_running = False
+            engine._plugin_executive = Mock()
+            engine._plugin_executive.is_running = False
 
             engine._on_connected()
 
-            engine._runner.start.assert_called()
+            engine._plugin_executive.start.assert_called_once()
 
 
 class TestCreateEngine:
@@ -689,31 +556,25 @@ class TestRunForever:
 class TestErrorHandling:
     """Tests for error handling"""
 
-    def test_on_data_error(self):
+    def test_on_data_error(self, engine):
         """Test data feed error handling"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
+        errors = []
+        engine.on_error = lambda e: errors.append(e)
 
-            errors = []
-            engine.on_error = lambda e: errors.append(e)
+        error = Exception("Data error")
+        engine._on_data_error("SPY", error)
 
-            error = Exception("Data error")
-            engine._on_data_error("SPY", error)
+        assert len(errors) == 1
 
-            assert len(errors) == 1
-
-    def test_on_runner_error(self):
+    def test_on_runner_error(self, engine):
         """Test runner error handling"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
+        errors = []
+        engine.on_error = lambda e: errors.append(e)
 
-            errors = []
-            engine.on_error = lambda e: errors.append(e)
+        error = Exception("Runner error")
+        engine._on_runner_error("test_algo", error)
 
-            error = Exception("Runner error")
-            engine._on_runner_error("test_algo", error)
-
-            assert len(errors) == 1
+        assert len(errors) == 1
 
 
 class TestResubscribeInstruments:
@@ -734,22 +595,6 @@ class TestResubscribeInstruments:
             engine._resubscribe_instruments()
 
             # Should have called subscribe on data feed
-            engine._data_feed.subscribe.assert_called()
+            engine._data_feed.subscribe.assert_called_once()
 
 
-class TestSubscribeAlgorithmInstruments:
-    """Tests for algorithm instrument subscription"""
-
-    def test_subscribe_algorithm_instruments(self):
-        """Test subscribing to algorithm instruments"""
-        with patch('trading_engine.Portfolio'):
-            engine = TradingEngine()
-            engine._data_feed = Mock()
-            algo = create_mock_algorithm()
-
-            engine._subscribe_algorithm_instruments(algo)
-
-            # Should subscribe with algorithm name as subscriber
-            call_args = engine._data_feed.subscribe.call_args
-            assert call_args[1]["subscriber"] == algo.name
-            assert "SPY" in engine._subscribed_symbols

@@ -34,15 +34,6 @@ Quick Start:
 
 __version__ = "0.1.0"
 
-# The actual package code lives in the ib/ subdirectory.
-# Extend __path__ so that relative imports (e.g. 'from .const import ...')
-# resolve to ib/ib/*.py instead of requiring duplicate files at the root.
-import os as _os
-_subdir = _os.path.join(_os.path.dirname(__file__), 'ib')
-if _subdir not in __path__:
-    __path__.insert(0, _subdir)
-del _os, _subdir
-
 # Constants (IB API compatible)
 from .const import (
     NO_VALID_ID,
@@ -120,6 +111,8 @@ from .command_server import (
     CommandServer,
     CommandResult,
     CommandStatus,
+    RequestEntry,
+    RequestQueue,
     send_command,
     DEFAULT_SOCKET_PATH,
 )
@@ -207,6 +200,8 @@ from .rate_limiter import (
     OrderRateLimiter,
 )
 
+from .plugin_executive import DepartureEntry
+
 from .auth import (
     TokenStore,
     Authenticator,
@@ -288,6 +283,8 @@ __all__ = [
     "CommandServer",
     "CommandResult",
     "CommandStatus",
+    "RequestEntry",
+    "RequestQueue",
     "send_command",
     "DEFAULT_SOCKET_PATH",
     # Enter/Exit
@@ -351,6 +348,8 @@ __all__ = [
     "RateLimiterConfig",
     "RateLimiterStats",
     "OrderRateLimiter",
+    # Plugin executive
+    "DepartureEntry",
     # Authentication
     "TokenStore",
     "Authenticator",

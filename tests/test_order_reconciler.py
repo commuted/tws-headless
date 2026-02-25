@@ -15,7 +15,7 @@ from order_reconciler import (
     PendingSignal,
     ExecutionAllocation,
 )
-from algorithms.base import TradeSignal
+from plugins.base import TradeSignal
 
 
 def create_contract(symbol: str) -> Contract:

@@ -18,7 +18,7 @@ import sys
 import time
 from datetime import datetime
 from threading import Event
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .portfolio import Portfolio
 from .rebalancer import (
@@ -803,6 +803,7 @@ class CommandHandler:
             plugin feeds                         - List MessageBus channels
             plugin history <channel> [count]     - Get channel message history
             plugin dump <name>                   - Dump positions and open orders
+            plugin departures [--clear]          - Show departure status board
         """
         if self.plugin_executive is None:
             return CommandResult(
@@ -826,9 +827,10 @@ class CommandHandler:
                 if not subargs:
                     return CommandResult(
                         status=CommandStatus.ERROR,
-                        message="Usage: plugin load <path>",
+                        message="Usage: plugin load <path> [descriptor]",
                     )
-                return self._plugin_load(subargs[0])
+                descriptor = subargs[1] if len(subargs) > 1 else None
+                return self._plugin_load(subargs[0], descriptor=descriptor)
             elif subcommand == "unload":
                 if not subargs:
                     return CommandResult(
@@ -938,6 +940,9 @@ class CommandHandler:
                         message="Usage: plugin dump <name>",
                     )
                 return self._plugin_dump(subargs[0])
+            elif subcommand == "departures":
+                clear = "--clear" in subargs
+                return self._plugin_departures(clear)
             else:
                 return CommandResult(
                     status=CommandStatus.ERROR,
@@ -969,14 +974,20 @@ class CommandHandler:
             data={"plugins": all_status},
         )
 
-    def _plugin_load(self, path: str) -> CommandResult:
-        """Load a plugin from file"""
-        name = self.plugin_executive.load_plugin_from_file(path)
-        if name:
+    def _plugin_load(self, path: str, descriptor: Any = None) -> CommandResult:
+        """Load a plugin from file, optionally passing a descriptor"""
+        result = self.plugin_executive.load_plugin_from_file(path, descriptor=descriptor)
+        if result:
             return CommandResult(
                 status=CommandStatus.SUCCESS,
-                message=f"Plugin '{name}' loaded from {path}",
-                data={"plugin_name": name, "path": path},
+                message=f"Plugin '{result['plugin_name']}' loaded "
+                        f"(instance_id={result['instance_id'][:8]})",
+                data={
+                    "plugin_name": result["plugin_name"],
+                    "instance_id": result["instance_id"],
+                    "descriptor": result["descriptor"],
+                    "path": path,
+                },
             )
         return CommandResult(
             status=CommandStatus.ERROR,
@@ -1243,6 +1254,19 @@ class CommandHandler:
             status=CommandStatus.SUCCESS,
             message="\n".join(lines),
             data=data,
+        )
+
+    def _plugin_departures(self, clear: bool = False) -> CommandResult:
+        """Get departure status messages from unloaded plugins"""
+        departures = self.plugin_executive.get_departures(clear=clear)
+        count = len(departures)
+        msg = f"{count} departure(s)"
+        if clear and count > 0:
+            msg += " (cleared)"
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=msg,
+            data={"departures": departures},
         )
 
     def handle_db(self, args: List[str]) -> CommandResult:

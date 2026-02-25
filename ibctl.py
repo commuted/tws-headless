@@ -38,8 +38,11 @@ Usage:
 
     # Plugin/algorithm management
     ./ibctl.py plugin list                     # List all plugins
-    ./ibctl.py plugin status NAME              # Get plugin status
-    ./ibctl.py plugin dump NAME                # Dump positions & open orders
+    ./ibctl.py plugin load PATH                # Load plugin from file
+    ./ibctl.py plugin load PATH DESCRIPTOR     # Load with descriptor
+    ./ibctl.py plugin unload NAME_OR_ID        # Unload a plugin
+    ./ibctl.py plugin status NAME_OR_ID        # Get plugin status
+    ./ibctl.py plugin dump NAME_OR_ID          # Dump positions & open orders
     ./ibctl.py pause                           # Pause execution
     ./ibctl.py resume                          # Resume execution
     ./ibctl.py stop                            # Shutdown the server
@@ -72,13 +75,17 @@ class CommandResult:
     status: CommandStatus
     message: str = ""
     data: Dict[str, Any] = field(default_factory=dict)
+    request_token: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "status": self.status.value,
             "message": self.message,
             "data": self.data,
         }
+        if self.request_token is not None:
+            result["request_token"] = self.request_token
+        return result
 
 
 def send_command(
@@ -86,6 +93,7 @@ def send_command(
     socket_path: str = DEFAULT_SOCKET_PATH,
     timeout: float = 10.0,
     token: Optional[str] = None,
+    request_token: Optional[str] = None,
 ) -> CommandResult:
     """
     Send a command to the running server.
@@ -95,6 +103,7 @@ def send_command(
         socket_path: Path to Unix socket
         timeout: Connection timeout in seconds
         token: Authentication token (if server requires auth)
+        request_token: Optional request token for tracking/dedup
 
     Returns:
         CommandResult from server
@@ -104,11 +113,12 @@ def send_command(
         sock.connect(socket_path)
         sock.settimeout(timeout)
 
-        # Wrap command with auth token if provided
+        # Build wire command: REQ first, then AUTH, then command
+        full_command = command
         if token:
-            full_command = f"AUTH {token} {command}"
-        else:
-            full_command = command
+            full_command = f"AUTH {token} {full_command}"
+        if request_token:
+            full_command = f"REQ {request_token} {full_command}"
 
         # Send command
         sock.sendall((full_command + "\n").encode("utf-8"))
@@ -131,6 +141,7 @@ def send_command(
             status=CommandStatus(response.get("status", "error")),
             message=response.get("message", ""),
             data=response.get("data", {}),
+            request_token=response.get("request_token"),
         )
 
     except FileNotFoundError:
@@ -164,13 +175,25 @@ def format_result(result: CommandResult, verbose: bool = False):
 
     print(f"{status_str} {result.message}")
 
+    if result.request_token is not None:
+        print(f"Request-Token: {result.request_token}")
+
     # Print data in verbose mode or for specific commands
     if verbose and result.data:
         print("\nData:")
         print(json.dumps(result.data, indent=2))
     elif result.data:
         # Special formatting for certain data types
-        if "open_orders" in result.data:
+        if "instance_id" in result.data and "plugin_name" in result.data:
+            # Plugin load response
+            print(f"\n  Plugin:      {result.data['plugin_name']}")
+            print(f"  Instance ID: {result.data['instance_id']}")
+            if result.data.get("descriptor") is not None:
+                print(f"  Descriptor:  {result.data['descriptor']}")
+            if result.data.get("path"):
+                print(f"  Path:        {result.data['path']}")
+
+        elif "open_orders" in result.data:
             # Plugin dump output
             cash = result.data.get("cash", 0.0)
             positions = result.data.get("positions", [])
@@ -245,16 +268,22 @@ Commands:
   transfer list PLUGIN Show transferable assets in a plugin
 
   Plugin commands (require server started with --plugins):
-  plugin list          List all plugins
-  plugin status NAME   Get plugin status
-  plugin start NAME    Start a plugin
-  plugin stop NAME     Stop a plugin
-  plugin freeze NAME   Freeze a plugin (pause with state save)
-  plugin resume NAME   Resume a frozen plugin
-  plugin enable NAME   Enable plugin for execution
-  plugin disable NAME  Disable plugin
-  plugin trigger NAME  Manually trigger plugin run
-  plugin dump NAME     Dump plugin positions and open orders
+  All NAME_OR_ID args accept a plugin name or instance_id (UUID).
+  Use instance_id to target a specific instance when multiple
+  instances of the same plugin are loaded.
+
+  plugin list                     List all plugins
+  plugin load PATH [DESCRIPTOR]   Load a plugin from file (returns instance_id)
+  plugin unload NAME_OR_ID        Unload a plugin
+  plugin status NAME_OR_ID        Get plugin status
+  plugin start NAME_OR_ID         Start a plugin
+  plugin stop NAME_OR_ID          Stop a plugin
+  plugin freeze NAME_OR_ID        Freeze a plugin (pause with state save)
+  plugin resume NAME_OR_ID        Resume a frozen plugin
+  plugin enable NAME_OR_ID        Enable plugin for execution
+  plugin disable NAME_OR_ID       Disable plugin
+  plugin trigger NAME_OR_ID       Manually trigger plugin run
+  plugin dump NAME_OR_ID          Dump plugin positions and open orders
 
   algo list            List all algorithms
   algo status NAME     Get algorithm status
@@ -262,6 +291,7 @@ Commands:
   algo disable NAME    Disable algorithm
   algo trigger NAME    Manually trigger algorithm
 
+  reconcile            Sync plugin holdings with IB account
   pause                Pause algorithm/plugin execution
   resume               Resume algorithm/plugin execution
   stop                 Shutdown the server gracefully
@@ -283,7 +313,10 @@ Examples:
   ./ibctl.py transfer cash _unassigned momentum_5day 10000 --confirm
   ./ibctl.py transfer position _unassigned momentum_5day SPY 50 --confirm
   ./ibctl.py plugin list
+  ./ibctl.py plugin load /path/to/my_strategy/plugin.py
+  ./ibctl.py plugin load /path/to/plugin.py '{"symbol": "AAPL"}'
   ./ibctl.py plugin status momentum_5day
+  ./ibctl.py plugin stop 78b052d2-17e7-4ee5-ac03-282e0cd05c2b
         """,
     )
 
@@ -317,6 +350,10 @@ Examples:
         "--token",
         help="Authentication token (if server requires auth)",
     )
+    parser.add_argument(
+        "--request-token",
+        help="Request token for tracking/deduplication",
+    )
 
     args = parser.parse_args()
 
@@ -333,6 +370,7 @@ Examples:
         socket_path=args.socket,
         timeout=args.timeout,
         token=args.token,
+        request_token=args.request_token,
     )
 
     # Output result

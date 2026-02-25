@@ -4,7 +4,7 @@ run_engine.py - Start the IB Trading Engine
 
 Full-featured entry point for continuous algorithmic trading with:
 - Socket command interface (ibctl.py compatible)
-- Plugin/algorithm execution
+- Plugin execution
 - Real-time market data streaming
 - Order execution with reconciliation
 
@@ -18,7 +18,6 @@ Options via environment variables:
 Command line options:
     python3 -m ib.run_engine --port 4002 --mode immediate
     python3 -m ib.run_engine --no-server   # Disable socket server
-    python3 -m ib.run_engine --plugins     # Use plugin executive instead of algorithm runner
 """
 
 import argparse
@@ -75,11 +74,6 @@ Examples:
         help="Order execution mode (default: from MODE env or dry_run)"
     )
 
-    # Engine mode
-    parser.add_argument(
-        "--plugins", action="store_true",
-        help="Use plugin executive instead of algorithm runner"
-    )
     parser.add_argument(
         "--plugin-dir",
         default=None,
@@ -134,12 +128,12 @@ def main():
     logger.info(f"Port: {port}")
     logger.info(f"Order Mode: {mode}")
     logger.info(f"Socket: {args.socket if not args.no_server else 'disabled'}")
-    logger.info(f"Engine Mode: {'Plugin Executive' if args.plugins else 'Algorithm Runner'}")
+    logger.info("Engine Mode: Plugin Executive")
     logger.info("=" * 60)
 
     # Import components
     from .trading_engine import TradingEngine, EngineConfig, EngineState
-    from .algorithm_runner import OrderExecutionMode
+    from .plugin_executive import OrderExecutionMode
     from .data_feed import DataType
     from .command_server import CommandServer, CommandResult, CommandStatus
 
@@ -156,8 +150,7 @@ def main():
         port=port,
         client_id=args.client_id,
         order_mode=mode_map.get(mode, OrderExecutionMode.DRY_RUN),
-        use_plugin_executive=args.plugins,
-        enable_message_bus=args.plugins,
+        enable_message_bus=True,
     )
 
     # Create engine
@@ -171,70 +164,54 @@ def main():
         handler = EngineCommandHandler(engine)
         handler.register_commands(command_server)
 
-    # Setup example algorithm or plugin
-    if args.plugins:
-        # Load orders system plugin for socket order execution
-        try:
-            from plugins.orders import OrdersPlugin
-            from .plugin_executive import ExecutionMode
+    # Load orders system plugin for socket order execution
+    try:
+        from plugins.orders import OrdersPlugin
+        from .plugin_executive import ExecutionMode
 
-            orders_plugin = OrdersPlugin(
-                portfolio=engine.portfolio,
-                message_bus=engine.message_bus if hasattr(engine, 'message_bus') else None,
+        orders_plugin = OrdersPlugin(
+            portfolio=engine.portfolio,
+            message_bus=engine.message_bus if hasattr(engine, 'message_bus') else None,
+        )
+        if engine.plugin_executive:
+            engine.plugin_executive.register_plugin(
+                orders_plugin,
+                execution_mode=ExecutionMode.MANUAL,
+                enabled=True,
             )
-            if engine.plugin_executive:
-                engine.plugin_executive.register_plugin(
-                    orders_plugin,
-                    execution_mode=ExecutionMode.MANUAL,
-                    enabled=True,
-                )
-                logger.info(f"Added system plugin: {orders_plugin.name}")
-        except ImportError as e:
-            logger.warning(f"Could not load orders plugin: {e}")
+            logger.info(f"Added system plugin: {orders_plugin.name}")
+    except ImportError as e:
+        logger.warning(f"Could not load orders plugin: {e}")
 
-        # Load example plugin when using plugin executive
-        try:
-            from plugins.momentum_5day import create_default_momentum_5day
+    # Load example plugin
+    try:
+        from plugins.momentum_5day import create_default_momentum_5day
 
-            plugin = create_default_momentum_5day()
-            if engine.plugin_executive:
-                engine.plugin_executive.register_plugin(plugin, enabled=True)
-                logger.info(f"Added plugin: {plugin.name}")
-        except ImportError as e:
-            logger.warning(f"Could not load example plugin: {e}")
+        plugin = create_default_momentum_5day()
+        if engine.plugin_executive:
+            engine.plugin_executive.register_plugin(plugin, enabled=True)
+            logger.info(f"Added plugin: {plugin.name}")
+    except ImportError as e:
+        logger.warning(f"Could not load example plugin: {e}")
 
-        # Load paper test feeds plugin
-        try:
-            from plugins.paper_tests.paper_test_feeds import PaperTestFeedsPlugin
-            from .plugin_executive import ExecutionMode
+    # Load paper test feeds plugin
+    try:
+        from plugins.paper_tests.paper_test_feeds import PaperTestFeedsPlugin
+        from .plugin_executive import ExecutionMode
 
-            paper_test_feeds = PaperTestFeedsPlugin(
-                portfolio=engine.portfolio,
-                message_bus=engine.message_bus if hasattr(engine, "message_bus") else None,
+        paper_test_feeds = PaperTestFeedsPlugin(
+            portfolio=engine.portfolio,
+            message_bus=engine.message_bus if hasattr(engine, "message_bus") else None,
+        )
+        if engine.plugin_executive:
+            engine.plugin_executive.register_plugin(
+                paper_test_feeds,
+                execution_mode=ExecutionMode.MANUAL,
+                enabled=True,
             )
-            if engine.plugin_executive:
-                engine.plugin_executive.register_plugin(
-                    paper_test_feeds,
-                    execution_mode=ExecutionMode.MANUAL,
-                    enabled=True,
-                )
-                logger.info(f"Added plugin: {paper_test_feeds.name}")
-        except ImportError as e:
-            logger.warning(f"Could not load paper_test_feeds plugin: {e}")
-    else:
-        try:
-            from .algorithms.base import AlgorithmInstrument
-            from .algorithms import DummyAlgorithm
-
-            algo = DummyAlgorithm()
-            algo.add_instrument(AlgorithmInstrument(symbol="SPY", name="SPDR S&P 500 ETF"))
-            algo.add_instrument(AlgorithmInstrument(symbol="QQQ", name="Invesco QQQ Trust"))
-            algo._loaded = True
-
-            engine.add_algorithm(algo)
-            logger.info(f"Added algorithm: {algo.name}")
-        except ImportError as e:
-            logger.warning(f"Could not load example algorithm: {e}")
+            logger.info(f"Added plugin: {paper_test_feeds.name}")
+    except ImportError as e:
+        logger.warning(f"Could not load paper_test_feeds plugin: {e}")
 
     # Callbacks
     def on_started():
@@ -707,7 +684,7 @@ class EngineCommandHandler:
         if not self.engine.plugin_executive:
             return CommandResult(
                 status=CommandStatus.ERROR,
-                message="Trade command requires plugin executive (use --plugins flag)",
+                message="Trade command requires plugin executive ",
             )
 
         if len(args) < 4:
@@ -1088,7 +1065,7 @@ class EngineCommandHandler:
         if not self.engine.plugin_executive:
             return CommandResult(
                 status=CommandStatus.ERROR,
-                message="Transfer command requires plugin executive (use --plugins flag)",
+                message="Transfer command requires plugin executive ",
             )
 
         if not args:
@@ -1223,7 +1200,7 @@ class EngineCommandHandler:
         if not self.engine.plugin_executive:
             return CommandResult(
                 status=CommandStatus.ERROR,
-                message="Reconcile command requires plugin executive (use --plugins flag)",
+                message="Reconcile command requires plugin executive ",
             )
 
         output_json = "--json" in args
@@ -1374,7 +1351,7 @@ class EngineCommandHandler:
         if not self.engine.plugin_executive:
             return CommandResult(
                 status=CommandStatus.ERROR,
-                message="Plugin executive not available (use --plugins flag)",
+                message="Plugin executive not available ",
             )
 
         if not args:
