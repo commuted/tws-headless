@@ -446,9 +446,9 @@ class OrderTestPluginBase(PluginBase):
                 logger.error(f"Paper verification failed: {error}")
                 return {"success": False, "message": error}
 
-            logger.info(f"[{self.name}] Setting delayed data mode")
-            self.portfolio.reqMarketDataType(3)
-
+            # Note: do NOT force reqMarketDataType(3) here.  reqRealTimeBars
+            # (used for price fetching) only works in live mode; forcing
+            # delayed (3) silently drops bar callbacks regardless of subscription.
             for tc in self.TEST_CASES:
                 logger.info(f"--- [{self.name}] Testing: {tc.name} ---")
                 result = self._run_test_case(tc)

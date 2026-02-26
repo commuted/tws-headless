@@ -166,8 +166,6 @@ class PaperTestOrders4Plugin(OrderTestPluginBase):
             if error:
                 return {"success": False, "message": error}
 
-            self.portfolio.reqMarketDataType(3)
-
             # Run each custom test method
             tests = [
                 self._test_bracket,

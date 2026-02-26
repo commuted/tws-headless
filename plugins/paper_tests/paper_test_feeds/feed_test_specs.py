@@ -70,19 +70,12 @@ def forex_spec() -> FeedTestSpec:
 
 
 def stock_spec() -> FeedTestSpec:
-    """Create a test spec for SPY stock.
-
-    Ticks use TRADES (delayed data works fine).
-    Bars use MIDPOINT: reqRealTimeBars ignores the delayed-data mode and
-    requires a live TRADES subscription, while MIDPOINT works on paper
-    accounts without one.
-    """
+    """Create a test spec for SPY stock."""
     return FeedTestSpec(
         feed_type=FeedType.STOCK,
         symbol="SPY",
         contract=ContractBuilder.us_stock("SPY"),
         what_to_show="TRADES",
-        bar_what_to_show="MIDPOINT",
         use_rth=True,
         description="Stock SPY",
     )

@@ -231,11 +231,10 @@ class PaperTestFeedsPlugin(PluginBase):
                 logger.error(f"Paper verification failed: {error}")
                 return {"success": False, "message": error}
 
-            # Step 2: Set delayed data mode
-            logger.info("Setting market data type to delayed (3)")
-            self.portfolio.reqMarketDataType(3)
-
-            # Step 3: Run each test pair serially
+            # Step 2: Run each test pair serially
+            # Note: do NOT force reqMarketDataType(3) here.  reqRealTimeBars
+            # only works in live mode (1); forcing delayed (3) silently drops
+            # all bar callbacks regardless of subscription status.
             for pair in DEFAULT_TEST_PAIRS:
                 logger.info(f"--- Testing pair: {pair.name} ---")
                 self._run_test_pair(pair)
