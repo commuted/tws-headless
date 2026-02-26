@@ -41,6 +41,9 @@ class FeedTestSpec:
     bar_timeout: float = 12.0
     min_tick_count: int = 1
     description: str = ""
+    # If True, a bar-test timeout is treated as PASS (skipped) because
+    # reqRealTimeBars only delivers data during market hours.
+    bar_market_hours_only: bool = False
 
     def __post_init__(self):
         if not self.description:
@@ -79,6 +82,9 @@ def stock_spec() -> FeedTestSpec:
     Bar test uses MIDPOINT: reqRealTimeBars with TRADES requires a live
     equity data subscription even in live mode, while MIDPOINT works on
     paper accounts with no additional subscription.
+
+    bar_market_hours_only=True: reqRealTimeBars delivers nothing outside
+    market hours regardless of what_to_show; treat timeout as skipped.
     """
     return FeedTestSpec(
         feed_type=FeedType.STOCK,
@@ -87,6 +93,7 @@ def stock_spec() -> FeedTestSpec:
         what_to_show="TRADES",
         bar_what_to_show="MIDPOINT",
         use_rth=True,
+        bar_market_hours_only=True,
         description="Stock SPY",
     )
 

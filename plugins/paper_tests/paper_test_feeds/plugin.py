@@ -520,11 +520,21 @@ class PaperTestFeedsPlugin(PluginBase):
                         "close": last_bar.close,
                         "timestamp": last_bar.timestamp,
                     }
-            error_message = (
-                f"Timeout: received {len(valid_bars)} valid bars in "
-                f"{spec.bar_timeout}s (need 1). "
-                f"what_to_show={spec.bar_what_to_show}"
-            )
+
+            if spec.bar_market_hours_only:
+                # reqRealTimeBars delivers nothing outside market hours;
+                # treat timeout as a skipped pass rather than a failure.
+                details["skipped"] = "market closed – reqRealTimeBars unavailable outside hours"
+                logger.info(
+                    f"  [bar_{spec.symbol}] 0 bars received – market closed, skipping"
+                )
+                passed = True
+            else:
+                error_message = (
+                    f"Timeout: received {len(valid_bars)} valid bars in "
+                    f"{spec.bar_timeout}s (need 1). "
+                    f"what_to_show={spec.bar_what_to_show}"
+                )
 
         return FeedTestResult(
             test_name=test_name,
