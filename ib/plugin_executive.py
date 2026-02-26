@@ -2157,7 +2157,19 @@ class PluginExecutive:
     # =========================================================================
 
     def enable_plugin(self, name: str, enabled: bool = True) -> bool:
-        """Enable or disable a plugin for continuous execution"""
+        """
+        Enable or disable a plugin for continuous execution.
+
+        A disabled plugin remains registered and in its current lifecycle state
+        but is skipped during tick/bar dispatch until re-enabled.
+
+        Args:
+            name: Plugin name
+            enabled: True to enable, False to disable
+
+        Returns:
+            True if plugin was found and updated, False if not found
+        """
         with self._lock:
             iid, config = self._resolve_plugin(name)
             if config:
@@ -2206,7 +2218,19 @@ class PluginExecutive:
             return True
 
     def get_plugin_parameters(self, name: str) -> Optional[Dict[str, Any]]:
-        """Get runtime parameters for a plugin"""
+        """
+        Get runtime parameters for a plugin.
+
+        Merges executive-level parameters (set via set_plugin_parameter) with
+        any parameters reported by the plugin's own get_parameters() method.
+        Plugin-reported values serve as defaults; executive overrides take precedence.
+
+        Args:
+            name: Plugin name
+
+        Returns:
+            Dict of parameter key/value pairs, or None if plugin not found
+        """
         with self._lock:
             iid, config = self._resolve_plugin(name)
             if not config:
@@ -2229,7 +2253,18 @@ class PluginExecutive:
     # =========================================================================
 
     def reset_circuit_breaker(self, name: str) -> bool:
-        """Manually reset a plugin's circuit breaker"""
+        """
+        Manually reset a plugin's circuit breaker.
+
+        Clears the failure count and returns the breaker to closed (normal) state,
+        allowing a plugin that was auto-disabled by repeated failures to run again.
+
+        Args:
+            name: Plugin name
+
+        Returns:
+            True if plugin was found and circuit breaker reset, False if not found
+        """
         with self._lock:
             iid, config = self._resolve_plugin(name)
             if not config:
@@ -2241,7 +2276,16 @@ class PluginExecutive:
             return True
 
     def get_circuit_breaker_status(self, name: str) -> Optional[Dict[str, Any]]:
-        """Get circuit breaker status for a plugin"""
+        """
+        Get circuit breaker status for a plugin.
+
+        Args:
+            name: Plugin name
+
+        Returns:
+            Dict with keys: state, consecutive_failures, max_failures,
+            last_failure_time, reset_after_seconds. None if plugin not found.
+        """
         with self._lock:
             iid, config = self._resolve_plugin(name)
             if not config:
@@ -2249,7 +2293,13 @@ class PluginExecutive:
             return config.circuit_breaker.to_dict()
 
     def get_all_circuit_breakers(self) -> Dict[str, Dict[str, Any]]:
-        """Get circuit breaker status for all plugins"""
+        """
+        Get circuit breaker status for all registered plugins.
+
+        Returns:
+            Dict mapping plugin name to circuit breaker status dict
+            (same structure as get_circuit_breaker_status)
+        """
         with self._lock:
             return {
                 config.plugin.name: config.circuit_breaker.to_dict()
@@ -2368,12 +2418,25 @@ class PluginExecutive:
         logger.info("Plugin executive stopped")
 
     def pause(self):
-        """Pause continuous execution (data still flows)"""
+        """
+        Pause continuous execution without stopping data flow.
+
+        While paused the executor loop skips plugin runs and order
+        processing, but the DataFeed continues to receive and buffer
+        ticks and bars.  Call resume() to restart execution; no data
+        is lost during the pause window.
+        """
         self._paused = True
         logger.info("Plugin executive paused")
 
     def resume(self):
-        """Resume continuous execution"""
+        """
+        Resume continuous execution after a pause.
+
+        Clears the paused flag so the executor loop resumes dispatching
+        data to plugins and processing order signals on the next cycle.
+        Has no effect if the executive is not currently paused.
+        """
         self._paused = False
         logger.info("Plugin executive resumed")
 
@@ -2613,7 +2676,21 @@ class PluginExecutive:
         self._reconciler.add_signal(plugin_name, signal, contract)
 
     def reconcile_and_execute(self):
-        """Reconcile pending signals and execute netted orders"""
+        """
+        Net pending trade signals across plugins and dispatch orders.
+
+        Passes all queued signals to the OrderReconciler, which nets
+        opposing buy/sell signals for the same symbol across plugins
+        (reducing unnecessary round-trips).  Each net order is then:
+
+        - **DRY_RUN**: logged and recorded in execution history without
+          placing a real order.
+        - **IMMEDIATE / QUEUED**: pushed onto the order queue for the
+          executor thread to place via IB.
+
+        Also fires the on_reconciled callback for each net order and
+        updates the shares-saved-by-netting statistic.
+        """
         reconciled_orders = self._reconciler.reconcile()
 
         reconciler_stats = self._reconciler.stats
@@ -2910,7 +2987,19 @@ class PluginExecutive:
     # =========================================================================
 
     def get_plugin_status(self, name: str) -> Optional[Dict[str, Any]]:
-        """Get status for a specific plugin"""
+        """
+        Get detailed status for a single plugin.
+
+        Args:
+            name: Plugin name or instance UUID.
+
+        Returns:
+            Dict with keys: name, instance_id, version, state,
+            is_system_plugin, enabled, execution_mode, bar_timeframe,
+            run_count, error_count, last_run, last_error,
+            circuit_breaker, parameters, subscribed_channels,
+            source_file.  Returns None if the plugin is not found.
+        """
         with self._lock:
             iid, config = self._resolve_plugin(name)
             if not config:
@@ -2938,7 +3027,24 @@ class PluginExecutive:
             }
 
     def get_status(self) -> Dict[str, Any]:
-        """Get overall executive status"""
+        """
+        Get a snapshot of the executive's overall state.
+
+        Returns a dict containing:
+
+        - ``running`` / ``paused`` flags
+        - ``order_mode``: current OrderExecutionMode value
+        - ``plugins``: per-plugin summary (state, enabled, run_count,
+          error_count, circuit_breaker_state)
+        - ``stats``: aggregate counters (signals processed, orders
+          placed, shares saved by netting, etc.)
+        - ``pending_orders``: orders awaiting IB fill confirmation
+        - ``queue_size``: orders currently in the executor queue
+        - ``health``: executor/health thread liveness and restart count
+        - ``open_circuit_breakers``: plugin names with open breakers
+        - ``message_bus_channels``: number of active pub/sub channels
+        - ``stream_manager``: StreamManager status dict
+        """
         with self._lock:
             plugin_status = {
                 config.plugin.name: {
@@ -2989,7 +3095,19 @@ class PluginExecutive:
         plugin_name: Optional[str] = None,
         count: int = 100,
     ) -> List[ExecutionResult]:
-        """Get execution history"""
+        """
+        Return recent execution results from the in-memory ring buffer.
+
+        Args:
+            plugin_name: If given, filter to results attributed to this
+                plugin only.
+            count: Maximum number of results to return. Defaults to 100;
+                the buffer retains up to ``_max_history`` entries total.
+
+        Returns:
+            List of ExecutionResult objects in chronological order
+            (most-recent last).
+        """
         history = self._execution_history
 
         if plugin_name:
@@ -2998,7 +3116,14 @@ class PluginExecutive:
         return history[-count:]
 
     def get_rate_limiter_stats(self) -> Dict[str, Any]:
-        """Get rate limiter statistics"""
+        """
+        Return token-bucket statistics from the order rate limiter.
+
+        Returns a dict with keys such as ``tokens_available``,
+        ``orders_throttled``, and ``total_orders_placed`` that reflect
+        the current state of the RateLimiter protecting the IB order
+        API from burst overloads.
+        """
         return self._order_rate_limiter.stats
 
     # =========================================================================
