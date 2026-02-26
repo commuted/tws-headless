@@ -284,6 +284,7 @@ Commands:
   plugin disable NAME_OR_ID       Disable plugin
   plugin trigger NAME_OR_ID       Manually trigger plugin run
   plugin dump NAME_OR_ID          Dump plugin positions and open orders
+  plugin request NAME TYPE [JSON] Send a request to a plugin's handle_request()
 
   algo list            List all algorithms
   algo status NAME     Get algorithm status

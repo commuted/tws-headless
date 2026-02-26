@@ -17,4 +17,4 @@ export IB_PLUGIN_DIR="${3:-$SCRIPT_DIR/plugins}"
 
 # Run from project root (where ib/ and plugins/ both live)
 cd "$SCRIPT_DIR"
-exec python3 -m ib.run_engine --plugins
+exec python3 -m ib.run_engine --port "$PORT" --mode "$MODE"

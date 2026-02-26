@@ -19,7 +19,7 @@ class TestFormatResult:
     def test_format_result_success(self):
         """Test format_result with success status"""
         from ibctl import format_result
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -36,7 +36,7 @@ class TestFormatResult:
     def test_format_result_error(self):
         """Test format_result with error status"""
         from ibctl import format_result
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         result = CommandResult(
             status=CommandStatus.ERROR,
@@ -52,7 +52,7 @@ class TestFormatResult:
     def test_format_result_pending(self):
         """Test format_result with pending status"""
         from ibctl import format_result
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         result = CommandResult(
             status=CommandStatus.PENDING,
@@ -68,7 +68,7 @@ class TestFormatResult:
     def test_format_result_verbose_shows_data(self):
         """Test format_result in verbose mode shows data"""
         from ibctl import format_result
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -85,7 +85,7 @@ class TestFormatResult:
     def test_format_result_positions_data(self):
         """Test format_result formats positions data"""
         from ibctl import format_result
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -247,7 +247,7 @@ class TestFormatResult:
     def test_format_result_empty_positions(self):
         """Test format_result with empty positions"""
         from ibctl import format_result
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -283,7 +283,7 @@ class TestIbctlMain:
     def test_main_sends_command(self):
         """Test main sends command to server"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -302,7 +302,7 @@ class TestIbctlMain:
     def test_main_sends_command_with_args(self):
         """Test main sends command with arguments"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -320,7 +320,7 @@ class TestIbctlMain:
     def test_main_json_output(self):
         """Test main with --json flag outputs JSON"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -340,7 +340,7 @@ class TestIbctlMain:
     def test_main_custom_socket(self):
         """Test main with custom socket path"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -358,7 +358,7 @@ class TestIbctlMain:
     def test_main_custom_timeout(self):
         """Test main with custom timeout"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -376,7 +376,7 @@ class TestIbctlMain:
     def test_main_error_exits_with_code_1(self):
         """Test main exits with code 1 on error"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.ERROR,
@@ -394,7 +394,7 @@ class TestIbctlMain:
     def test_main_success_no_exit_code(self):
         """Test main doesn't exit with error code on success"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -413,7 +413,7 @@ class TestIbctlMain:
     def test_main_verbose_flag(self):
         """Test main with verbose flag"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -441,7 +441,7 @@ class TestCommandBuilding:
     def test_multiple_word_command(self):
         """Test command with multiple words"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -460,7 +460,7 @@ class TestCommandBuilding:
     def test_help_command(self):
         """Test help command"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -487,7 +487,7 @@ class TestIbctlIntegration:
     def test_status_command_flow(self):
         """Test full status command flow"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -511,7 +511,7 @@ class TestIbctlIntegration:
     def test_sell_command_flow(self):
         """Test full sell command flow"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -530,7 +530,7 @@ class TestIbctlIntegration:
     def test_stop_command_flow(self):
         """Test stop command flow"""
         from ibctl import main
-        from command_server import CommandStatus, CommandResult
+        from ibctl import CommandStatus, CommandResult
 
         mock_result = CommandResult(
             status=CommandStatus.SUCCESS,
@@ -544,3 +544,64 @@ class TestIbctlIntegration:
 
         call_args = str(mock_print.call_args)
         assert "Shutdown" in call_args or "OK" in call_args
+
+
+# =============================================================================
+# Request Token Tests
+# =============================================================================
+
+class TestRequestToken:
+    """Tests for request token support in ibctl"""
+
+    def test_format_result_shows_request_token(self):
+        """Test format_result displays request token when present"""
+        from ibctl import format_result
+        from ibctl import CommandStatus, CommandResult
+
+        result = CommandResult(
+            status=CommandStatus.SUCCESS,
+            message="pong",
+            request_token="abc123",
+        )
+
+        with patch('builtins.print') as mock_print:
+            format_result(result)
+
+        calls = [str(call) for call in mock_print.call_args_list]
+        assert any("Request-Token: abc123" in c for c in calls)
+
+    def test_format_result_no_request_token(self):
+        """Test format_result does not show token line when absent"""
+        from ibctl import format_result
+        from ibctl import CommandStatus, CommandResult
+
+        result = CommandResult(
+            status=CommandStatus.SUCCESS,
+            message="pong",
+        )
+
+        with patch('builtins.print') as mock_print:
+            format_result(result)
+
+        calls = [str(call) for call in mock_print.call_args_list]
+        assert not any("Request-Token" in c for c in calls)
+
+    def test_main_with_request_token(self):
+        """Test --request-token flag is passed to send_command"""
+        from ibctl import main
+        from ibctl import CommandStatus, CommandResult
+
+        mock_result = CommandResult(
+            status=CommandStatus.SUCCESS,
+            message="pong",
+            request_token="my-token",
+        )
+
+        with patch('sys.argv', ['ibctl', '--request-token', 'my-token', 'ping']), \
+             patch('ibctl.send_command', return_value=mock_result) as mock_send, \
+             patch('builtins.print'):
+            main()
+
+        call_kwargs = mock_send.call_args
+        assert call_kwargs[1].get('request_token') == 'my-token' or \
+               'my-token' in str(call_kwargs)

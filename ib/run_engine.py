@@ -1466,6 +1466,47 @@ class EngineCommandHandler:
                 data=data,
             )
 
+        elif subcommand == "request" and len(subargs) >= 2:
+            name = subargs[0]
+            request_type = subargs[1]
+            payload = {}
+            if len(subargs) >= 3:
+                import json as _json
+                try:
+                    payload = _json.loads(subargs[2])
+                except Exception as e:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message=f"Invalid JSON payload: {e}",
+                    )
+
+            _, config = pe._resolve_plugin(name)
+            if not config:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Plugin '{name}' not found",
+                )
+
+            try:
+                result = config.plugin.handle_request(request_type, payload)
+            except Exception as e:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Plugin request error: {e}",
+                )
+
+            if result.get("success"):
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=result.get("message", f"Plugin '{name}' handled '{request_type}'"),
+                    data=result.get("data", {}),
+                )
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=result.get("message", f"Plugin '{name}' returned failure for '{request_type}'"),
+                data=result.get("data", {}),
+            )
+
         return CommandResult(
             status=CommandStatus.ERROR,
             message=f"Unknown plugin subcommand: {subcommand}",

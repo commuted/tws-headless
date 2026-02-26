@@ -672,9 +672,9 @@ class TestCommissionApportionment:
             )
             logs.append(log)
 
-        assert logs[0].commission == 0.75  # 50%
-        assert logs[1].commission == 0.45  # 30%
-        assert logs[2].commission == 0.30  # 20%
+        assert logs[0].commission == pytest.approx(0.75)  # 50%
+        assert logs[1].commission == pytest.approx(0.45)  # 30%
+        assert logs[2].commission == pytest.approx(0.30)  # 20%
 
         total = sum(log.commission for log in logs)
         assert abs(total - total_commission) < 0.01

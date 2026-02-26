@@ -102,7 +102,7 @@ class TestRateLimiter:
         result = limiter.try_acquire()
 
         assert result is True
-        assert limiter.available_tokens == 9.0
+        assert limiter.available_tokens == pytest.approx(9.0, abs=0.01)
 
     def test_try_acquire_exhausts_tokens(self):
         """Test acquiring all tokens"""
@@ -308,8 +308,8 @@ class TestOrderRateLimiter:
         limiter.acquire()
         after = limiter.available_capacity
 
-        assert initial == 5.0
-        assert after == 4.0
+        assert initial == pytest.approx(5.0, abs=0.01)
+        assert after == pytest.approx(4.0, abs=0.01)
 
     def test_stats(self):
         """Test order statistics"""

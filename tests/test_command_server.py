@@ -17,6 +17,8 @@ from command_server import (
     CommandStatus,
     CommandResult,
     CommandServer,
+    RequestEntry,
+    RequestQueue,
     send_command,
     DEFAULT_SOCKET_PATH,
 )
@@ -577,3 +579,240 @@ class TestSendCommandWithToken:
         result = send_command("ping", socket_path=socket_path, token="wrong_token")
 
         assert result.status == CommandStatus.UNAUTHORIZED
+
+
+# =============================================================================
+# RequestEntry Tests
+# =============================================================================
+
+class TestRequestEntry:
+    """Tests for RequestEntry dataclass"""
+
+    def test_creation_with_defaults(self):
+        """Test creating a RequestEntry with default values"""
+        entry = RequestEntry(token="abc123", command="ping")
+        assert entry.token == "abc123"
+        assert entry.command == "ping"
+        assert entry.status == "active"
+        assert entry.result is None
+        assert entry.completed_at is None
+
+    def test_timestamp_present(self):
+        """Test that created_at timestamp is set automatically"""
+        before = time.time()
+        entry = RequestEntry(token="abc123", command="ping")
+        after = time.time()
+        assert before <= entry.created_at <= after
+
+
+# =============================================================================
+# RequestQueue Tests
+# =============================================================================
+
+class TestRequestQueue:
+    """Tests for RequestQueue"""
+
+    def test_enqueue_unique_token_succeeds(self):
+        """Test enqueue with unique token returns None (success)"""
+        queue = RequestQueue()
+        result = queue.try_enqueue("token1", "ping")
+        assert result is None
+
+    def test_duplicate_active_token_returns_suggestion(self):
+        """Test duplicate active token returns a suggested alternative"""
+        queue = RequestQueue()
+        queue.try_enqueue("token1", "ping")
+        suggested = queue.try_enqueue("token1", "status")
+        assert suggested is not None
+        assert isinstance(suggested, str)
+        assert suggested != "token1"
+
+    def test_duplicate_completed_token_returns_suggestion(self):
+        """Test duplicate token in completed queue returns suggestion"""
+        queue = RequestQueue()
+        queue.try_enqueue("token1", "ping")
+        queue.complete("token1")
+        suggested = queue.try_enqueue("token1", "status")
+        assert suggested is not None
+        assert suggested != "token1"
+
+    def test_complete_moves_to_completed(self):
+        """Test complete moves entry from active to completed"""
+        queue = RequestQueue()
+        queue.try_enqueue("token1", "ping")
+        result = CommandResult(status=CommandStatus.SUCCESS, message="pong")
+        queue.complete("token1", result)
+        # token1 should no longer be active but still in completed
+        assert queue.size == 1
+
+    def test_max_completed_retained(self):
+        """Test only MAX_COMPLETED entries retained in completed queue"""
+        queue = RequestQueue()
+        for i in range(12):
+            token = f"token_{i}"
+            queue.try_enqueue(token, "ping")
+            queue.complete(token)
+        # Should have 8 completed (MAX_COMPLETED), 0 active
+        assert queue.size == RequestQueue.MAX_COMPLETED
+
+    def test_evicted_token_can_be_reused(self):
+        """Test that evicted tokens can be reused"""
+        queue = RequestQueue()
+        # Fill up completed queue and evict token_0
+        for i in range(RequestQueue.MAX_COMPLETED + 1):
+            token = f"token_{i}"
+            queue.try_enqueue(token, "ping")
+            queue.complete(token)
+        # token_0 was evicted, should be reusable
+        result = queue.try_enqueue("token_0", "ping")
+        assert result is None  # Success
+
+    def test_generated_tokens_are_unique(self):
+        """Test generate_token produces unique tokens"""
+        queue = RequestQueue()
+        tokens = {queue.generate_token() for _ in range(50)}
+        assert len(tokens) == 50
+
+    def test_thread_safety(self):
+        """Test concurrent enqueue/complete operations"""
+        queue = RequestQueue()
+        errors = []
+
+        def worker(worker_id):
+            try:
+                for i in range(20):
+                    token = f"w{worker_id}_t{i}"
+                    result = queue.try_enqueue(token, "ping")
+                    if result is not None:
+                        errors.append(f"Unexpected duplicate: {token}")
+                    queue.complete(token)
+            except Exception as e:
+                errors.append(str(e))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+
+        assert len(errors) == 0, f"Thread safety errors: {errors}"
+
+
+# =============================================================================
+# Request Token Parsing Tests
+# =============================================================================
+
+class TestRequestTokenParsing:
+    """Tests for _parse_request_token"""
+
+    def setup_method(self):
+        self.server = CommandServer()
+
+    def test_req_token_command_extracted(self):
+        """Test REQ token command extracts token and remaining"""
+        token, remaining = self.server._parse_request_token("REQ mytoken ping")
+        assert token == "mytoken"
+        assert remaining == "ping"
+
+    def test_case_insensitive_req(self):
+        """Test req prefix is case-insensitive"""
+        token, remaining = self.server._parse_request_token("req mytoken ping")
+        assert token == "mytoken"
+        assert remaining == "ping"
+
+    def test_req_with_auth_preserved(self):
+        """Test REQ token AUTH authtoken command strips REQ, preserves AUTH"""
+        token, remaining = self.server._parse_request_token(
+            "REQ mytoken AUTH secret123 ping"
+        )
+        assert token == "mytoken"
+        assert remaining == "AUTH secret123 ping"
+
+    def test_no_req_generates_token(self):
+        """Test no REQ prefix generates a token and preserves command"""
+        token, remaining = self.server._parse_request_token("ping")
+        assert isinstance(token, str)
+        assert len(token) > 0
+        assert remaining == "ping"
+
+    def test_no_req_with_auth_preserved(self):
+        """Test no REQ with AUTH generates token and preserves AUTH line"""
+        token, remaining = self.server._parse_request_token("AUTH secret123 ping")
+        assert isinstance(token, str)
+        assert len(token) > 0
+        assert remaining == "AUTH secret123 ping"
+
+    def test_req_with_multi_word_args(self):
+        """Test REQ with multi-word arguments"""
+        token, remaining = self.server._parse_request_token(
+            "REQ mytoken sell SPY 100 --confirm"
+        )
+        assert token == "mytoken"
+        assert remaining == "sell SPY 100 --confirm"
+
+    def test_req_with_token_only(self):
+        """Test REQ with token but no remaining command"""
+        token, remaining = self.server._parse_request_token("REQ mytoken")
+        assert token == "mytoken"
+        assert remaining == ""
+
+
+# =============================================================================
+# Request Token Integration Tests
+# =============================================================================
+
+class TestRequestTokenIntegration:
+    """Integration tests for request tokens with actual socket communication"""
+
+    @pytest.fixture
+    def temp_socket_path(self):
+        """Create a temporary socket path"""
+        fd, path = tempfile.mkstemp(suffix=".sock")
+        os.close(fd)
+        os.unlink(path)
+        yield path
+        if os.path.exists(path):
+            os.unlink(path)
+
+    @pytest.fixture
+    def running_server(self, temp_socket_path):
+        """Create and start a server, yield it, then stop"""
+        server = CommandServer(socket_path=temp_socket_path)
+        server.register_handler("test", lambda args: CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"args={args}",
+        ))
+        started = server.start()
+        assert started
+        time.sleep(0.1)
+        yield server, temp_socket_path
+        server.stop()
+
+    def test_client_provided_token_in_response(self, running_server):
+        """Test client-provided token appears in response"""
+        server, socket_path = running_server
+        result = send_command("ping", socket_path=socket_path, request_token="my-req-1")
+        assert result.request_token == "my-req-1"
+        assert result.status == CommandStatus.SUCCESS
+
+    def test_server_generates_token_when_none_provided(self, running_server):
+        """Test server generates token when client doesn't provide one"""
+        server, socket_path = running_server
+        result = send_command("ping", socket_path=socket_path)
+        assert result.request_token is not None
+        assert len(result.request_token) > 0
+
+    def test_duplicate_token_returns_error(self, running_server):
+        """Test duplicate token returns error with suggested alternative"""
+        server, socket_path = running_server
+
+        # Send first request — it will complete before the second arrives
+        # so we need to use a token that lands in the completed queue
+        result1 = send_command("ping", socket_path=socket_path, request_token="dup-token")
+        assert result1.status == CommandStatus.SUCCESS
+
+        # Send second request with same token — should fail (token in completed queue)
+        result2 = send_command("ping", socket_path=socket_path, request_token="dup-token")
+        assert result2.status == CommandStatus.ERROR
+        assert "Duplicate" in result2.message
+        assert "suggested_token" in result2.data

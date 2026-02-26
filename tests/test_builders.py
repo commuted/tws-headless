@@ -97,6 +97,8 @@ class TestContractBuilderOption:
         contract = ContractBuilder.option_by_local_symbol("AAPL  251219C00150000")
         assert contract.localSymbol == "AAPL  251219C00150000"
         assert contract.secType == "OPT"
+        assert contract.exchange == "SMART"
+        assert contract.currency == "USD"
 
     def test_option_chain_query(self):
         """Test option chain query contract"""
@@ -173,12 +175,15 @@ class TestContractBuilderBond:
         assert contract.secIdType == "CUSIP"
         assert contract.secId == "912828C57"
         assert contract.secType == "BOND"
+        assert contract.exchange == "SMART"
+        assert contract.currency == "USD"
 
     def test_bond_by_conid(self):
         """Test bond by contract ID"""
         contract = ContractBuilder.bond_by_conid(123456)
         assert contract.conId == 123456
         assert contract.secType == "BOND"
+        assert contract.exchange == "SMART"
 
 
 class TestContractBuilderOther:
@@ -386,12 +391,16 @@ class TestOrderFactoryTrailing:
         order = OrderFactory.trailing_stop("SELL", Decimal("100"), trail_amount=2.0)
         assert order.orderType == "TRAIL"
         assert order.auxPrice == 2.0
+        assert order.totalQuantity == Decimal("100")
+        assert order.action == "SELL"
 
     def test_trailing_stop_percent(self):
         """Test trailing stop with percent"""
         order = OrderFactory.trailing_stop("SELL", Decimal("100"), trail_percent=5.0)
         assert order.orderType == "TRAIL"
         assert order.trailingPercent == 5.0
+        assert order.totalQuantity == Decimal("100")
+        assert order.action == "SELL"
 
     def test_trailing_stop_limit(self):
         """Test trailing stop limit order"""
@@ -400,6 +409,7 @@ class TestOrderFactoryTrailing:
         )
         assert order.orderType == "TRAIL LIMIT"
         assert order.lmtPriceOffset == 0.5
+        assert order.auxPrice == 2.0
 
 
 class TestOrderFactoryPegged:
@@ -415,6 +425,8 @@ class TestOrderFactoryPegged:
         """Test pegged to midpoint order"""
         order = OrderFactory.pegged_to_midpoint("BUY", Decimal("100"))
         assert order.orderType == "PEG MID"
+        assert order.auxPrice == 0.0
+        assert order.lmtPrice == 0.0
 
     def test_midprice(self):
         """Test midprice order"""
@@ -430,6 +442,7 @@ class TestOrderFactoryRelative:
         order = OrderFactory.relative("BUY", Decimal("100"), 0.01)
         assert order.orderType == "REL"
         assert order.auxPrice == 0.01
+        assert order.lmtPrice == 0.0
 
     def test_passive_relative(self):
         """Test passive relative order"""
@@ -610,6 +623,8 @@ class TestAlgoParamsVWAP:
         assert order.algoStrategy == "Vwap"
         params = {p.tag: p.value for p in order.algoParams}
         assert params["maxPctVol"] == str(0.1)
+        assert params["startTime"] == "09:30:00"
+        assert params["endTime"] == "16:00:00"
 
     def test_vwap_alias(self):
         """Test VWAP convenience alias"""
@@ -655,6 +670,8 @@ class TestAlgoParamsPctVol:
         assert order.algoStrategy == "PctVol"
         params = {p.tag: p.value for p in order.algoParams}
         assert params["pctVol"] == str(0.05)
+        assert params["startTime"] == "09:30:00"
+        assert params["endTime"] == "16:00:00"
 
     def test_pct_vol_alias(self):
         """Test PctVol convenience alias"""

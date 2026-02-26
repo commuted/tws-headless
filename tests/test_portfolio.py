@@ -113,6 +113,15 @@ def portfolio_instance(mock_ibapi):
         portfolio.managed_accounts = ["DU123456"]
         portfolio._shutting_down = False
 
+        # Forex and execution tracking (added in newer portfolio.py)
+        portfolio._forex_cash = {}
+        portfolio._forex_rates = {}
+        portfolio._forex_positions = {}
+        portfolio._forex_cost_basis = {}
+        portfolio._account_updates_done = Event()
+        portfolio._executions_done = Event()
+        portfolio._execution_db = None
+
         return portfolio
 
 
@@ -722,11 +731,15 @@ class TestPortfolioLoad:
         portfolio_instance._connected.set()
         portfolio_instance._positions = {"SPY": mock_position}
         portfolio_instance._positions_done.set()
+        portfolio_instance._account_updates_done.set()
 
         with patch.object(portfolio_instance, 'reqPositions'), \
+             patch.object(portfolio_instance, 'reqAccountUpdates'), \
+             patch.object(portfolio_instance, '_apply_forex_rates'), \
              patch.object(portfolio_instance, '_fetch_market_data'), \
              patch.object(portfolio_instance, '_calculate_allocations'), \
-             patch.object(portfolio_instance, '_fetch_account_summary'):
+             patch.object(portfolio_instance, '_fetch_account_summary'), \
+             patch.object(portfolio_instance, 'request_executions'):
             portfolio_instance.load()
 
         assert portfolio_instance._positions == {}
@@ -735,11 +748,15 @@ class TestPortfolioLoad:
         """Test load calls reqPositions"""
         portfolio_instance._connected.set()
         portfolio_instance._positions_done.set()
+        portfolio_instance._account_updates_done.set()
 
         with patch.object(portfolio_instance, 'reqPositions') as mock_req, \
+             patch.object(portfolio_instance, 'reqAccountUpdates'), \
+             patch.object(portfolio_instance, '_apply_forex_rates'), \
              patch.object(portfolio_instance, '_fetch_market_data'), \
              patch.object(portfolio_instance, '_calculate_allocations'), \
-             patch.object(portfolio_instance, '_fetch_account_summary'):
+             patch.object(portfolio_instance, '_fetch_account_summary'), \
+             patch.object(portfolio_instance, 'request_executions'):
             portfolio_instance.load()
 
         mock_req.assert_called_once()
@@ -747,6 +764,7 @@ class TestPortfolioLoad:
     def test_load_fetches_prices_when_enabled(self, portfolio_instance, mock_position):
         """Test load fetches prices when fetch_prices=True"""
         portfolio_instance._connected.set()
+        portfolio_instance._account_updates_done.set()
 
         # Simulate positions being loaded by reqPositions callback
         def fake_req_positions():
@@ -754,9 +772,12 @@ class TestPortfolioLoad:
             portfolio_instance._positions_done.set()
 
         with patch.object(portfolio_instance, 'reqPositions', side_effect=fake_req_positions), \
+             patch.object(portfolio_instance, 'reqAccountUpdates'), \
+             patch.object(portfolio_instance, '_apply_forex_rates'), \
              patch.object(portfolio_instance, '_fetch_market_data') as mock_fetch, \
              patch.object(portfolio_instance, '_calculate_allocations'), \
-             patch.object(portfolio_instance, '_fetch_account_summary'):
+             patch.object(portfolio_instance, '_fetch_account_summary'), \
+             patch.object(portfolio_instance, 'request_executions'):
             portfolio_instance.load(fetch_prices=True)
 
         mock_fetch.assert_called_once()
@@ -765,11 +786,15 @@ class TestPortfolioLoad:
         """Test load skips price fetch when fetch_prices=False"""
         portfolio_instance._connected.set()
         portfolio_instance._positions_done.set()
+        portfolio_instance._account_updates_done.set()
 
         with patch.object(portfolio_instance, 'reqPositions'), \
+             patch.object(portfolio_instance, 'reqAccountUpdates'), \
+             patch.object(portfolio_instance, '_apply_forex_rates'), \
              patch.object(portfolio_instance, '_fetch_market_data') as mock_fetch, \
              patch.object(portfolio_instance, '_calculate_allocations'), \
-             patch.object(portfolio_instance, '_fetch_account_summary'):
+             patch.object(portfolio_instance, '_fetch_account_summary'), \
+             patch.object(portfolio_instance, 'request_executions'):
             portfolio_instance.load(fetch_prices=False)
 
         mock_fetch.assert_not_called()
@@ -778,10 +803,14 @@ class TestPortfolioLoad:
         """Test load fetches account when fetch_account=True"""
         portfolio_instance._connected.set()
         portfolio_instance._positions_done.set()
+        portfolio_instance._account_updates_done.set()
 
         with patch.object(portfolio_instance, 'reqPositions'), \
+             patch.object(portfolio_instance, 'reqAccountUpdates'), \
+             patch.object(portfolio_instance, '_apply_forex_rates'), \
              patch.object(portfolio_instance, '_calculate_allocations'), \
-             patch.object(portfolio_instance, '_fetch_account_summary') as mock_fetch:
+             patch.object(portfolio_instance, '_fetch_account_summary') as mock_fetch, \
+             patch.object(portfolio_instance, 'request_executions'):
             portfolio_instance.load(fetch_prices=False, fetch_account=True)
 
         mock_fetch.assert_called_once()
@@ -1371,13 +1400,25 @@ class TestOpenOrderAndExecDetails:
         handler = MagicMock()
         portfolio_instance._callbacks = {"execDetails": handler}
 
+        contract = MagicMock()
+        contract.secType = "STK"
+        contract.symbol = "SPY"
+        contract.localSymbol = "SPY"
+        contract.currency = "USD"
+        contract.exchange = "SMART"
+
         execution = MagicMock()
+        execution.execId = "0001"
         execution.orderId = 100
         execution.side = "BOT"
         execution.shares = 100
-        execution.price = 450.0
+        execution.cumQty = 100
+        execution.avgPrice = 450.0
+        execution.exchange = "SMART"
+        execution.acctNumber = "DU123456"
 
-        portfolio_instance.execDetails(1, MagicMock(), execution)
+        with patch('portfolio.get_execution_db'):
+            portfolio_instance.execDetails(1, contract, execution)
 
         handler.assert_called_once()
 

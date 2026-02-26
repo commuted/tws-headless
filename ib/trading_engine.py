@@ -141,6 +141,15 @@ class TradingEngine:
             use_delayed_data=self.config.use_delayed_data,
         )
 
+        # Wire DataFeed callbacks BEFORE creating PluginExecutive.
+        # StreamManager (created inside PluginExecutive.__init__) captures
+        # data_feed.on_tick/on_bar at init time.  If we set them afterward
+        # (as _setup_callbacks() used to do), StreamManager is bypassed and
+        # plugin request_stream() callbacks never fire.
+        self._data_feed.on_tick = self._on_tick
+        self._data_feed.on_bar = self._on_bar
+        self._data_feed.on_error = self._on_data_error
+
         # Create MessageBus for plugin communication
         self._message_bus = MessageBus() if self.config.enable_message_bus else None
 
@@ -214,11 +223,6 @@ class TradingEngine:
         self._connection_manager.on_connected = self._on_connected
         self._connection_manager.on_disconnected = self._on_disconnected
         self._connection_manager.on_reconnecting = self._on_reconnecting
-
-        # Data feed callbacks
-        self._data_feed.on_tick = self._on_tick
-        self._data_feed.on_bar = self._on_bar
-        self._data_feed.on_error = self._on_data_error
 
         # Plugin executive callbacks
         if self._plugin_executive:

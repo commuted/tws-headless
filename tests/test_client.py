@@ -235,7 +235,7 @@ class TestIBClientCallbacks:
         handler = MagicMock()
         client.register_callback("error", handler)
 
-        client.error(1, 200, "Test error")
+        client.error(1, 0, 200, "Test error")
 
         handler.assert_called_once_with(1, 200, "Test error")
 
@@ -246,12 +246,12 @@ class TestIBClientCallbacks:
 
         for code in info_codes:
             # Should not raise
-            client.error(-1, code, "Info message")
+            client.error(-1, 0, code, "Info message")
 
     def test_error_system_message(self, client):
         """Test error handles system messages (reqId=-1)"""
         # Should not raise
-        client.error(-1, 1100, "System message")
+        client.error(-1, 0, 1100, "System message")
 
 
 class TestIBClientRepr:
@@ -378,6 +378,8 @@ class TestIBClientConnectExtended:
             client._connected = Event()
             client._next_order_id = None
             client._thread = None
+            client._host = "127.0.0.1"
+            client._port = 7497
             client.host = "127.0.0.1"
             client.port = 7497
             client.client_id = 1
@@ -468,23 +470,23 @@ class TestIBClientErrorExtended:
     def test_error_with_advanced_order_reject(self, client):
         """Test error handles advancedOrderRejectJson"""
         # Should not raise
-        client.error(1, 201, "Order rejected", '{"reason": "test"}')
+        client.error(1, 0, 201, "Order rejected", '{"reason": "test"}')
 
     def test_error_delayed_data_notification(self, client):
         """Test error handles delayed data notification code"""
         # 10167 is delayed market data notification
         # Should not raise
-        client.error(-1, 10167, "Delayed market data")
+        client.error(-1, 0, 10167, "Delayed market data")
 
     def test_error_actual_error_with_reqid(self, client):
         """Test error logs actual error with reqId"""
         # Should not raise
-        client.error(123, 200, "No security definition found")
+        client.error(123, 0, 200, "No security definition found")
 
     def test_error_no_callback(self, client):
         """Test error works without callback registered"""
         # Should not raise
-        client.error(1, 200, "Test error")
+        client.error(1, 0, 200, "Test error")
 
 
 class TestIBClientCurrentTime:
