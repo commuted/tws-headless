@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Pairs 2-6 are long/inverse so exactly one side fills per market move.
 # ===========================================================================
 ETF_PAIRS: List[Tuple[str, str]] = [
-    ("QQQQ", "QQQM"),   # 0 – NASDAQ-100 twins (same direction)
+    ("QQQ",  "QQQM"),   # 0 – NASDAQ-100 twins (same direction)
     ("SPY",  "VOO"),    # 1 – S&P 500 twins    (same direction)
     ("QQQ",  "PSQ"),    # 2 – NASDAQ-100 long / inverse
     ("DIA",  "DOG"),    # 3 – Dow Jones long   / inverse
@@ -167,7 +167,8 @@ class OrderTestPluginBase(PluginBase):
         saved = self.load_state()
         if saved:
             self._results = [
-                OrderPairResult(**r) for r in saved.get("results", [])
+                OrderPairResult(**{k: v for k, v in r.items() if k != "passed"})
+                for r in saved.get("results", [])
             ]
         return True
 

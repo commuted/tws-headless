@@ -70,11 +70,15 @@ def forex_spec() -> FeedTestSpec:
 
 
 def stock_spec() -> FeedTestSpec:
-    """Create a test spec for SPY stock."""
+    """Create a test spec for SPY stock.
+
+    primaryExch="ARCA" is required for unambiguous live TRADES data.
+    Without it, IB may return a contract-ambiguous warning and no data.
+    """
     return FeedTestSpec(
         feed_type=FeedType.STOCK,
         symbol="SPY",
-        contract=ContractBuilder.us_stock("SPY"),
+        contract=ContractBuilder.us_stock("SPY", primary_exchange="ARCA"),
         what_to_show="TRADES",
         use_rth=True,
         description="Stock SPY",

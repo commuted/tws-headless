@@ -5,7 +5,7 @@ Tests: Market, Limit, Stop, Stop-Limit, Market-on-Close,
        Market-on-Open, Market-to-Limit
 
 ETF pairs (one per order type):
-  0 QQQQ / QQQM   1 SPY / VOO   2 QQQ / PSQ
+  0 QQQ  / QQQM   1 SPY / VOO   2 QQQ / PSQ
   3 DIA  / DOG    4 SH  / SPXS  5 IWM / RWM   6 EEM / EEV
 """
 
