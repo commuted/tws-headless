@@ -1507,6 +1507,92 @@ class EngineCommandHandler:
                 data=result.get("data", {}),
             )
 
+        elif subcommand == "load" and subargs:
+            module_or_path = subargs[0]
+
+            # Normalise: convert filesystem path to dotted module name
+            if "/" in module_or_path or module_or_path.endswith(".py"):
+                from pathlib import Path as _Path
+                p = _Path(module_or_path.rstrip("/"))
+                if p.suffix == ".py":
+                    p = p.parent           # strip plugin.py → dir
+                parts: List[str] = []
+                while p.name:
+                    parts.insert(0, p.name)
+                    parent = p.parent
+                    if not (parent / "__init__.py").exists():
+                        break
+                    p = parent
+                module_name = ".".join(parts)
+            else:
+                module_name = module_or_path
+
+            try:
+                import importlib as _il
+                module = _il.import_module(module_name)
+
+                from plugins.base import PluginBase
+                plugin_class = None
+                for _attr_name, _obj in vars(module).items():
+                    if (
+                        isinstance(_obj, type)
+                        and issubclass(_obj, PluginBase)
+                        and _obj is not PluginBase
+                        and not _attr_name.startswith("_")
+                    ):
+                        plugin_class = _obj
+                        break
+
+                if plugin_class is None:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message=f"No PluginBase subclass found in '{module_name}'",
+                    )
+
+                plugin_instance = plugin_class(
+                    portfolio=self.engine.portfolio,
+                    message_bus=(
+                        self.engine.message_bus
+                        if hasattr(self.engine, "message_bus")
+                        else None
+                    ),
+                )
+
+                from .plugin_executive import ExecutionMode
+                pe.register_plugin(
+                    plugin_instance,
+                    execution_mode=ExecutionMode.MANUAL,
+                    enabled=True,
+                )
+
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=f"Loaded plugin '{plugin_instance.name}' from {module_name}",
+                    data={
+                        "plugin_name": plugin_instance.name,
+                        "instance_id": plugin_instance.name,
+                        "module": module_name,
+                    },
+                )
+
+            except Exception as exc:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Failed to load plugin from '{module_or_path}': {exc}",
+                )
+
+        elif subcommand == "unload" and subargs:
+            name = subargs[0]
+            if pe.unload_plugin(name):
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=f"Plugin '{name}' unloaded",
+                )
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Plugin '{name}' not found or could not be unloaded",
+            )
+
         return CommandResult(
             status=CommandStatus.ERROR,
             message=f"Unknown plugin subcommand: {subcommand}",
