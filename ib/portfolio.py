@@ -772,6 +772,94 @@ class Portfolio(IBClient):
             logger.error(f"Error cancelling order {order_id}: {e}")
             return False
 
+    def allocate_order_ids(self, count: int = 1) -> List[int]:
+        """
+        Allocate a block of consecutive order IDs.
+
+        Use with place_order_raw() for multi-leg orders (bracket, OCA).
+
+        Args:
+            count: Number of consecutive IDs to allocate
+
+        Returns:
+            List of allocated order IDs, empty list if not connected
+        """
+        if self._next_order_id is None:
+            return []
+        with self._lock:
+            start_id = self._next_order_id
+            self._next_order_id += count
+        return list(range(start_id, start_id + count))
+
+    def place_order_raw(self, order_id: int, contract: Contract, order: Order) -> bool:
+        """
+        Place a pre-allocated order, registering it for status tracking.
+
+        Use together with allocate_order_ids() for multi-leg orders
+        (bracket, OCA, conditions) where consecutive IDs must be pre-reserved.
+
+        Args:
+            order_id: Pre-allocated order ID
+            contract: IB Contract to trade
+            order: Fully-configured Order object
+
+        Returns:
+            True if submitted successfully
+        """
+        if not self.connected:
+            logger.error("Not connected to IB")
+            return False
+
+        record = OrderRecord(
+            order_id=order_id,
+            symbol=contract.symbol,
+            action=order.action,
+            quantity=float(order.totalQuantity),
+            order_type=order.orderType,
+            submitted_time=datetime.now().isoformat(),
+        )
+        completion_event = Event()
+        with self._orders_lock:
+            self._orders[order_id] = record
+            self._pending_orders[order_id] = completion_event
+
+        try:
+            self.placeOrder(order_id, contract, order)
+            logger.info(
+                f"Placed order {order_id}: {order.action} {order.totalQuantity} "
+                f"{contract.symbol} @ {order.orderType}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error placing order {order_id}: {e}")
+            with self._orders_lock:
+                record.status = OrderStatus.ERROR
+                record.error_message = str(e)
+                completion_event.set()
+            return False
+
+    def place_order_custom(self, contract: Contract, order: Order) -> Optional[int]:
+        """
+        Place an arbitrary Order object, allocating the next order ID.
+
+        For plugins/tests that need order types beyond the simple place_order()
+        interface (midprice, trailing, pegged, conditions, etc.).
+
+        Args:
+            contract: IB Contract to trade
+            order: Fully-configured Order object (action, orderType, qty, etc.)
+
+        Returns:
+            Order ID if submitted, None if failed
+        """
+        ids = self.allocate_order_ids(1)
+        if not ids:
+            logger.error("No valid order ID available")
+            return None
+        order_id = ids[0]
+        order.orderId = order_id
+        return order_id if self.place_order_raw(order_id, contract, order) else None
+
     def wait_for_order(self, order_id: int, timeout: float = 30.0) -> Optional[OrderRecord]:
         """
         Wait for an order to complete (fill, cancel, or error).
