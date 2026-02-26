@@ -74,12 +74,18 @@ def stock_spec() -> FeedTestSpec:
 
     primaryExch="ARCA" is required for unambiguous live TRADES data.
     Without it, IB may return a contract-ambiguous warning and no data.
+
+    Tick test uses TRADES (delayed mode works for ticks).
+    Bar test uses MIDPOINT: reqRealTimeBars with TRADES requires a live
+    equity data subscription even in live mode, while MIDPOINT works on
+    paper accounts with no additional subscription.
     """
     return FeedTestSpec(
         feed_type=FeedType.STOCK,
         symbol="SPY",
         contract=ContractBuilder.us_stock("SPY", primary_exchange="ARCA"),
         what_to_show="TRADES",
+        bar_what_to_show="MIDPOINT",
         use_rth=True,
         description="Stock SPY",
     )
