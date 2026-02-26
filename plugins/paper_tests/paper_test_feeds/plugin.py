@@ -269,16 +269,22 @@ class PaperTestFeedsPlugin(PluginBase):
         """Run tick and bar tests for a pair of specs."""
         specs = [pair.spec_a, pair.spec_b]
 
-        # Phase 1: Tick test
-        logger.info(f"Phase 1: Tick test for {pair.name}")
+        # Phase 1: Tick test — use delayed (3) so US equity ticks arrive
+        # even without a live API subscription (delayed data is always available).
+        logger.info(f"Phase 1: Tick test for {pair.name} (delayed mode)")
+        self.portfolio.reqMarketDataType(3)
         self._run_tick_test(specs)
 
-        # Brief pause between phases
-        time.sleep(1)
-
-        # Phase 2: Bar test
-        logger.info(f"Phase 2: Bar test for {pair.name}")
+        # Phase 2: Bar test — must restore live (1) before reqRealTimeBars;
+        # reqRealTimeBars ignores the delayed mode flag and delivers nothing
+        # when the session is set to 3.
+        time.sleep(0.5)
+        logger.info(f"Phase 2: Bar test for {pair.name} (live mode)")
+        self.portfolio.reqMarketDataType(1)
         self._run_bar_test(specs)
+
+        # Restore live mode for anything that runs after
+        self.portfolio.reqMarketDataType(1)
 
     # =========================================================================
     # TICK TEST

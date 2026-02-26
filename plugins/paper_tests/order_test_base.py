@@ -247,7 +247,12 @@ class OrderTestPluginBase(PluginBase):
 
     def _fetch_price(self, symbol: str, contract: Contract,
                      timeout: float = 15.0) -> Optional[float]:
-        """Subscribe to a tick stream, wait for one valid price, cancel stream."""
+        """Subscribe to a tick stream, wait for one valid price, cancel stream.
+
+        Uses delayed market data (type 3) so US equity ticks arrive on paper
+        accounts; restores live mode (type 1) before returning so that any
+        subsequent reqRealTimeBars calls are not silently suppressed.
+        """
         price_event = threading.Event()
         captured: Dict[str, float] = {}
 
@@ -255,6 +260,9 @@ class OrderTestPluginBase(PluginBase):
             if sym == symbol and price > 0 and not price_event.is_set():
                 captured["price"] = price
                 price_event.set()
+
+        if self.portfolio:
+            self.portfolio.reqMarketDataType(3)
 
         self.request_stream(
             symbol=symbol,
@@ -265,6 +273,10 @@ class OrderTestPluginBase(PluginBase):
 
         price_event.wait(timeout=timeout)
         self.cancel_stream(symbol)
+
+        if self.portfolio:
+            self.portfolio.reqMarketDataType(1)
+
         return captured.get("price")
 
     # -----------------------------------------------------------------------
