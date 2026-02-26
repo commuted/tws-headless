@@ -412,14 +412,14 @@ class PaperTestFeedsPlugin(PluginBase):
             for spec in specs:
                 logger.info(
                     f"  Requesting bar stream: {spec.symbol} "
-                    f"(what_to_show={spec.what_to_show}, use_rth={spec.use_rth})"
+                    f"(what_to_show={spec.bar_what_to_show}, use_rth={spec.use_rth})"
                 )
                 self.request_stream(
                     symbol=spec.symbol,
                     contract=spec.contract,
                     data_types={DataType.BAR_5SEC},
                     on_bar=self._on_test_bar,
-                    what_to_show=spec.what_to_show,
+                    what_to_show=spec.bar_what_to_show,
                     use_rth=spec.use_rth,
                 )
 
@@ -487,7 +487,7 @@ class PaperTestFeedsPlugin(PluginBase):
         details = {
             "bars_received": len(bars),
             "valid_bars": len(valid_bars),
-            "what_to_show": spec.what_to_show,
+            "what_to_show": spec.bar_what_to_show,
             "use_rth": spec.use_rth,
             "timeout_seconds": spec.bar_timeout,
         }
@@ -518,7 +518,7 @@ class PaperTestFeedsPlugin(PluginBase):
             error_message = (
                 f"Timeout: received {len(valid_bars)} valid bars in "
                 f"{spec.bar_timeout}s (need 1). "
-                f"what_to_show={spec.what_to_show}"
+                f"what_to_show={spec.bar_what_to_show}"
             )
 
         return FeedTestResult(

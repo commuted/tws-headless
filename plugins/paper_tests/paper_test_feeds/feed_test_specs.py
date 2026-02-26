@@ -32,6 +32,10 @@ class FeedTestSpec:
     symbol: str
     contract: Contract
     what_to_show: str = "TRADES"
+    # reqRealTimeBars ignores reqMarketDataType(3); TRADES bars need a live
+    # equity subscription even when delayed ticks work.  Set bar_what_to_show
+    # to override independently (e.g. MIDPOINT works on paper accounts).
+    bar_what_to_show: str = ""  # empty → falls back to what_to_show
     use_rth: bool = True
     tick_timeout: float = 15.0
     bar_timeout: float = 12.0
@@ -41,6 +45,8 @@ class FeedTestSpec:
     def __post_init__(self):
         if not self.description:
             self.description = f"{self.feed_type.value} {self.symbol}"
+        if not self.bar_what_to_show:
+            self.bar_what_to_show = self.what_to_show
 
 
 @dataclass
@@ -64,12 +70,19 @@ def forex_spec() -> FeedTestSpec:
 
 
 def stock_spec() -> FeedTestSpec:
-    """Create a test spec for SPY stock"""
+    """Create a test spec for SPY stock.
+
+    Ticks use TRADES (delayed data works fine).
+    Bars use MIDPOINT: reqRealTimeBars ignores the delayed-data mode and
+    requires a live TRADES subscription, while MIDPOINT works on paper
+    accounts without one.
+    """
     return FeedTestSpec(
         feed_type=FeedType.STOCK,
         symbol="SPY",
         contract=ContractBuilder.us_stock("SPY"),
         what_to_show="TRADES",
+        bar_what_to_show="MIDPOINT",
         use_rth=True,
         description="Stock SPY",
     )
