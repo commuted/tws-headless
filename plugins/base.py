@@ -6,7 +6,8 @@ Provides the foundation for implementing trading plugins with:
 - Custom request handling
 - Pub/Sub MessageBus integration for indicator feeds
 - Automatic state persistence to JSON files
-- Instruments, holdings, and execution from AlgorithmBase
+- Instrument management and market data subscriptions
+- Holdings tracking and order execution
 """
 
 import json
@@ -40,7 +41,7 @@ class PluginState(Enum):
 
 
 # =============================================================================
-# Data Classes (preserved from AlgorithmBase)
+# Data Classes
 # =============================================================================
 
 @dataclass
@@ -199,7 +200,7 @@ class Holdings:
         if data.get("created_at"):
             created_at = datetime.fromisoformat(data["created_at"])
 
-        # Support both "plugin" and legacy "algorithm" keys
+        # Support both "plugin" and "algorithm" keys for backward compatibility with old state files
         plugin_name = data.get("plugin", data.get("algorithm", "unknown"))
 
         return cls(
@@ -819,7 +820,7 @@ class PluginBase(ABC):
         return list(self._subscriptions)
 
     # =========================================================================
-    # Shared Holdings Support (preserved from AlgorithmBase)
+    # Shared Holdings Support
     # =========================================================================
 
     @property
@@ -900,7 +901,7 @@ class PluginBase(ABC):
         return holdings.get("total_value", 0.0)
 
     # =========================================================================
-    # Properties (preserved from AlgorithmBase)
+    # Properties
     # =========================================================================
 
     @property
@@ -929,7 +930,7 @@ class PluginBase(ABC):
         return self.IS_SYSTEM_PLUGIN
 
     # =========================================================================
-    # Runtime Parameters Interface (preserved from AlgorithmBase)
+    # Runtime Parameters Interface
     # =========================================================================
 
     def get_parameters(self) -> Dict[str, Any]:
@@ -971,7 +972,7 @@ class PluginBase(ABC):
         return {}
 
     # =========================================================================
-    # Load/Save Methods (preserved from AlgorithmBase)
+    # Load/Save Methods
     # =========================================================================
 
     def load(self) -> bool:
@@ -1054,7 +1055,7 @@ class PluginBase(ABC):
         logger.info(f"Saved instruments for '{self.name}'")
 
     # =========================================================================
-    # Instrument Management (preserved from AlgorithmBase)
+    # Instrument Management
     # =========================================================================
 
     def get_instrument(self, symbol: str) -> Optional[PluginInstrument]:
@@ -1080,7 +1081,7 @@ class PluginBase(ABC):
         return [i.to_contract() for i in self.enabled_instruments]
 
     # =========================================================================
-    # Market Data Management (preserved from AlgorithmBase)
+    # Market Data Management
     # =========================================================================
 
     def set_market_data(self, symbol: str, bars: List[Dict]):
@@ -1102,7 +1103,7 @@ class PluginBase(ABC):
         self._market_data.clear()
 
     # =========================================================================
-    # Execution (preserved from AlgorithmBase)
+    # Execution
     # =========================================================================
 
     def run(self, market_data: Optional[Dict[str, List[Dict]]] = None) -> PluginResult:
@@ -1232,7 +1233,7 @@ class PluginBase(ABC):
         )
 
     # =========================================================================
-    # Utility Methods (preserved from AlgorithmBase)
+    # Utility Methods
     # =========================================================================
 
     def calculate_target_quantities(

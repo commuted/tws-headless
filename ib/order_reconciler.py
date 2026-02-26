@@ -5,9 +5,9 @@ Aggregates orders from multiple plugins trading the same instruments,
 netting them before sending to IB to minimize market impact and costs.
 
 Example:
-    Algorithm A: BUY 100 SPY
-    Algorithm B: SELL 30 SPY
-    Algorithm C: BUY 20 SPY
+    Plugin A: BUY 100 SPY
+    Plugin B: SELL 30 SPY
+    Plugin C: BUY 20 SPY
     --------------------------
     Net order:   BUY 90 SPY (sent to IB)
 """
@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PendingSignal:
-    """A pending trade signal from an algorithm"""
-    algorithm_name: str
+    """A pending trade signal from a plugin"""
+    algorithm_name: str  # plugin name (field name kept for state compatibility)
     signal: TradeSignal
     contract: Contract
     received_at: datetime = field(default_factory=datetime.now)
@@ -49,7 +49,7 @@ class ReconciledOrder:
 
     @property
     def algorithm_breakdown(self) -> Dict[str, Tuple[str, int]]:
-        """Get breakdown of contributions by algorithm"""
+        """Get breakdown of contributions by plugin"""
         breakdown = {}
         for ps in self.contributing_signals:
             breakdown[ps.algorithm_name] = (ps.signal.action, ps.signal.quantity)
@@ -58,20 +58,20 @@ class ReconciledOrder:
 
 @dataclass
 class ExecutionAllocation:
-    """Tracks how an execution should be allocated back to algorithms"""
+    """Tracks how an execution should be allocated back to plugins"""
     symbol: str
     order_id: int
     total_filled: int
     avg_price: float
-    allocations: Dict[str, int] = field(default_factory=dict)  # algo_name -> shares
-    allocation_pcts: Dict[str, float] = field(default_factory=dict)  # algo_name -> percentage (0.0-1.0)
+    allocations: Dict[str, int] = field(default_factory=dict)  # plugin_name -> shares
+    allocation_pcts: Dict[str, float] = field(default_factory=dict)  # plugin_name -> percentage (0.0-1.0)
 
     def get_allocation_pct(self, algorithm_name: str) -> float:
-        """Get allocation percentage for a specific algorithm"""
+        """Get allocation percentage for a specific plugin"""
         return self.allocation_pcts.get(algorithm_name, 0.0)
 
     def is_combined_order(self) -> bool:
-        """Check if this order combines signals from multiple algorithms"""
+        """Check if this order combines signals from multiple plugins"""
         return len(self.allocations) > 1
 
 
@@ -84,7 +84,7 @@ class ReconciliationMode(Enum):
 
 class OrderReconciler:
     """
-    Reconciles and nets orders from multiple algorithms.
+    Reconciles and nets orders from multiple plugins.
 
     Collects pending signals, nets them by symbol, and produces
     reconciled orders for execution.
@@ -92,7 +92,7 @@ class OrderReconciler:
     Usage:
         reconciler = OrderReconciler()
 
-        # Add signals from algorithms
+        # Add signals from plugins
         reconciler.add_signal("algo1", buy_signal, contract)
         reconciler.add_signal("algo2", sell_signal, contract)
 
@@ -330,7 +330,7 @@ class OrderReconciler:
         avg_price: float,
     ) -> Dict[str, Tuple[int, float]]:
         """
-        Allocate a fill back to contributing algorithms.
+        Allocate a fill back to contributing plugins.
 
         Args:
             order_id: The order ID that was filled
@@ -377,7 +377,7 @@ class OrderReconciler:
         """
         Get allocation percentages for an order.
 
-        Used for commission apportionment in multi-algorithm orders.
+        Used for commission apportionment in multi-plugin orders.
 
         Args:
             order_id: The IB order ID
@@ -394,13 +394,13 @@ class OrderReconciler:
 
     def is_combined_order(self, order_id: int) -> bool:
         """
-        Check if an order combines signals from multiple algorithms.
+        Check if an order combines signals from multiple plugins.
 
         Args:
             order_id: The IB order ID
 
         Returns:
-            True if order has multiple contributing algorithms
+            True if order has multiple contributing plugins
         """
         with self._lock:
             allocation = self._execution_allocations.get(order_id)
@@ -422,7 +422,7 @@ class OrderReconciler:
         order.orderType = "MKT"
         order.tif = "DAY"
 
-        # Add reference to algorithms in order reference
+        # Add reference to plugins in order reference
         algo_names = [ps.algorithm_name for ps in reconciled.contributing_signals]
         order.orderRef = f"reconciled:{','.join(algo_names)}"
 

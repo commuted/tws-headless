@@ -298,10 +298,7 @@ class EngineCommandHandler:
         server.register_handler("transfer", self.handle_transfer)
         server.register_handler("reconcile", self.handle_reconcile)
 
-        # Always register plugin and algo commands - they return helpful
-        # errors if the feature isn't enabled
         server.register_handler("plugin", self.handle_plugin)
-        server.register_handler("algo", self.handle_algo)
 
     def handle_status(self, args: List[str]):
         """Handle 'status' command"""
@@ -1263,85 +1260,6 @@ class EngineCommandHandler:
         return CommandResult(
             status=CommandStatus.SUCCESS,
             message="Shutdown initiated",
-        )
-
-    def handle_algo(self, args: List[str]):
-        """Handle 'algo' command - algorithm control"""
-        from .command_server import CommandResult, CommandStatus
-
-        if not self.engine.runner:
-            return CommandResult(
-                status=CommandStatus.ERROR,
-                message="Algorithm runner not available",
-            )
-
-        if not args:
-            return CommandResult(
-                status=CommandStatus.ERROR,
-                message="Usage: algo <list|status|enable|disable|trigger> [name]",
-            )
-
-        subcommand = args[0].lower()
-        subargs = args[1:]
-
-        if subcommand == "list":
-            algos = self.engine.runner.algorithms
-            status_list = {}
-            for name in algos:
-                status = self.engine.runner.get_algorithm_status(name)
-                if status:
-                    status_list[name] = {
-                        "enabled": status["enabled"],
-                        "run_count": status["run_count"],
-                    }
-            return CommandResult(
-                status=CommandStatus.SUCCESS,
-                message=f"{len(algos)} algorithms",
-                data={"algorithms": status_list},
-            )
-
-        elif subcommand == "status" and subargs:
-            status = self.engine.runner.get_algorithm_status(subargs[0])
-            if status:
-                return CommandResult(
-                    status=CommandStatus.SUCCESS,
-                    message=f"Algorithm '{subargs[0]}'",
-                    data=status,
-                )
-            return CommandResult(
-                status=CommandStatus.ERROR,
-                message=f"Algorithm '{subargs[0]}' not found",
-            )
-
-        elif subcommand == "enable" and subargs:
-            self.engine.runner.enable_algorithm(subargs[0], True)
-            return CommandResult(
-                status=CommandStatus.SUCCESS,
-                message=f"Algorithm '{subargs[0]}' enabled",
-            )
-
-        elif subcommand == "disable" and subargs:
-            self.engine.runner.enable_algorithm(subargs[0], False)
-            return CommandResult(
-                status=CommandStatus.SUCCESS,
-                message=f"Algorithm '{subargs[0]}' disabled",
-            )
-
-        elif subcommand == "trigger" and subargs:
-            result = self.engine.runner.trigger_algorithm(subargs[0])
-            if result:
-                return CommandResult(
-                    status=CommandStatus.SUCCESS,
-                    message=f"Algorithm '{subargs[0]}' triggered: {result.signals_count} signals",
-                )
-            return CommandResult(
-                status=CommandStatus.ERROR,
-                message=f"Algorithm '{subargs[0]}' not found",
-            )
-
-        return CommandResult(
-            status=CommandStatus.ERROR,
-            message=f"Unknown algo subcommand: {subcommand}",
         )
 
     def handle_plugin(self, args: List[str]):

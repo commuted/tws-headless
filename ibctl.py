@@ -267,7 +267,7 @@ Commands:
                        Transfer position between plugins
   transfer list PLUGIN Show transferable assets in a plugin
 
-  Plugin commands (require server started with --plugins):
+  Plugin commands:
   All NAME_OR_ID args accept a plugin name or instance_id (UUID).
   Use instance_id to target a specific instance when multiple
   instances of the same plugin are loaded.

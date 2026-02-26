@@ -65,8 +65,14 @@ class MockPluginExecutive:
 
     def __init__(self):
         self._plugins = {
-            "momentum_5day": Mock(state="STARTED", enabled=True, run_count=10, is_system_plugin=False),
-            "mean_reversion": Mock(state="STOPPED", enabled=False, run_count=5, is_system_plugin=False),
+            "momentum_5day": Mock(
+                spec=["state", "enabled", "run_count", "is_system_plugin"],
+                state="STARTED", enabled=True, run_count=10, is_system_plugin=False,
+            ),
+            "mean_reversion": Mock(
+                spec=["state", "enabled", "run_count", "is_system_plugin"],
+                state="STOPPED", enabled=False, run_count=5, is_system_plugin=False,
+            ),
         }
         self.execute_manual_trade_calls = []
 
@@ -148,47 +154,12 @@ class MockPluginExecutive:
         return True, 12345, f"[EXECUTED] {action} {quantity} {symbol}"
 
 
-class MockAlgorithmRunner:
-    """Mock algorithm runner for testing"""
-
-    def __init__(self):
-        self._algorithms = {
-            "test_algo": Mock(enabled=True, run_count=15),
-            "disabled_algo": Mock(enabled=False, run_count=3),
-        }
-
-    @property
-    def algorithms(self):
-        return self._algorithms
-
-    def get_algorithm_status(self, name: str) -> Optional[Dict[str, Any]]:
-        if name not in self._algorithms:
-            return None
-        a = self._algorithms[name]
-        return {
-            "enabled": a.enabled,
-            "run_count": a.run_count,
-        }
-
-    def enable_algorithm(self, name: str, enabled: bool):
-        if name in self._algorithms:
-            self._algorithms[name].enabled = enabled
-
-    def trigger_algorithm(self, name: str):
-        if name not in self._algorithms:
-            return None
-        result = Mock()
-        result.signals_count = 2
-        return result
-
-
 class MockEngine:
     """Mock trading engine for testing"""
 
     def __init__(self):
         self.portfolio = MockPortfolio()
         self.plugin_executive: Optional[MockPluginExecutive] = None
-        self.runner: Optional[MockAlgorithmRunner] = None
         self._paused = False
         self._stopped = False
 
@@ -594,79 +565,6 @@ class TestEngineCommandHandlerStop:
         assert self.engine._stopped == True
 
 
-class TestEngineCommandHandlerAlgo:
-    """Tests for algo command"""
-
-    def setup_method(self):
-        self.engine = MockEngine()
-        self.engine.runner = MockAlgorithmRunner()
-        self.handler = EngineCommandHandler(self.engine)
-
-    def test_algo_no_runner(self):
-        """Test algo command when runner not available"""
-        self.engine.runner = None
-        result = self.handler.handle_algo(["list"])
-        assert result.status == CommandStatus.ERROR
-        assert "not available" in result.message
-
-    def test_algo_missing_subcommand(self):
-        """Test algo without subcommand"""
-        result = self.handler.handle_algo([])
-        assert result.status == CommandStatus.ERROR
-        assert "Usage:" in result.message
-
-    def test_algo_list(self):
-        """Test algo list subcommand"""
-        result = self.handler.handle_algo(["list"])
-        assert result.status == CommandStatus.SUCCESS
-        assert "2 algorithms" in result.message
-        assert "test_algo" in result.data["algorithms"]
-
-    def test_algo_status(self):
-        """Test algo status subcommand"""
-        result = self.handler.handle_algo(["status", "test_algo"])
-        assert result.status == CommandStatus.SUCCESS
-        assert result.data["enabled"] == True
-        assert result.data["run_count"] == 15
-
-    def test_algo_status_not_found(self):
-        """Test algo status with unknown algorithm"""
-        result = self.handler.handle_algo(["status", "unknown"])
-        assert result.status == CommandStatus.ERROR
-        assert "not found" in result.message
-
-    def test_algo_enable(self):
-        """Test algo enable subcommand"""
-        result = self.handler.handle_algo(["enable", "disabled_algo"])
-        assert result.status == CommandStatus.SUCCESS
-        assert "enabled" in result.message
-
-    def test_algo_disable(self):
-        """Test algo disable subcommand"""
-        result = self.handler.handle_algo(["disable", "test_algo"])
-        assert result.status == CommandStatus.SUCCESS
-        assert "disabled" in result.message
-
-    def test_algo_trigger(self):
-        """Test algo trigger subcommand"""
-        result = self.handler.handle_algo(["trigger", "test_algo"])
-        assert result.status == CommandStatus.SUCCESS
-        assert "triggered" in result.message
-        assert "2 signals" in result.message
-
-    def test_algo_trigger_not_found(self):
-        """Test algo trigger with unknown algorithm"""
-        result = self.handler.handle_algo(["trigger", "unknown"])
-        assert result.status == CommandStatus.ERROR
-        assert "not found" in result.message
-
-    def test_algo_unknown_subcommand(self):
-        """Test algo with unknown subcommand"""
-        result = self.handler.handle_algo(["invalid"])
-        assert result.status == CommandStatus.ERROR
-        assert "Unknown algo subcommand" in result.message
-
-
 class TestEngineCommandHandlerPlugin:
     """Tests for plugin command"""
 
@@ -885,7 +783,7 @@ class TestEngineCommandHandlerRegister:
         calls = {call[0][0] for call in server.register_handler.call_args_list}
         expected = {
             "status", "positions", "summary", "liquidate", "stop", "shutdown",
-            "sell", "buy", "trade", "pause", "resume", "plugin", "algo"
+            "sell", "buy", "trade", "pause", "resume", "plugin"
         }
         assert expected.issubset(calls)
 

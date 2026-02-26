@@ -59,7 +59,7 @@ class EngineConfig:
     # Data feed settings
     use_delayed_data: bool = True
 
-    # Algorithm runner settings
+    # Plugin execution settings
     order_mode: OrderExecutionMode = OrderExecutionMode.DRY_RUN
     default_execution_mode: ExecutionMode = ExecutionMode.ON_BAR
     default_bar_timeframe: DataType = DataType.BAR_1MIN
@@ -200,7 +200,7 @@ class TradingEngine:
 
     @property
     def plugin_executive(self) -> Optional[PluginExecutive]:
-        """Get the plugin executive instance (None if using algorithm runner)"""
+        """Get the plugin executive instance"""
         return self._plugin_executive
 
     @property
@@ -526,7 +526,7 @@ class TradingEngine:
         """
         Start the trading engine.
 
-        Connects to IB, loads portfolio, starts data feed and algorithm runner.
+        Connects to IB, loads portfolio, starts data feed and plugin executive.
 
         Returns:
             True if started successfully
