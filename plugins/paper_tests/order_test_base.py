@@ -202,23 +202,48 @@ class OrderTestPluginBase(PluginBase):
         return True
 
     def _cancel_all_test_orders(self):
-        """Cancel every order ID recorded in _results.
+        """Cancel all live test orders recorded in _results.
+
+        Checks the actual order status before cancelling:
+          - FILLED / CANCELLED: skip (already terminal)
+          - INACTIVE: cancel and warn (IB accepted the order but it is
+            not actively working; e.g. condition unmet, outside hours,
+            or unsupported on paper).  Left uncancelled these can
+            execute unexpectedly when the condition is eventually met.
+          - PENDING / SUBMITTED / PARTIALLY_FILLED / UNKNOWN: cancel.
 
         Called before unload and again in stop() as a safety net.
-        cancelOrder is a no-op for orders already filled or cancelled,
-        so it is safe to call multiple times.
         """
-        ids = []
-        for r in self._results:
-            if r.long_order_id is not None:
-                ids.append(r.long_order_id)
-            if r.short_order_id is not None:
-                ids.append(r.short_order_id)
-        if not ids:
+        if not self.portfolio:
             return
-        logger.info(f"[{self.name}] Cancelling {len(ids)} test orders (cleanup)")
-        for oid in ids:
-            self._cancel(oid)
+
+        from ib.models import OrderStatus  # avoid circular at module level
+
+        for r in self._results:
+            for oid in (r.long_order_id, r.short_order_id):
+                if oid is None:
+                    continue
+                rec = self.portfolio.get_order(oid)
+                if rec is None:
+                    # Not tracked — send cancel defensively
+                    logger.warning(f"[{self.name}] Order {oid} not in portfolio records; cancelling defensively")
+                    self._cancel(oid)
+                    continue
+
+                if rec.status in (OrderStatus.FILLED, OrderStatus.CANCELLED):
+                    logger.debug(f"[{self.name}] Order {oid} already {rec.status.value}; skipping")
+                    continue
+
+                if rec.status == OrderStatus.INACTIVE:
+                    logger.warning(
+                        f"[{self.name}] Order {oid} ({rec.symbol} {rec.action} "
+                        f"{rec.order_type}) is INACTIVE — cancelling. "
+                        f"whyHeld may indicate unsupported condition or outside hours."
+                    )
+                else:
+                    logger.info(f"[{self.name}] Cancelling order {oid} ({rec.symbol} {rec.action} {rec.status.value})")
+
+                self._cancel(oid)
 
     def freeze(self) -> bool:
         self.save_state({"results": [r.to_dict() for r in self._results]})

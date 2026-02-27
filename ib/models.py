@@ -331,6 +331,7 @@ class OrderStatus(Enum):
     FILLED = "Filled"
     PARTIALLY_FILLED = "PartiallyFilled"
     CANCELLED = "Cancelled"
+    INACTIVE = "Inactive"   # submitted to IB but not actively working
     ERROR = "Error"
     UNKNOWN = "Unknown"
 
@@ -346,6 +347,7 @@ class OrderStatus(Enum):
             "PartiallyFilled": cls.PARTIALLY_FILLED,
             "Cancelled": cls.CANCELLED,
             "ApiCancelled": cls.CANCELLED,
+            "Inactive": cls.INACTIVE,
             "Error": cls.ERROR,
         }
         return mapping.get(status, cls.UNKNOWN)
