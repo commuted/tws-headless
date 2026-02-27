@@ -309,6 +309,55 @@ class OrderTestPluginBase(PluginBase):
         return None
 
     # -----------------------------------------------------------------------
+    # Post-placement status check
+    # -----------------------------------------------------------------------
+
+    def _check_placement_status(
+        self,
+        test_name: str,
+        oid_a: Optional[int], sym_a: str,
+        oid_b: Optional[int], sym_b: str,
+    ) -> List[str]:
+        """Check order statuses 2 seconds after placement.
+
+        Returns a list of error strings for any order that is INACTIVE
+        or ERROR.  An empty list means both orders look healthy.
+
+        INACTIVE immediately after placement means IB accepted the order
+        but is not working it — typical causes: condition unsupported on
+        this account type, order placed outside market hours, or a
+        problem with the order parameters.  The whyHeld field (if set)
+        gives IB's reason.
+        """
+        from ib.models import OrderStatus
+
+        errors = []
+        for label, oid, sym in (("long", oid_a, sym_a), ("short", oid_b, sym_b)):
+            if oid is None:
+                errors.append(f"{label} order not placed for {sym}")
+                continue
+            rec = self.portfolio.get_order(oid) if self.portfolio else None
+            if rec is None:
+                logger.warning(f"  [{test_name}] {label} order {oid} not found in portfolio records")
+                continue
+            if rec.status == OrderStatus.INACTIVE:
+                why = f" (whyHeld={rec.why_held!r})" if rec.why_held else ""
+                msg = f"{label} order {oid} ({sym} {rec.order_type}) is INACTIVE{why}"
+                logger.warning(f"  [{test_name}] {msg} — cancelling")
+                self._cancel(oid)
+                errors.append(msg)
+            elif rec.status == OrderStatus.ERROR:
+                msg = f"{label} order {oid} ({sym}) ERROR: {rec.error_message}"
+                logger.error(f"  [{test_name}] {msg}")
+                errors.append(msg)
+            else:
+                logger.info(
+                    f"  [{test_name}] {label} order {oid} ({sym}) status: {rec.status.value}"
+                    + (f" whyHeld={rec.why_held!r}" if rec.why_held else "")
+                )
+        return errors
+
+    # -----------------------------------------------------------------------
     # Price fetching
     # -----------------------------------------------------------------------
 
@@ -467,12 +516,24 @@ class OrderTestPluginBase(PluginBase):
             oid_b = self._place(con_b, order_b)
 
             if oid_a is None and oid_b is None:
-                result.error_message = "Failed to submit both orders"
+                result.error_message = "Failed to place both orders (no order ID returned)"
                 result.duration_seconds = time.time() - start
                 return result
 
             result.long_order_id = oid_a
             result.short_order_id = oid_b
+
+            # Wait briefly for IB to send the initial orderStatus callback,
+            # then verify each order is actually in a working state.
+            time.sleep(2.0)
+            placement_errors = self._check_placement_status(
+                tc.name, oid_a, sym_a, oid_b, sym_b
+            )
+            if placement_errors:
+                result.error_message = "; ".join(placement_errors)
+                result.duration_seconds = time.time() - start
+                return result
+
             result.submitted = True
             result.notes = tc.notes
 

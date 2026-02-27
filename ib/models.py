@@ -369,6 +369,7 @@ class OrderRecord:
     submitted_time: str = ""
     filled_time: str = ""
     error_message: str = ""
+    why_held: str = ""  # populated from IB orderStatus whyHeld field
 
     @property
     def is_complete(self) -> bool:

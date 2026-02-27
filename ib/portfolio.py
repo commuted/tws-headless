@@ -1523,6 +1523,8 @@ class Portfolio(IBClient):
             order_record.remaining = remaining
             order_record.avg_fill_price = avgFillPrice
             order_record.last_fill_price = lastFillPrice
+            if whyHeld:
+                order_record.why_held = whyHeld
 
             # Mark completion time if terminal state
             if order_record.is_complete:
