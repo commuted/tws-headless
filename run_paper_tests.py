@@ -9,7 +9,8 @@ paper-trading account.
 Usage:
     ./run_paper_tests.py                      # all order-type plugins (1-5)
     ./run_paper_tests.py --feeds              # feed tests only
-    ./run_paper_tests.py --all                # feeds + all order plugins
+    ./run_paper_tests.py --historical         # historical data tests only
+    ./run_paper_tests.py --all                # feeds + historical + all order plugins
     ./run_paper_tests.py --only 1 3 5         # specific order plugins
     ./run_paper_tests.py --socket /tmp/x.sock # custom socket
     ./run_paper_tests.py --timeout 3600       # per-plugin timeout (seconds)
@@ -38,6 +39,13 @@ FEED_PLUGIN = {
     "module": "plugins.paper_tests.paper_test_feeds",
     "label": "Feed Tests",
     "timeout": 120.0,
+}
+
+HISTORICAL_PLUGIN = {
+    "name": "paper_test_historical",
+    "module": "plugins.paper_tests.paper_test_historical",
+    "label": "Historical Data Tests",
+    "timeout": 300.0,
 }
 
 ORDER_PLUGINS = [
@@ -153,6 +161,28 @@ def _fmt_order_results(results: List[Dict]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_historical_results(results: List[Dict]) -> str:
+    lines = []
+    col = "{:<25} {:<8} {:<10} {:<6} {:<6} {}"
+    lines.append(col.format("Test", "BarSize", "Duration", "Bars", "Pass?", "Detail"))
+    lines.append("-" * 84)
+    for r in results:
+        passed = "PASS" if r.get("passed") else "FAIL"
+        bars = f"{r.get('bars_received', 0)}/{r.get('min_bars_required', 0)}"
+        detail = r.get("error_message") or f"{r.get('first_date', '')}..{r.get('last_date', '')}"
+        lines.append(
+            col.format(
+                r.get("test_name", "?")[:25],
+                r.get("bar_size", "?")[:8],
+                r.get("duration_str", "?")[:10],
+                bars,
+                passed,
+                detail[:50],
+            )
+        )
+    return "\n".join(lines)
+
+
 def _fmt_feed_results(results: List[Dict]) -> str:
     lines = []
     col = "{:<30} {:<8} {:<8} {:<8} {}"
@@ -259,8 +289,11 @@ def run_plugin(plugin_info: Dict, socket_path: str, timeout: float, dry_run: boo
 
     if results:
         print()
-        if "order_type" in (results[0] if results else {}):
+        first = results[0] if results else {}
+        if "order_type" in first:
             print(_fmt_order_results(results))
+        elif "bar_size" in first:
+            print(_fmt_historical_results(results))
         else:
             print(_fmt_feed_results(results))
         print()
@@ -298,10 +331,15 @@ def main():
         help="Run the paper_test_feeds plugin",
     )
     parser.add_argument(
+        "--historical",
+        action="store_true",
+        help="Run the paper_test_historical plugin",
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
         dest="run_all",
-        help="Run feeds + all order plugins",
+        help="Run feeds + historical + all order plugins",
     )
     parser.add_argument(
         "--only",
@@ -321,9 +359,11 @@ def main():
     plugins_to_run: List[Dict] = []
 
     if args.run_all:
-        plugins_to_run = [FEED_PLUGIN] + ORDER_PLUGINS
+        plugins_to_run = [FEED_PLUGIN, HISTORICAL_PLUGIN] + ORDER_PLUGINS
     elif args.feeds:
         plugins_to_run = [FEED_PLUGIN]
+    elif args.historical:
+        plugins_to_run = [HISTORICAL_PLUGIN]
     elif args.only:
         for n in args.only:
             if 1 <= n <= len(ORDER_PLUGINS):
