@@ -27,19 +27,41 @@ from plugins.base import PluginBase, TradeSignal
 logger = logging.getLogger(__name__)
 
 # ===========================================================================
-# ETF pairs: (long_symbol, hedge_symbol)
-# Both symbols should move in the same or predictable relative direction.
-# Pair 0-1 are same-direction twins (both track the same index).
-# Pairs 2-6 are long/inverse so exactly one side fills per market move.
+# ETF pairs: (symbol_a, symbol_b)
+#
+# All pairs use leveraged ETFs for amplified price movement, which makes
+# limit and stop conditions more likely to trigger in the test window.
+#
+# Three underlying pairs, assigned by test characteristics:
+#
+#   TQQQ/SQQQ  – QQQ +3×/−3× (inverse to each other).  Both legs fire in
+#                the same market direction; ideal for immediate-fill tests
+#                (market, MOC, MOO, MTL) where direction does not matter.
+#
+#   SPXU/SDS   – SPY −3×/−2× (same direction, opposite to SPY).  BUY side
+#                fires when SPY rises; SELL side fires when SPY falls.
+#                One leg fills regardless of market direction.
+#
+#   SDOW/DXD   – DOW −3×/−2× (same direction, opposite to DIA).  Same
+#                property as SPXU/SDS on an independent underlying.
+#
+# Index → test use:
+#   0 TQQQ/SQQQ  market / immediate
+#   1 SPXU/SDS   limit
+#   2 SDOW/DXD   stop
+#   3 SPXU/SDS   stop-limit
+#   4 TQQQ/SQQQ  MOC / immediate
+#   5 SDOW/DXD   MOO / immediate
+#   6 TQQQ/SQQQ  MTL / immediate
 # ===========================================================================
 ETF_PAIRS: List[Tuple[str, str]] = [
-    ("QQQ",  "QQQM"),   # 0 – NASDAQ-100 twins (same direction)
-    ("SPY",  "VOO"),    # 1 – S&P 500 twins    (same direction)
-    ("QQQ",  "PSQ"),    # 2 – NASDAQ-100 long / inverse
-    ("DIA",  "DOG"),    # 3 – Dow Jones long   / inverse
-    ("SH",   "SPXS"),   # 4 – S&P 500 inverse  / 3× inverse
-    ("IWM",  "RWM"),    # 5 – Russell 2000 long / inverse
-    ("EEM",  "EEV"),    # 6 – EM long           / 2× inverse
+    ("TQQQ", "SQQQ"),   # 0 – QQQ +3× / −3× inverse
+    ("SPXU", "SDS"),    # 1 – SPY −3× / −2× (same dir; one fires either way)
+    ("SDOW", "DXD"),    # 2 – DOW −3× / −2× (same dir; one fires either way)
+    ("SPXU", "SDS"),    # 3 – SPY −3× / −2× (same dir; one fires either way)
+    ("TQQQ", "SQQQ"),   # 4 – QQQ +3× / −3× inverse
+    ("SDOW", "DXD"),    # 5 – DOW −3× / −2× (same dir; one fires either way)
+    ("TQQQ", "SQQQ"),   # 6 – QQQ +3× / −3× inverse
 ]
 
 # Quantity for all test orders (1 share – small footprint on paper account)
