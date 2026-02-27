@@ -143,13 +143,13 @@ _CASES: List[HistoricalTestCase] = [
         name="forex_hourly_eurusd",
         contract_fn=lambda: ContractBuilder.forex("EUR", "USD"),
         end_date_time="",
-        duration_str="1 D",
+        duration_str="2 D",
         bar_size_setting="1 hour",
         what_to_show="MIDPOINT",
         use_rth=False,
         min_bars=20,
         timeout=30.0,
-        notes="EUR.USD hourly bars, 1 day — expect ~24 bars",
+        notes="EUR.USD hourly bars, 2 days — expect ~48 bars (24/5 forex market)",
     ),
 ]
 
