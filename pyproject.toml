@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ib-portfolio"
 version = "0.1.0"
-description = "Interactive Brokers Portfolio Rebalancer"
+description = "Interactive Brokers headless plugin based trading solution"
 requires-python = ">=3.10"
 dependencies = [
     "ibapi",
