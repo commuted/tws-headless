@@ -13,6 +13,7 @@ Provides the foundation for implementing trading plugins with:
 import json
 import logging
 import os
+import threading
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -702,6 +703,77 @@ class PluginBase(ABC):
         if not self._executive:
             return False
         return self._executive.stream_manager.cancel_stream(self.name, symbol)
+
+    def get_historical_data(
+        self,
+        contract: Contract,
+        end_date_time: str = "",
+        duration_str: str = "1 W",
+        bar_size_setting: str = "1 day",
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+        timeout: float = 60.0,
+    ) -> Optional[List]:
+        """
+        Fetch historical bar data and block until complete or timeout.
+
+        Data is private to this plugin — each call allocates its own
+        request ID so concurrent calls from different plugins never mix.
+
+        Args:
+            contract:         IB Contract (use ContractBuilder helpers)
+            end_date_time:    End of period as "YYYYMMDD HH:MM:SS [tz]",
+                              or "" for now
+            duration_str:     How far back: "1 D", "1 W", "1 M", "1 Y", etc.
+            bar_size_setting: Bar width: "1 day", "1 hour", "5 mins", etc.
+            what_to_show:     TRADES, MIDPOINT, BID, ASK, ADJUSTED_LAST, etc.
+            use_rth:          Regular trading hours only
+            timeout:          Seconds to wait before giving up (default 60)
+
+        Returns:
+            List of ibapi BarData objects (attributes: date, open, high,
+            low, close, volume, wap, barCount), or None on timeout/error.
+
+        Example:
+            bars = self.get_historical_data(
+                contract=ContractBuilder.us_stock("AAPL"),
+                duration_str="1 W",
+                bar_size_setting="1 day",
+            )
+            if bars:
+                for b in bars:
+                    print(b.date, b.close)
+        """
+        if not self.portfolio:
+            logger.warning(f"Plugin '{self.name}': no portfolio for historical data")
+            return None
+
+        done = threading.Event()
+        result: Dict[str, Any] = {}
+
+        def on_end(bars: list, start: str, end: str) -> None:
+            result["bars"] = bars
+            done.set()
+
+        req_id = self.portfolio.request_historical_data(
+            contract=contract,
+            end_date_time=end_date_time,
+            duration_str=duration_str,
+            bar_size_setting=bar_size_setting,
+            what_to_show=what_to_show,
+            use_rth=use_rth,
+            on_end=on_end,
+        )
+
+        if not done.wait(timeout=timeout):
+            logger.warning(
+                f"Plugin '{self.name}': historical data timeout "
+                f"after {timeout}s (req_id={req_id})"
+            )
+            self.portfolio.cancel_historical_data(req_id)
+            return None
+
+        return result.get("bars", [])
 
     def request_unload(self) -> bool:
         """

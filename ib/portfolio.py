@@ -107,6 +107,10 @@ class Portfolio(IBClient):
         self._on_bar: Optional[Callable[[Bar], None]] = None
         self._last_bars: Dict[str, Bar] = {}  # symbol -> last bar
 
+        # Historical data requests (one-shot, per-requester callbacks)
+        # reqId -> (on_bar_cb, on_end_cb, accumulated_bars)
+        self._historical_requests: Dict[int, tuple] = {}
+
         # Account data
         self._account_summary: Dict[str, AccountSummary] = {}
         self._account_summary_done = Event()
@@ -627,6 +631,68 @@ class Portfolio(IBClient):
         del self._bar_req_ids[symbol]
 
         logger.debug(f"Stopped bar stream for {symbol}")
+
+    # =========================================================================
+    # Historical Data
+    # =========================================================================
+
+    def request_historical_data(
+        self,
+        contract,
+        end_date_time: str = "",
+        duration_str: str = "1 W",
+        bar_size_setting: str = "1 day",
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+        on_bar: Optional[Callable] = None,
+        on_end: Optional[Callable] = None,
+    ) -> int:
+        """
+        Request historical bar data from IB.
+
+        Each call allocates its own request ID so multiple concurrent
+        requests from different plugins never interfere.
+
+        Args:
+            contract:         IB Contract to fetch data for
+            end_date_time:    End of the requested period ("" = now)
+            duration_str:     How far back to go, e.g. "1 W", "3 M", "1 Y"
+            bar_size_setting: Bar width, e.g. "1 day", "1 hour", "5 mins"
+            what_to_show:     TRADES, MIDPOINT, BID, ASK, etc.
+            use_rth:          Regular trading hours only
+            on_bar:           Optional callback(bar) called for each bar as it arrives
+            on_end:           Callback(bars, start, end) called when request completes
+
+        Returns:
+            Request ID (pass to cancel_historical_data() to abort early)
+        """
+        req_id = self.get_next_req_id()
+        self._historical_requests[req_id] = (on_bar, on_end, [])
+        logger.debug(
+            f"reqHistoricalData req_id={req_id} "
+            f"duration={duration_str} bar_size={bar_size_setting} "
+            f"what_to_show={what_to_show}"
+        )
+        self.reqHistoricalData(
+            req_id,
+            contract,
+            end_date_time,
+            duration_str,
+            bar_size_setting,
+            what_to_show,
+            1 if use_rth else 0,
+            1,      # formatDate=1 → human-readable date strings
+            False,  # keepUpToDate=False → one-shot historical fetch
+            [],
+        )
+        return req_id
+
+    def cancel_historical_data(self, req_id: int) -> None:
+        """Cancel an in-progress historical data request."""
+        if req_id in self._historical_requests:
+            self.cancelHistoricalData(req_id)
+            del self._historical_requests[req_id]
+            logger.debug(f"Cancelled historical data request req_id={req_id}")
 
     # =========================================================================
     # Order Placement and Management
@@ -1189,6 +1255,39 @@ class Portfolio(IBClient):
         # Also invoke registered callback
         if "bar" in self._callbacks:
             self._callbacks["bar"](bar)
+
+    # =========================================================================
+    # EWrapper Callbacks for Historical Data
+    # =========================================================================
+
+    def historicalData(self, reqId: int, bar) -> None:
+        """IB callback: one bar of historical data has arrived."""
+        entry = self._historical_requests.get(reqId)
+        if entry is None:
+            return
+        on_bar, _on_end, bars = entry
+        bars.append(bar)
+        if on_bar:
+            try:
+                on_bar(bar)
+            except Exception as e:
+                logger.error(f"Error in historicalData on_bar callback: {e}")
+
+    def historicalDataEnd(self, reqId: int, start: str, end: str) -> None:
+        """IB callback: historical data request is complete."""
+        entry = self._historical_requests.pop(reqId, None)
+        if entry is None:
+            return
+        _on_bar, on_end, bars = entry
+        logger.debug(
+            f"historicalDataEnd req_id={reqId} bars={len(bars)} "
+            f"start={start} end={end}"
+        )
+        if on_end:
+            try:
+                on_end(bars, start, end)
+            except Exception as e:
+                logger.error(f"Error in historicalDataEnd on_end callback: {e}")
 
     # =========================================================================
     # EWrapper Callbacks for Account Summary
