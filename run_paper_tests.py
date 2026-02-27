@@ -48,6 +48,17 @@ HISTORICAL_PLUGIN = {
     "timeout": 300.0,
 }
 
+# Pair run together to test StreamManager shared-subscription paths
+DUAL_FEED_PLUGINS = [
+    FEED_PLUGIN,
+    {
+        "name": "paper_test_feeds_2",
+        "module": "plugins.paper_tests.paper_test_feeds_2",
+        "label": "Feed Tests 2 (concurrent)",
+        "timeout": 120.0,
+    },
+]
+
 ORDER_PLUGINS = [
     {
         "name": "paper_test_orders_1",
@@ -228,6 +239,90 @@ def _print_summary(label: str, summary: Dict):
 # Per-plugin runner
 # ---------------------------------------------------------------------------
 
+def _load_and_start(plugin_info: Dict, socket_path: str) -> bool:
+    """Load and start one plugin. Returns True on success."""
+    name = plugin_info["name"]
+    module = plugin_info["module"]
+    if _is_loaded(name, socket_path):
+        print(f"  Plugin '{name}' already loaded — skipping load step")
+    else:
+        print(f"  Loading {module} ...", end=" ", flush=True)
+        ok, msg, _ = _cmd(f"plugin load {module}", socket_path, timeout=15.0)
+        if not ok:
+            print(f"FAILED\n  {msg}")
+            return False
+        print("OK")
+    print(f"  Starting '{name}' ...", end=" ", flush=True)
+    ok, msg, _ = _cmd(f"plugin start {name}", socket_path, timeout=15.0)
+    if not ok:
+        print(f"FAILED\n  {msg}")
+        return False
+    print("OK")
+    return True
+
+
+def run_plugins_parallel(
+    plugin_infos: List[Dict],
+    socket_path: str,
+    timeout: float,
+    dry_run: bool,
+) -> bool:
+    """Load all plugins sequentially, then run their tests concurrently."""
+    if dry_run:
+        for info in plugin_infos:
+            print(f"  [DRY-RUN] Would load {info['module']} and run concurrently")
+        return True
+
+    # Load and start all plugins before firing off concurrent run_tests calls.
+    # Sequential here avoids racing on the socket and makes errors easy to read.
+    for info in plugin_infos:
+        if not _load_and_start(info, socket_path):
+            return False
+
+    print(f"\n  Launching {len(plugin_infos)} plugins concurrently ...\n")
+
+    results_map: Dict[str, Tuple[bool, str, Dict, float]] = {}
+    lock = threading.Lock()
+
+    def _run_one(info: Dict):
+        name = info["name"]
+        t0 = time.time()
+        ok, msg, data = _cmd(
+            f"plugin request {name} run_tests", socket_path, timeout=timeout
+        )
+        elapsed = time.time() - t0
+        with lock:
+            results_map[name] = (ok, msg, data, elapsed)
+
+    threads = [
+        threading.Thread(target=_run_one, args=(info,), daemon=True)
+        for info in plugin_infos
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    overall_ok = True
+    for info in plugin_infos:
+        name = info["name"]
+        label = info["label"]
+        ok, msg, data, elapsed = results_map.get(name, (False, "no result", {}, 0.0))
+        print(f"\n  --- {label} ({elapsed:.1f}s) ---")
+        if not ok:
+            print(f"  [ERROR] {msg}")
+            overall_ok = False
+            continue
+        results = data.get("results", [])
+        summary = data.get("summary", {})
+        if results:
+            print(_fmt_feed_results(results))
+        if summary:
+            _print_summary(label, summary)
+
+    return overall_ok
+
+
 def run_plugin(plugin_info: Dict, socket_path: str, timeout: float, dry_run: bool) -> bool:
     """Load, start, run tests, and report for one plugin. Returns True on success."""
     name = plugin_info["name"]
@@ -331,6 +426,12 @@ def main():
         help="Run the paper_test_feeds plugin",
     )
     parser.add_argument(
+        "--feeds-dual",
+        action="store_true",
+        dest="feeds_dual",
+        help="Run two feed test instances concurrently (tests StreamManager sharing)",
+    )
+    parser.add_argument(
         "--historical",
         action="store_true",
         help="Run the paper_test_historical plugin",
@@ -357,6 +458,20 @@ def main():
 
     # Build plugin list
     plugins_to_run: List[Dict] = []
+
+    if args.feeds_dual:
+        if not args.dry_run:
+            ok, msg, _ = _cmd("status", args.socket, timeout=10.0)
+            if not ok:
+                print(f"[ERROR] Cannot reach engine at {args.socket}: {msg}")
+                sys.exit(1)
+            print(f"Engine is up: {msg.splitlines()[0]}")
+        timeout = args.timeout or DUAL_FEED_PLUGINS[0]["timeout"]
+        print(f"\nRunning {len(DUAL_FEED_PLUGINS)} feed plugins concurrently (timeout={timeout:.0f}s):")
+        for p in DUAL_FEED_PLUGINS:
+            print(f"  {p['label']}")
+        success = run_plugins_parallel(DUAL_FEED_PLUGINS, args.socket, timeout, args.dry_run)
+        sys.exit(0 if success else 1)
 
     if args.run_all:
         plugins_to_run = [FEED_PLUGIN, HISTORICAL_PLUGIN] + ORDER_PLUGINS

@@ -71,9 +71,10 @@ class PaperTestFeedsPlugin(PluginBase):
         portfolio=None,
         shared_holdings=None,
         message_bus=None,
+        name: str = "paper_test_feeds",
     ):
         super().__init__(
-            "paper_test_feeds",
+            name,
             base_path,
             portfolio,
             shared_holdings,
