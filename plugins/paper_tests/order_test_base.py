@@ -196,9 +196,29 @@ class OrderTestPluginBase(PluginBase):
 
     def stop(self) -> bool:
         logger.info(f"Stopping plugin '{self.name}'")
+        self._cancel_all_test_orders()
         self.save_state({"results": [r.to_dict() for r in self._results]})
         self.unsubscribe_all()
         return True
+
+    def _cancel_all_test_orders(self):
+        """Cancel every order ID recorded in _results.
+
+        Called before unload and again in stop() as a safety net.
+        cancelOrder is a no-op for orders already filled or cancelled,
+        so it is safe to call multiple times.
+        """
+        ids = []
+        for r in self._results:
+            if r.long_order_id is not None:
+                ids.append(r.long_order_id)
+            if r.short_order_id is not None:
+                ids.append(r.short_order_id)
+        if not ids:
+            return
+        logger.info(f"[{self.name}] Cancelling {len(ids)} test orders (cleanup)")
+        for oid in ids:
+            self._cancel(oid)
 
     def freeze(self) -> bool:
         self.save_state({"results": [r.to_dict() for r in self._results]})
@@ -483,6 +503,7 @@ class OrderTestPluginBase(PluginBase):
                 f"{summary['filled']}/{summary['total']} filled"
             )
 
+            self._cancel_all_test_orders()
             self.request_unload()
 
             return {
