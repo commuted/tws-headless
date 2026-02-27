@@ -1,0 +1,237 @@
+{
+  "version": "1.0",
+  "description": "Approved tradeable securities pool",
+  "securities": [
+    {
+      "symbol": "VUG",
+      "name": "Vanguard Growth ETF",
+      "category": "equity",
+      "sub_category": "large_cap_growth",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Large-cap US growth stocks"
+    },
+    {
+      "symbol": "VTV",
+      "name": "Vanguard Value ETF",
+      "category": "equity",
+      "sub_category": "large_cap_value",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Large-cap US value stocks"
+    },
+    {
+      "symbol": "IJR",
+      "name": "iShares Core S&P Small-Cap ETF",
+      "category": "equity",
+      "sub_category": "small_cap",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "US small-cap stocks"
+    },
+    {
+      "symbol": "VWO",
+      "name": "Vanguard FTSE Emerging Markets ETF",
+      "category": "equity",
+      "sub_category": "emerging_markets",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Emerging market equities"
+    },
+    {
+      "symbol": "GOVT",
+      "name": "iShares U.S. Treasury Bond ETF",
+      "category": "fixed_income",
+      "sub_category": "government",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "US Treasury bonds across maturities"
+    },
+    {
+      "symbol": "HYG",
+      "name": "iShares iBoxx $ High Yield Corporate Bond ETF",
+      "category": "fixed_income",
+      "sub_category": "high_yield",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "High yield corporate bonds"
+    },
+    {
+      "symbol": "BNDX",
+      "name": "Vanguard Total International Bond ETF",
+      "category": "fixed_income",
+      "sub_category": "international",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "International investment-grade bonds"
+    },
+    {
+      "symbol": "USO",
+      "name": "United States Oil Fund",
+      "category": "commodities",
+      "sub_category": "energy",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Crude oil futures"
+    },
+    {
+      "symbol": "GLD",
+      "name": "SPDR Gold Trust",
+      "category": "commodities",
+      "sub_category": "precious_metals",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Physical gold"
+    },
+    {
+      "symbol": "DBB",
+      "name": "Invesco DB Base Metals Fund",
+      "category": "commodities",
+      "sub_category": "industrial_metals",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Industrial base metals (aluminum, copper, zinc)"
+    },
+    {
+      "symbol": "DBA",
+      "name": "Invesco DB Agriculture Fund",
+      "category": "commodities",
+      "sub_category": "agriculture",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Agricultural commodities"
+    },
+    {
+      "symbol": "REZ",
+      "name": "iShares Residential and Multisector Real Estate ETF",
+      "category": "real_estate",
+      "sub_category": "residential",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Residential REITs"
+    },
+    {
+      "symbol": "INDS",
+      "name": "Pacer Industrial Real Estate ETF",
+      "category": "real_estate",
+      "sub_category": "industrial",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Industrial REITs"
+    },
+    {
+      "symbol": "RTH",
+      "name": "VanEck Retail ETF",
+      "category": "real_estate",
+      "sub_category": "retail",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Retail sector"
+    },
+    {
+      "symbol": "SRVR",
+      "name": "Pacer Data & Infrastructure Real Estate ETF",
+      "category": "real_estate",
+      "sub_category": "office",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Data centers and infrastructure REITs"
+    },
+    {
+      "symbol": "UUP",
+      "name": "Invesco DB US Dollar Index Bullish Fund",
+      "category": "currencies",
+      "sub_category": "majors_usd",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Long USD vs major currencies"
+    },
+    {
+      "symbol": "FXE",
+      "name": "Invesco CurrencyShares Euro Trust",
+      "category": "currencies",
+      "sub_category": "majors_eur",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Euro currency"
+    },
+    {
+      "symbol": "CEW",
+      "name": "WisdomTree Emerging Currency Strategy Fund",
+      "category": "currencies",
+      "sub_category": "emerging_markets",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Emerging market currencies"
+    },
+    {
+      "symbol": "BIL",
+      "name": "SPDR Bloomberg 1-3 Month T-Bill ETF",
+      "category": "cash",
+      "sub_category": "treasury_bills",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Short-term Treasury bills"
+    },
+    {
+      "symbol": "FLOT",
+      "name": "iShares Floating Rate Bond ETF",
+      "category": "cash",
+      "sub_category": "commercial_paper",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Floating rate investment-grade bonds"
+    },
+    {
+      "symbol": "JPST",
+      "name": "JPMorgan Ultra-Short Income ETF",
+      "category": "cash",
+      "sub_category": "money_market",
+      "exchange": "SMART",
+      "currency": "USD",
+      "sec_type": "STK",
+      "enabled": true,
+      "notes": "Ultra-short duration bonds"
+    }
+  ]
+}
