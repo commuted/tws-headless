@@ -251,9 +251,12 @@ class PluginLoader:
         module = self._loaded_modules[plugin_name]
         module_name = module.__name__
 
-        # Remove from sys.modules
-        if module_name in sys.modules:
-            del sys.modules[module_name]
+        # Remove the package and all submodules from sys.modules so that a
+        # subsequent load always picks up the latest code on disk.
+        prefix = module_name + "."
+        stale = [k for k in sys.modules if k == module_name or k.startswith(prefix)]
+        for k in stale:
+            del sys.modules[k]
 
         del self._loaded_modules[plugin_name]
         logger.info(f"Unloaded plugin module for '{plugin_name}'")

@@ -851,6 +851,52 @@ class PluginBase(ABC):
 
         return result.get("bars", [])
 
+    def get_contract_details(
+        self,
+        contract,
+        timeout: float = 15.0,
+    ) -> Optional[List]:
+        """
+        Fetch contract details and block until complete or timeout.
+
+        Each call allocates its own request ID so concurrent calls from
+        different plugins never interfere.
+
+        Args:
+            contract: IB Contract to look up
+            timeout:  Seconds to wait (default 15)
+
+        Returns:
+            List of ContractDetails objects, or None on timeout/error.
+            Useful fields include:
+              cd.tradingHours  — e.g. "20260303:0930-20260303:1600;..."
+              cd.liquidHours   — same format, regular-hours only
+              cd.timeZoneId    — e.g. "America/New_York"
+        """
+        if not self.portfolio:
+            logger.warning(f"Plugin '{self.name}': no portfolio for contract details")
+            return None
+
+        done = threading.Event()
+        result: Dict[str, Any] = {}
+
+        def on_end(details: list) -> None:
+            result["details"] = details
+            done.set()
+
+        self.portfolio.request_contract_details(
+            contract=contract,
+            on_end=on_end,
+        )
+
+        if not done.wait(timeout=timeout):
+            logger.warning(
+                f"Plugin '{self.name}': contract details timeout after {timeout}s"
+            )
+            return None
+
+        return result.get("details", [])
+
     def request_unload(self) -> bool:
         """
         Request that the executive unload this plugin.

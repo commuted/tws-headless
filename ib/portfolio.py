@@ -137,6 +137,10 @@ class Portfolio(IBClient):
         # reqId -> (on_bar_cb, on_end_cb, accumulated_bars)
         self._historical_requests: Dict[int, tuple] = {}
 
+        # Contract details requests
+        # reqId -> (on_details_cb, on_end_cb, accumulated_details)
+        self._contract_details_requests: Dict[int, tuple] = {}
+
         # Account data
         self._account_summary: Dict[str, AccountSummary] = {}
         self._account_summary_done = asyncio.Event()
@@ -1009,6 +1013,29 @@ class Portfolio(IBClient):
             del self._historical_requests[req_id]
             logger.debug(f"Cancelled historical data request req_id={req_id}")
 
+    def request_contract_details(
+        self,
+        contract,
+        on_details=None,
+        on_end=None,
+    ) -> int:
+        """
+        Request contract details from IB.
+
+        Args:
+            contract:   IB Contract to look up
+            on_details: Optional callback(ContractDetails) called for each result
+            on_end:     Callback(details_list) called when the request is complete
+
+        Returns:
+            Request ID (unique per call; IB sends back this reqId in callbacks)
+        """
+        req_id = self.get_next_req_id()
+        self._contract_details_requests[req_id] = (on_details, on_end, [])
+        logger.debug(f"reqContractDetails req_id={req_id} symbol={getattr(contract, 'symbol', '?')}")
+        self.reqContractDetails(req_id, contract)
+        return req_id
+
     # =========================================================================
     # Order Placement and Management
     # =========================================================================
@@ -1750,6 +1777,36 @@ class Portfolio(IBClient):
                 on_end(bars, start, end)
             except Exception as e:
                 logger.error(f"Error in historicalDataEnd on_end callback: {e}")
+
+    # =========================================================================
+    # EWrapper Callbacks for Contract Details
+    # =========================================================================
+
+    def contractDetails(self, reqId: int, contractDetails) -> None:
+        """IB callback: one ContractDetails object has arrived."""
+        entry = self._contract_details_requests.get(reqId)
+        if entry is None:
+            return
+        on_details, _on_end, accumulated = entry
+        accumulated.append(contractDetails)
+        if on_details:
+            try:
+                on_details(contractDetails)
+            except Exception as e:
+                logger.error(f"Error in contractDetails on_details callback: {e}")
+
+    def contractDetailsEnd(self, reqId: int) -> None:
+        """IB callback: all ContractDetails for this reqId have arrived."""
+        entry = self._contract_details_requests.pop(reqId, None)
+        if entry is None:
+            return
+        _on_details, on_end, accumulated = entry
+        logger.debug(f"contractDetailsEnd req_id={reqId} count={len(accumulated)}")
+        if on_end:
+            try:
+                on_end(accumulated)
+            except Exception as e:
+                logger.error(f"Error in contractDetailsEnd on_end callback: {e}")
 
     # =========================================================================
     # EWrapper Callbacks for Account Summary
