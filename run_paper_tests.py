@@ -10,8 +10,9 @@ Usage:
     ./run_paper_tests.py                      # all order-type plugins (1-5)
     ./run_paper_tests.py --feeds              # feed tests only
     ./run_paper_tests.py --historical         # historical data tests only
-    ./run_paper_tests.py --all                # feeds + historical + all order plugins
+    ./run_paper_tests.py --all                # feeds + historical + all order plugins + orders6
     ./run_paper_tests.py --only 1 3 5         # specific order plugins
+    ./run_paper_tests.py --orders6            # round-trip lifecycle tests (orders 6)
     ./run_paper_tests.py --interface          # interface validation tests only
     ./run_paper_tests.py --socket /tmp/x.sock # custom socket
     ./run_paper_tests.py --timeout 3600       # per-plugin timeout (seconds)
@@ -99,6 +100,13 @@ ORDER_PLUGINS = [
         "timeout": 2700.0,
     },
 ]
+
+ORDERS_6_PLUGIN = {
+    "name": "paper_test_orders_6",
+    "module": "plugins.paper_tests.paper_test_orders_6",
+    "label": "Orders 6 — Round-trip lifecycle: IOC/GTC/FOK, Adaptive algo, Iceberg",
+    "timeout": 2700.0,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +207,46 @@ def _fmt_order_results(results: List[Dict]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_roundtrip_results(results: List[Dict]) -> str:
+    lines = []
+    col = "{:<22} {:<16} {:<6} {:<10} {:<10} {:<9} {}"
+    lines.append(col.format("Test", "Type", "Pass?", "Entry@", "Exit@", "PnL", "Notes"))
+    lines.append("-" * 100)
+    for r in results:
+        passed = "PASS" if r.get("passed") else "FAIL"
+        if r.get("expected_no_fill"):
+            entry_s = "—"
+            exit_s = "—"
+            pnl_s = "—"
+            status = "CONFIRMED" if r.get("no_fill_confirmed") else "MISS"
+            notes = r.get("notes") or status
+        elif r.get("error_message"):
+            entry_s = "—"
+            exit_s = "—"
+            pnl_s = "—"
+            notes = r.get("error_message", "")[:45]
+        else:
+            ep = r.get("entry_fill_price", 0)
+            xp = r.get("exit_fill_price", 0)
+            entry_s = f"${ep:.3f}" if ep else "pending"
+            exit_s = f"${xp:.3f}" if xp else "pending"
+            pnl = r.get("net_pnl", 0)
+            pnl_s = f"${pnl:+.3f}" if r.get("round_trip_complete") else "—"
+            notes = r.get("notes") or ("roundtrip" if r.get("round_trip_complete") else "open")
+        lines.append(
+            col.format(
+                r.get("test_name", "?")[:22],
+                r.get("order_type", "?")[:16],
+                passed,
+                entry_s[:10],
+                exit_s[:10],
+                pnl_s[:9],
+                str(notes)[:45],
+            )
+        )
+    return "\n".join(lines)
+
+
 def _fmt_historical_results(results: List[Dict]) -> str:
     lines = []
     col = "{:<25} {:<8} {:<10} {:<6} {:<6} {}"
@@ -243,9 +291,29 @@ def _fmt_feed_results(results: List[Dict]) -> str:
 
 def _print_summary(label: str, summary: Dict):
     total = summary.get("total", 0)
+    errors = summary.get("errors", [])
+
+    # Round-trip summary (orders 6)
+    if "round_trips" in summary:
+        passed = summary.get("passed", 0)
+        round_trips = summary.get("round_trips", 0)
+        no_fill_ok = summary.get("no_fill_confirmed", 0)
+        total_pnl = summary.get("total_pnl", 0.0)
+        parts = [
+            f"passed={passed}/{total}",
+            f"round_trips={round_trips}",
+            f"no_fill_confirmed={no_fill_ok}",
+            f"pnl=${total_pnl:+.3f}",
+        ]
+        if errors:
+            parts.append(f"errors={len(errors)} ({', '.join(errors[:3])})")
+        ok = not errors and passed == total
+        marker = "[PASS]" if ok else "[WARN]"
+        print(f"  {marker} {label}: {', '.join(parts)}")
+        return
+
     filled = summary.get("filled", summary.get("passed", 0))
     stubs = summary.get("stubs", 0)
-    errors = summary.get("errors", [])
     submitted = summary.get("submitted", 0)
 
     parts = []
@@ -412,7 +480,9 @@ def run_plugin(plugin_info: Dict, socket_path: str, timeout: float, dry_run: boo
     if results:
         print()
         first = results[0] if results else {}
-        if "order_type" in first:
+        if "round_trip_complete" in first:
+            print(_fmt_roundtrip_results(results))
+        elif "order_type" in first:
             print(_fmt_order_results(results))
         elif "bar_size" in first:
             print(_fmt_historical_results(results))
@@ -471,10 +541,15 @@ def main():
         help="Run the paper_test_interface plugin (PluginBase interface validation)",
     )
     parser.add_argument(
+        "--orders6",
+        action="store_true",
+        help="Run the paper_test_orders_6 plugin (round-trip lifecycle tests)",
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
         dest="run_all",
-        help="Run feeds + historical + all order plugins",
+        help="Run feeds + historical + all order plugins (1-5) + orders6",
     )
     parser.add_argument(
         "--only",
@@ -508,9 +583,15 @@ def main():
         sys.exit(0 if success else 1)
 
     if args.run_all:
-        plugins_to_run = [INTERFACE_PLUGIN, FEED_PLUGIN, HISTORICAL_PLUGIN] + ORDER_PLUGINS
+        plugins_to_run = (
+            [INTERFACE_PLUGIN, FEED_PLUGIN, HISTORICAL_PLUGIN]
+            + ORDER_PLUGINS
+            + [ORDERS_6_PLUGIN]
+        )
     elif args.interface:
         plugins_to_run = [INTERFACE_PLUGIN]
+    elif args.orders6:
+        plugins_to_run = [ORDERS_6_PLUGIN]
     elif args.feeds:
         plugins_to_run = [FEED_PLUGIN]
     elif args.historical:
@@ -522,7 +603,7 @@ def main():
             else:
                 print(f"Warning: no order plugin #{n} (valid: 1-{len(ORDER_PLUGINS)})")
     else:
-        # Default: all order plugins
+        # Default: all order plugins (1-5, not 6 — 6 must be opted in explicitly)
         plugins_to_run = ORDER_PLUGINS
 
     if not plugins_to_run:
