@@ -163,7 +163,7 @@ class Portfolio(IBClient):
 
         # Commission tracking - maps exec_id to commission report
         self._commission_reports: Dict[str, "CommissionAndFeesReport"] = {}
-        self._on_commission: Optional[Callable[[str, float, float], None]] = None
+        self._on_commission: Optional[Callable[[str, float, float, str], None]] = None
 
         # Tick-by-tick subscriptions
         self._tbt_subscriptions: Dict[int, str] = {}   # reqId -> symbol
@@ -180,7 +180,7 @@ class Portfolio(IBClient):
         self._pnl_req_id: Optional[int] = None                  # account-level reqId
         self._pnl_single_req_ids: Dict[int, str] = {}           # reqId -> symbol
         self._pnl_single_symbols: Dict[str, int] = {}           # symbol -> reqId
-        self._on_pnl: Optional[Callable] = None                 # fires for both account + single
+        self._on_pnl: Optional[Callable[[PnLData], None]] = None  # fires for both account + single
 
     @property
     def positions(self) -> List[Position]:
@@ -350,6 +350,8 @@ class Portfolio(IBClient):
 
     def pnl(self, reqId: int, dailyPnL: float, unrealizedPnL: float, realizedPnL: float):
         """Called by IB for account-level P&L updates (reqPnL)."""
+        if not self.managed_accounts:
+            logger.warning("pnl() called but managed_accounts is empty; account will be ''")
         account = self.managed_accounts[0] if self.managed_accounts else ""
         pnl_data = PnLData(
             account=account,
@@ -374,7 +376,13 @@ class Portfolio(IBClient):
         value: float,
     ):
         """Called by IB for per-position P&L updates (reqPnLSingle)."""
-        symbol = self._pnl_single_req_ids.get(reqId, "")
+        symbol = self._pnl_single_req_ids.get(reqId)
+        if symbol is None:
+            logger.warning(
+                f"pnlSingle() received unknown reqId={reqId}; "
+                "callback may have fired after cancel"
+            )
+            symbol = ""
         account = self.managed_accounts[0] if self.managed_accounts else ""
         pnl_data = PnLData(
             account=account,
@@ -2136,7 +2144,7 @@ class Portfolio(IBClient):
 
         # Notify callback if registered
         if self._on_commission:
-            self._on_commission(exec_id, commission, realized_pnl)
+            self._on_commission(exec_id, commission, realized_pnl, currency)
 
         if "commissionReport" in self._callbacks:
             self._callbacks["commissionReport"](commissionAndFeesReport)

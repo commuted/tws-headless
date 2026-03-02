@@ -3241,6 +3241,7 @@ class PluginExecutive:
         exec_id: str,
         commission: float,
         realized_pnl: float,
+        currency: str = "USD",
     ):
         """
         Handle commission report from Portfolio.
@@ -3253,10 +3254,11 @@ class PluginExecutive:
             exec_id: The execution ID
             commission: Commission amount
             realized_pnl: Realized P&L for closing trades
+            currency: Commission currency (e.g. "USD")
         """
         logger.debug(
             f"Commission report received: exec_id={exec_id}, "
-            f"commission=${commission:.4f}, pnl=${realized_pnl:.2f}"
+            f"commission=${commission:.4f}, pnl=${realized_pnl:.2f}, currency={currency}"
         )
 
         # Find the order associated with this execution
@@ -3267,7 +3269,7 @@ class PluginExecutive:
             logger.debug(f"No order found for exec_id={exec_id}, commission logged without allocation")
             return
 
-        self._process_commission_for_order(order_id, exec_id, commission, realized_pnl)
+        self._process_commission_for_order(order_id, exec_id, commission, realized_pnl, currency)
 
     def _process_commission_for_order(
         self,
@@ -3275,18 +3277,20 @@ class PluginExecutive:
         exec_id: str,
         commission: float,
         realized_pnl: float,
+        currency: str = "USD",
     ):
         """
         Process commission for an order and write execution logs.
 
         Apportions commission among contributing plugins based on their
-        allocation percentages.
+        allocation percentages, then calls plugin.on_commission() for each.
 
         Args:
             order_id: The IB order ID
             exec_id: The execution ID
             commission: Total commission
             realized_pnl: Total realized P&L
+            currency: Commission currency (e.g. "USD")
         """
         pending = self._pending_commissions.get(order_id)
         if not pending:
@@ -3369,6 +3373,18 @@ class PluginExecutive:
                 )
             else:
                 logger.error(f"Failed to write execution log for {plugin_name}")
+
+            # Notify the plugin itself (plugin_config already resolved above)
+            if plugin_config and plugin_config.plugin:
+                try:
+                    plugin_config.plugin.on_commission(
+                        exec_id, plugin_commission, plugin_pnl, currency
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Plugin {plugin_name} raised in on_commission: {e}",
+                        exc_info=True,
+                    )
 
     def register_execution_for_commission(
         self,

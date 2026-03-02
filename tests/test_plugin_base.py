@@ -584,3 +584,15 @@ class TestNewCallbacks:
         plugin = ConcreteTestPlugin()
         # Should not raise
         plugin.on_pnl(Mock())
+
+    def test_on_pnl_accepts_pnl_data_instance(self):
+        """on_pnl works with an actual PnLData object."""
+        from ib.models import PnLData
+        plugin = ConcreteTestPlugin()
+        data = PnLData(account="DU1", daily_pnl=10.0, unrealized_pnl=50.0, realized_pnl=0.0)
+        plugin.on_pnl(data)  # base no-op should not raise
+
+    def test_on_commission_accepts_all_four_args(self):
+        """on_commission works with all four expected arguments."""
+        plugin = ConcreteTestPlugin()
+        plugin.on_commission("exec_001", 1.25, 0.0, "USD")  # should not raise

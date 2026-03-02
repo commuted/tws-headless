@@ -731,3 +731,68 @@ class TestCommissionAndPnL:
         ex = PluginExecutive(portfolio=portfolio, data_feed=None)
 
         assert portfolio._on_pnl == ex._dispatch_pnl
+
+    def test_pnl_dispatch_exception_in_one_plugin_does_not_stop_others(self):
+        """An exception in one plugin's on_pnl must not prevent other plugins receiving it."""
+        from ib.models import PnLData
+
+        executive = PluginExecutive(None, None)
+        received = []
+
+        class BrokenPlugin(MockPlugin):
+            def on_pnl(self, pnl_data):
+                raise RuntimeError("plugin bug")
+
+        class GoodPlugin(MockPlugin):
+            def on_pnl(self, pnl_data):
+                received.append(pnl_data)
+
+        broken = BrokenPlugin("broken_plugin")
+        good = GoodPlugin("good_plugin")
+        executive.register_plugin(broken)
+        executive.register_plugin(good)
+        executive.start_plugin("broken_plugin")
+        executive.start_plugin("good_plugin")
+
+        pnl_data = PnLData(account="DU1", daily_pnl=1.0, unrealized_pnl=0.0, realized_pnl=0.0)
+        # Should not raise
+        executive._dispatch_pnl(pnl_data)
+
+        assert len(received) == 1
+        assert received[0] is pnl_data
+
+    def test_commission_currency_reaches_plugin(self):
+        """on_commission is called with all 4 args including currency."""
+        executive = PluginExecutive(None, None)
+        received = []
+
+        class CommPlugin(MockPlugin):
+            def on_commission(self, exec_id, commission, realized_pnl, currency):
+                received.append((exec_id, commission, realized_pnl, currency))
+
+        plugin = CommPlugin("comm_plugin")
+        executive.register_plugin(plugin)
+        executive.start_plugin("comm_plugin")
+
+        # Build the minimal _pending_commissions entry
+        order_id = 1001
+        signal_stub = Mock()
+        signal_stub.algorithm_name = "comm_plugin"
+        executive._pending_commissions[order_id] = {
+            "symbol": "SPY",
+            "action": "BUY",
+            "net_quantity": 100,
+            "contributing_signals": [signal_stub],
+        }
+        executive._exec_id_to_order["exec_abc"] = order_id
+
+        # Mock reconciler and log writer so they don't fail
+        executive._reconciler = Mock()
+        executive._reconciler.get_allocation_percentages.return_value = {"comm_plugin": 1.0}
+        executive._execution_log_writer = Mock()
+        executive._execution_log_writer.write.return_value = True
+
+        executive._handle_commission_report("exec_abc", 2.50, 100.0, "USD")
+
+        assert len(received) == 1
+        assert received[0] == ("exec_abc", 2.50, 100.0, "USD")

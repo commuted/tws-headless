@@ -26,7 +26,7 @@ Complete reference for writing plugins for the IB trading engine.
 13. [Order Callbacks and Error Routing](#13-order-callbacks-and-error-routing)
     - 13.1 [on_order_fill / on_order_status](#on_order_fillself-order_record---none)
     - 13.2 [on_commission — execution cost reports](#on_commissionself-exec_id-commission-realized_pnl-currency---none)
-    - 13.3 [on_pnl — live P&L updates](#on_pnlself-pnl_data---none)
+    - 13.3 [on_pnl — live P&L updates](#on_pnlself-pnl_data-pnldata---none)
     - 13.4 [on_ib_error](#on_ib_errorself-req_id-int-error_code-int-error_string-str---none)
 14. [Portfolio Access](#14-portfolio-access)
     - 14.1 [Real-time P&L subscriptions](#141-real-time-pl-subscriptions)
@@ -887,6 +887,13 @@ Called when IB delivers a commission report for an execution linked to an
 order attributed to this plugin. The `exec_id` ties this report to the
 corresponding `execDetails` event.
 
+**Apportionment for combined orders**: when two or more plugins contributed
+signals to the same net order (a "combined order"), the executive splits the
+total commission and realized P&L proportionally by each plugin's allocation
+percentage. Each plugin therefore receives only its share — not the full
+order commission. For orders placed by a single plugin the allocation is
+always 100%, so `commission` equals the full IB-reported amount.
+
 ```python
 def on_commission(
     self,
@@ -918,7 +925,7 @@ No extra registration is required. The executive wires `execDetails` →
 
 ---
 
-### `on_pnl(self, pnl_data) -> None`
+### `on_pnl(self, pnl_data: PnLData) -> None`
 
 Called with live P&L updates from IB's streaming P&L API. The engine
 delivers these after `portfolio.request_pnl()` or

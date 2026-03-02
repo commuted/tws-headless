@@ -21,9 +21,12 @@ from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Set, Tuple, Callable
+from typing import TYPE_CHECKING, List, Dict, Optional, Any, Set, Tuple, Callable
 
 from ibapi.contract import Contract
+
+if TYPE_CHECKING:
+    from ib.models import PnLData
 
 logger = logging.getLogger(__name__)
 
@@ -703,7 +706,7 @@ class PluginBase(ABC):
             currency:     Currency of the commission (e.g., "USD")
         """
 
-    def on_pnl(self, pnl_data) -> None:
+    def on_pnl(self, pnl_data: "PnLData") -> None:
         """
         Called with live P&L updates from IB's reqPnL / reqPnLSingle subscriptions.
 

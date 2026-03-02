@@ -1658,3 +1658,74 @@ class TestPnLCallbacks:
         """pnl() with no _on_pnl set should not raise."""
         portfolio_instance._on_pnl = None
         portfolio_instance.pnl(reqId=1, dailyPnL=0.0, unrealizedPnL=0.0, realizedPnL=0.0)
+
+    def test_cancel_pnl_single(self, portfolio_instance):
+        """cancel_pnl_single() calls cancelPnLSingle and clears both mappings."""
+        portfolio_instance.cancelPnLSingle = MagicMock()
+        portfolio_instance._pnl_single_req_ids = {42: "SPY"}
+        portfolio_instance._pnl_single_symbols = {"SPY": 42}
+
+        portfolio_instance.cancel_pnl_single("SPY")
+
+        portfolio_instance.cancelPnLSingle.assert_called_once_with(42)
+        assert "SPY" not in portfolio_instance._pnl_single_symbols
+        assert 42 not in portfolio_instance._pnl_single_req_ids
+
+    def test_cancel_pnl_single_unknown_symbol_no_error(self, portfolio_instance):
+        """cancel_pnl_single() on an unsubscribed symbol should not raise."""
+        portfolio_instance.cancelPnLSingle = MagicMock()
+        portfolio_instance.cancel_pnl_single("UNKNOWN")
+        portfolio_instance.cancelPnLSingle.assert_not_called()
+
+    def test_shutdown_cancels_pnl_subscriptions(self, portfolio_instance):
+        """shutdown() cancels both account-level and single P&L subscriptions."""
+        portfolio_instance.cancelPnL = MagicMock()
+        portfolio_instance.cancelPnLSingle = MagicMock()
+        portfolio_instance._pnl_req_id = 7
+        portfolio_instance._pnl_single_req_ids = {42: "SPY", 43: "AAPL"}
+        portfolio_instance._pnl_single_symbols = {"SPY": 42, "AAPL": 43}
+
+        portfolio_instance.shutdown()
+
+        portfolio_instance.cancelPnL.assert_called_once_with(7)
+        assert portfolio_instance.cancelPnLSingle.call_count == 2
+
+    def test_pnl_single_unknown_req_id_no_error(self, portfolio_instance):
+        """pnlSingle() with an unknown reqId should not raise (logs warning)."""
+        portfolio_instance._on_pnl = MagicMock()
+        portfolio_instance._pnl_single_req_ids = {}
+        portfolio_instance.managed_accounts = ["DU123456"]
+
+        # Should not raise even when reqId is not in the mapping
+        portfolio_instance.pnlSingle(
+            reqId=99, pos=0, dailyPnL=0.0, unrealizedPnL=0.0, realizedPnL=0.0, value=0.0
+        )
+
+        # Callback still fires but with empty symbol
+        portfolio_instance._on_pnl.assert_called_once()
+        data = portfolio_instance._on_pnl.call_args[0][0]
+        assert data.symbol == ""
+
+    def test_commission_currency_forwarded(self, portfolio_instance):
+        """commissionAndFeesReport() passes currency through _on_commission."""
+        # commissionAndFeesReport uses fields not in the P&L fixture
+        portfolio_instance._commission_reports = {}
+        portfolio_instance._on_commission = None
+        portfolio_instance._callbacks = {}
+
+        received = []
+        portfolio_instance._on_commission = lambda *args: received.append(args)
+
+        report = MagicMock()
+        report.execId = "exec_001"
+        report.commissionAndFees = 1.25
+        report.realizedPNL = 0.0
+        report.currency = "USD"
+
+        portfolio_instance.commissionAndFeesReport(report)
+
+        assert len(received) == 1
+        exec_id, commission, realized_pnl, currency = received[0]
+        assert exec_id == "exec_001"
+        assert commission == 1.25
+        assert currency == "USD"
