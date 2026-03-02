@@ -5,6 +5,7 @@ Tests for plugins/base.py - Plugin base class and data structures
 import pytest
 import json
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 from datetime import datetime
 from unittest.mock import Mock, patch, MagicMock
@@ -185,13 +186,13 @@ class TestTradeSignal:
         signal = TradeSignal(
             symbol="SPY",
             action="BUY",
-            quantity=10,
+            quantity=Decimal("10"),
             reason="Momentum signal",
         )
 
         assert signal.symbol == "SPY"
         assert signal.action == "BUY"
-        assert signal.quantity == 10
+        assert signal.quantity == Decimal("10")
         assert signal.reason == "Momentum signal"
 
     def test_create_with_target_weight(self):
@@ -207,16 +208,16 @@ class TestTradeSignal:
 
     def test_is_actionable(self):
         """Test is_actionable property"""
-        buy_signal = TradeSignal("SPY", "BUY", quantity=10)
+        buy_signal = TradeSignal("SPY", "BUY", quantity=Decimal("10"))
         assert buy_signal.is_actionable is True
 
-        sell_signal = TradeSignal("SPY", "SELL", quantity=5)
+        sell_signal = TradeSignal("SPY", "SELL", quantity=Decimal("5"))
         assert sell_signal.is_actionable is True
 
-        hold_signal = TradeSignal("SPY", "HOLD", quantity=10)
+        hold_signal = TradeSignal("SPY", "HOLD", quantity=Decimal("10"))
         assert hold_signal.is_actionable is False
 
-        zero_qty = TradeSignal("SPY", "BUY", quantity=0)
+        zero_qty = TradeSignal("SPY", "BUY", quantity=Decimal("0"))
         assert zero_qty.is_actionable is False
 
 
@@ -225,7 +226,7 @@ class TestPluginResult:
 
     def test_create_success_result(self):
         """Test creating a successful result"""
-        signals = [TradeSignal("SPY", "BUY", quantity=10)]
+        signals = [TradeSignal("SPY", "BUY", quantity=Decimal("10"))]
         result = PluginResult(
             plugin_name="test",
             timestamp=datetime.now(),
@@ -252,9 +253,9 @@ class TestPluginResult:
     def test_actionable_signals(self):
         """Test actionable signals filter"""
         signals = [
-            TradeSignal("SPY", "BUY", quantity=10),
-            TradeSignal("QQQ", "HOLD", quantity=5),
-            TradeSignal("AAPL", "SELL", quantity=20),
+            TradeSignal("SPY", "BUY", quantity=Decimal("10")),
+            TradeSignal("QQQ", "HOLD", quantity=Decimal("5")),
+            TradeSignal("AAPL", "SELL", quantity=Decimal("20")),
         ]
         result = PluginResult(
             plugin_name="test",

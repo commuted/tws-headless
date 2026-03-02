@@ -179,6 +179,7 @@ class OrderTestPluginBase(PluginBase):
         super().__init__(name, base_path, portfolio, shared_holdings, message_bus)
         self._results: List[OrderPairResult] = []
         self._running = False
+        self._fill_events: Dict[int, threading.Event] = {}  # order_id -> fill event
 
     # -----------------------------------------------------------------------
     # Lifecycle (minimal – one-shot plugins)
@@ -254,6 +255,25 @@ class OrderTestPluginBase(PluginBase):
 
     def calculate_signals(self, market_data: Dict) -> List[TradeSignal]:
         return []
+
+    def on_order_fill(self, order_record) -> None:
+        """Wake _wait_fill_cancel_other when a tracked order fills."""
+        ev = self._fill_events.get(order_record.order_id)
+        if ev:
+            ev.set()
+
+    def on_order_status(self, order_record) -> None:
+        """Wake _wait_fill_cancel_other on any terminal state (fill or rejection)."""
+        if order_record.is_complete:
+            ev = self._fill_events.get(order_record.order_id)
+            if ev:
+                ev.set()
+
+    def on_ib_error(self, req_id: int, error_code: int, error_string: str) -> None:
+        """Log IB errors attributed to this plugin's orders or streams."""
+        logger.warning(
+            f"[{self.name}] IB error reqId={req_id} [{error_code}]: {error_string}"
+        )
 
     # -----------------------------------------------------------------------
     # Request handling
@@ -424,7 +444,10 @@ class OrderTestPluginBase(PluginBase):
         immediate: bool = False,
     ) -> Tuple[Optional[str], float]:
         """
-        Poll for fills on both orders until one fills or timeout.
+        Wait for fills on both orders until one fills or timeout.
+
+        Wakes immediately via on_order_fill() callback; falls back to a
+        0.5-second poll interval if callbacks are unavailable.
 
         For immediate orders (market/MOC) both are expected to fill;
         returns "both" in that case.
@@ -436,26 +459,58 @@ class OrderTestPluginBase(PluginBase):
         deadline = time.time() + timeout
         port = self.portfolio
 
-        while time.time() < deadline:
-            rec_l = port.get_order(oid_long) if oid_long else None
-            rec_s = port.get_order(oid_short) if oid_short else None
-            filled_l = rec_l and rec_l.is_filled
-            filled_s = rec_s and rec_s.is_filled
+        ev = threading.Event()
+        for oid in (oid_long, oid_short):
+            if oid is not None:
+                self._fill_events[oid] = ev
 
-            if immediate:
+        try:
+            while time.time() < deadline:
+                rec_l = port.get_order(oid_long) if oid_long else None
+                rec_s = port.get_order(oid_short) if oid_short else None
+                filled_l = rec_l and rec_l.is_filled
+                filled_s = rec_s and rec_s.is_filled
+
+                if immediate:
+                    if filled_l and filled_s:
+                        return "both", (rec_l.avg_fill_price + rec_s.avg_fill_price) / 2
+
+                if filled_l and not filled_s:
+                    self._cancel(oid_short)
+                    return "long", rec_l.avg_fill_price
+                if filled_s and not filled_l:
+                    self._cancel(oid_long)
+                    return "short", rec_s.avg_fill_price
                 if filled_l and filled_s:
                     return "both", (rec_l.avg_fill_price + rec_s.avg_fill_price) / 2
 
-            if filled_l and not filled_s:
-                self._cancel(oid_short)
-                return "long", rec_l.avg_fill_price
-            if filled_s and not filled_l:
-                self._cancel(oid_long)
-                return "short", rec_s.avg_fill_price
-            if filled_l and filled_s:
-                return "both", (rec_l.avg_fill_price + rec_s.avg_fill_price) / 2
+                # Exit early if either order reached a terminal non-fill state
+                # (rejected, cancelled, error) so we don't wait out the full timeout.
+                if rec_l and rec_l.is_complete and not filled_l:
+                    logger.warning(
+                        f"  Order {oid_long} ({rec_l.symbol}) terminal without fill:"
+                        f" {rec_l.status.value}"
+                    )
+                    self._cancel(oid_short)
+                    return None, 0.0
+                if rec_s and rec_s.is_complete and not filled_s:
+                    logger.warning(
+                        f"  Order {oid_short} ({rec_s.symbol}) terminal without fill:"
+                        f" {rec_s.status.value}"
+                    )
+                    self._cancel(oid_long)
+                    return None, 0.0
 
-            time.sleep(0.5)
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                ev.wait(timeout=min(0.5, remaining))
+                ev.clear()
+
+        finally:
+            for oid in (oid_long, oid_short):
+                if oid is not None:
+                    self._fill_events.pop(oid, None)
 
         # Timeout – cancel both
         self._cancel(oid_long)
@@ -514,6 +569,11 @@ class OrderTestPluginBase(PluginBase):
 
             oid_a = self._place(con_a, order_a)
             oid_b = self._place(con_b, order_b)
+
+            if oid_a is not None:
+                self.register_order(oid_a)
+            if oid_b is not None:
+                self.register_order(oid_b)
 
             if oid_a is None and oid_b is None:
                 result.error_message = "Failed to place both orders (no order ID returned)"

@@ -31,6 +31,7 @@ Usage:
 """
 
 import logging
+from decimal import Decimal
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 from pathlib import Path
@@ -280,7 +281,7 @@ class PanicPlugin(PluginBase):
             signals.append(TradeSignal(
                 symbol=pos["symbol"],
                 action="SELL",
-                quantity=int(pos["quantity"]),
+                quantity=Decimal(str(pos["quantity"])),
                 target_weight=0.0,
                 current_weight=0.0,
                 reason=f"Panic liquidation (urgency={pos['urgency']})",

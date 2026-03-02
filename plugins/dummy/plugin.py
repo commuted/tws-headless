@@ -9,6 +9,7 @@ A simple placeholder plugin that:
 
 import logging
 from datetime import datetime
+from decimal import Decimal
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 
@@ -221,7 +222,7 @@ class DummyPlugin(PluginBase):
             signals.append(TradeSignal(
                 symbol=inst.symbol,
                 action="HOLD",
-                quantity=0,
+                quantity=Decimal("0"),
                 target_weight=inst.weight,
                 current_weight=current_weight,
                 reason="Dummy plugin - no action taken",

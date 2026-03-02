@@ -13,6 +13,7 @@ Example:
 """
 
 import logging
+from decimal import Decimal
 from threading import Lock
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
@@ -43,7 +44,7 @@ class ReconciledOrder:
     symbol: str
     contract: Contract
     action: str  # BUY or SELL
-    net_quantity: int
+    net_quantity: Decimal
     contributing_signals: List[PendingSignal]
     created_at: datetime = field(default_factory=datetime.now)
 
@@ -202,7 +203,7 @@ class OrderReconciler:
             signals = self._pending[sym]
 
             # Calculate net position
-            net_qty = 0
+            net_qty = Decimal("0")
             contract = None
             for ps in signals:
                 contract = ps.contract

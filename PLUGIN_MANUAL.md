@@ -18,13 +18,14 @@ Complete reference for writing plugins for the IB trading engine.
 10. [MessageBus — Publish / Subscribe](#10-messagebus--publish--subscribe)
 11. [Request Handling](#11-request-handling)
 12. [Trade Signals](#12-trade-signals)
-13. [Portfolio Access](#13-portfolio-access)
-14. [Contract Builder](#14-contract-builder)
-15. [Self-Unload](#15-self-unload)
-16. [Engine Commands](#16-engine-commands)
-17. [Threading Rules](#17-threading-rules)
-18. [Naming Conventions](#18-naming-conventions)
-19. [Complete Examples](#19-complete-examples)
+13. [Order Callbacks and Error Routing](#13-order-callbacks-and-error-routing)
+14. [Portfolio Access](#14-portfolio-access)
+15. [Contract Builder](#15-contract-builder)
+16. [Self-Unload](#16-self-unload)
+17. [Engine Commands](#17-engine-commands)
+18. [Threading Rules](#18-threading-rules)
+19. [Naming Conventions](#19-naming-conventions)
+20. [Complete Examples](#20-complete-examples)
 
 ---
 
@@ -64,6 +65,7 @@ __all__ = ["MyPlugin"]
 ## 3. Class Skeleton
 
 ```python
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List, Optional
 from plugins.base import PluginBase, TradeSignal
@@ -240,7 +242,7 @@ the circuit breaker.
 def calculate_signals(self, market_data: Dict) -> List[TradeSignal]:
     if self._signal_pending:
         self._signal_pending = False
-        return [TradeSignal(symbol="SPY", action="BUY", quantity=10)]
+        return [TradeSignal(symbol="SPY", action="BUY", quantity=Decimal("10"))]
     return []
 ```
 
@@ -543,19 +545,25 @@ reconciles signals from all plugins, applies rate limiting, and places
 orders.
 
 ```python
+from decimal import Decimal
 from plugins.base import TradeSignal
 
 TradeSignal(
-    symbol="SPY",          # str   — ticker symbol
-    action="BUY",          # str   — "BUY" | "SELL" | "HOLD"
-    quantity=10,           # int   — number of shares/contracts
-    target_weight=0.20,    # float — optional: target portfolio weight 0.0–1.0
-    current_weight=0.15,   # float — optional: current portfolio weight
-    reason="SMA crossover",# str   — logged; shown in execution history
-    confidence=0.85,       # float — 0.0–1.0; used by reconciler
-    urgency="Normal",      # str   — "Patient" | "Normal" | "Urgent"
+    symbol="SPY",              # str     — ticker symbol
+    action="BUY",              # str     — "BUY" | "SELL" | "HOLD"
+    quantity=Decimal("10"),    # Decimal — number of shares/contracts
+    target_weight=0.20,        # float   — optional: target portfolio weight 0.0–1.0
+    current_weight=0.15,       # float   — optional: current portfolio weight
+    reason="SMA crossover",    # str     — logged; shown in execution history
+    confidence=0.85,           # float   — 0.0–1.0; used by reconciler
+    urgency="Normal",          # str     — "Patient" | "Normal" | "Urgent"
 )
 ```
+
+`quantity` is a `Decimal`. Always construct it from a string literal
+(`Decimal("10")`) or from `str()` of a computed value
+(`Decimal(str(shares))`) to avoid floating-point rounding artefacts.
+The default is `Decimal("0")`.
 
 A signal is **actionable** (`signal.is_actionable == True`) when
 `action` is `"BUY"` or `"SELL"` and `quantity > 0`. `"HOLD"` signals are
@@ -571,7 +579,127 @@ ignored by the executor.
 
 ---
 
-## 13. Portfolio Access
+## 13. Order Callbacks and Error Routing
+
+The executive routes IB order status updates and errors back to the plugin
+that owns each request. Overriding these hooks is optional; the default
+implementations are no-ops.
+
+### Automatic routing for `calculate_signals` orders
+
+Orders placed by the executive as a result of `calculate_signals` are
+automatically associated with the originating plugin. No extra
+registration is required.
+
+### `register_order(order_id: int) -> None`
+
+When a plugin places orders **directly** via
+`self.portfolio.place_order_custom()` (bypassing the signal system), call
+`register_order` immediately after so the executive can route callbacks to
+this plugin.
+
+```python
+order_id = self.portfolio.place_order_custom(contract, order)
+if order_id is not None:
+    self.register_order(order_id)
+```
+
+### `on_order_fill(self, order_record) -> None`
+
+Called when one of this plugin's orders reaches `FILLED` status.
+
+```python
+def on_order_fill(self, order_record) -> None:
+    logger.info(
+        f"Filled {order_record.order_id}: "
+        f"{order_record.filled_quantity} × {order_record.symbol} "
+        f"@ {order_record.avg_fill_price:.2f}"
+    )
+```
+
+### `on_order_status(self, order_record) -> None`
+
+Called on **every** IB status change for an order attributed to this
+plugin (submitted, partially filled, filled, cancelled, etc.).
+
+```python
+def on_order_status(self, order_record) -> None:
+    if order_record.is_complete and not order_record.is_filled:
+        logger.warning(
+            f"Order {order_record.order_id} ended without fill: "
+            f"{order_record.status.value}"
+        )
+```
+
+**`OrderRecord` attributes:**
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `order_id` | `int` | IB order ID |
+| `symbol` | `str` | Ticker symbol |
+| `action` | `str` | `"BUY"` or `"SELL"` |
+| `quantity` | `float` | Requested quantity |
+| `order_type` | `str` | `"MKT"`, `"LMT"`, etc. |
+| `status` | `OrderStatus` | Current status enum value |
+| `filled_quantity` | `float` | Shares filled so far |
+| `avg_fill_price` | `float` | Average fill price (0.0 until filled) |
+| `remaining` | `float` | Shares not yet filled |
+| `is_filled` | `bool` | `True` when `status == FILLED` |
+| `is_complete` | `bool` | `True` when filled, cancelled, or error |
+| `fill_value` | `float` | `filled_quantity × avg_fill_price` |
+
+**`OrderStatus` enum values:**
+
+| Value | Meaning |
+|-------|---------|
+| `PENDING` | Not yet acknowledged by IB |
+| `SUBMITTED` | Actively working at IB |
+| `PARTIALLY_FILLED` | Some shares filled; order still open |
+| `FILLED` | Completely filled |
+| `CANCELLED` | Cancelled by user or IB |
+| `INACTIVE` | Submitted but not actively working (e.g. outside hours) |
+| `ERROR` | Rejected or other error |
+
+### `on_ib_error(self, req_id: int, error_code: int, error_string: str) -> None`
+
+Called when IB reports an error for a request owned by this plugin.
+The executive filters out system messages and routine informational codes
+before dispatching, so every call to this method represents an actionable
+condition.
+
+**Filtered before dispatch (never reach `on_ib_error`):**
+
+| Code | Description |
+|------|-------------|
+| `req_id == -1` | System-level message not tied to any request |
+| 2104 | Market data farm connection is OK |
+| 2106 | HMDS data farm connection is OK |
+| 2119 | Market data farm is connecting |
+| 2158 | Sec-def data farm connection is OK |
+| 10167 | Requested market data is not subscribed (delayed data switch) |
+
+```python
+def on_ib_error(self, req_id: int, error_code: int, error_string: str) -> None:
+    logger.warning(f"IB error reqId={req_id} [{error_code}]: {error_string}")
+    if error_code == 201:          # Order rejected
+        self._handle_rejection(req_id)
+    elif error_code in (10090, 10091):   # No market data permissions
+        logger.error(f"Missing data subscription for reqId={req_id}")
+```
+
+**Routing logic:**
+
+- If `req_id` matches a registered order ID, the error is routed to the
+  plugin(s) that own that order.
+- Otherwise, if `req_id` matches an active tick or bar stream subscription,
+  the error is routed to all plugins subscribed to that symbol.
+- Order routing takes priority if the same ID appears in both maps.
+- If no plugin claims the request, the error is logged at DEBUG level
+  and discarded.
+
+---
+
+## 14. Portfolio Access
 
 `self.portfolio` is the live IB connection. It is `None` in unit tests.
 Always guard with `if self.portfolio:` before use.
@@ -643,7 +771,7 @@ wrapper handles threading and timeout automatically.
 
 ---
 
-## 14. Contract Builder
+## 15. Contract Builder
 
 `from ib.contract_builder import ContractBuilder`
 
@@ -723,7 +851,7 @@ ContractBuilder.by_figi("BBG000B9XRY4")
 
 ---
 
-## 15. Self-Unload
+## 16. Self-Unload
 
 A one-shot plugin (e.g. a test or a single-execution strategy) can ask
 the engine to unload it after completing its work.
@@ -738,7 +866,7 @@ The engine calls `stop()` then `unload()` on the plugin.
 
 ---
 
-## 16. Engine Commands
+## 17. Engine Commands
 
 Plugins are controlled via the `ibctl.py` CLI (or the socket directly).
 
@@ -773,7 +901,7 @@ is a non-abstract subclass of `PluginBase`, instantiates it (passing
 
 ---
 
-## 17. Threading Rules
+## 18. Threading Rules
 
 - **Stream callbacks** (`on_tick`, `on_bar`) are called on the IB reader
   thread. They must return quickly. Do not call blocking operations or
@@ -788,6 +916,15 @@ is a non-abstract subclass of `PluginBase`, instantiates it (passing
 
 - **`start`, `stop`, `freeze`, `resume`** are called on the executive
   control thread.
+
+- **`on_order_fill`, `on_order_status`** are called on the IB reader
+  thread (the same thread that receives `orderStatus` callbacks from TWS).
+  They must return quickly. Do not block or acquire long-held locks.
+  Use a `threading.Event` or queue to hand off work to a waiting thread.
+
+- **`on_ib_error`** is called on the IB reader thread (the thread that
+  receives `error()` callbacks from TWS). The same fast-return rule
+  applies.
 
 - If a callback needs to do heavy work, post to a queue and process on a
   dedicated thread started in `start()` and stopped in `stop()`.
@@ -806,7 +943,7 @@ is a non-abstract subclass of `PluginBase`, instantiates it (passing
 
 ---
 
-## 18. Naming Conventions
+## 19. Naming Conventions
 
 | Item | Convention | Example |
 |------|------------|---------|
@@ -822,7 +959,7 @@ plugin with the same name is rejected by the engine.
 
 ---
 
-## 19. Complete Examples
+## 20. Complete Examples
 
 ### One-shot plugin (runs, then self-unloads)
 
@@ -961,6 +1098,7 @@ class RSIPublisherPlugin(PluginBase):
 ### Subscriber / strategy plugin
 
 ```python
+from decimal import Decimal
 from plugins.base import PluginBase, TradeSignal
 
 class RSIStrategyPlugin(PluginBase):
@@ -1010,12 +1148,12 @@ class RSIStrategyPlugin(PluginBase):
         symbol = message.payload.get("symbol", "SPY")
         if rsi < 30:
             self._pending.append(
-                TradeSignal(symbol=symbol, action="BUY", quantity=10,
+                TradeSignal(symbol=symbol, action="BUY", quantity=Decimal("10"),
                             reason=f"RSI oversold ({rsi:.1f})", confidence=0.8)
             )
         elif rsi > 70:
             self._pending.append(
-                TradeSignal(symbol=symbol, action="SELL", quantity=10,
+                TradeSignal(symbol=symbol, action="SELL", quantity=Decimal("10"),
                             reason=f"RSI overbought ({rsi:.1f})", confidence=0.8)
             )
 ```

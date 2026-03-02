@@ -12,6 +12,7 @@ Provides:
 """
 
 import logging
+from decimal import Decimal
 from threading import Thread, Event, Lock, RLock
 from typing import Optional, Callable, Dict, List, Set, Any, Tuple
 from datetime import datetime, timedelta
@@ -36,6 +37,9 @@ from .rate_limiter import OrderRateLimiter
 from .plugin_execution_log import PluginExecutionLog, ExecutionLogWriter
 
 logger = logging.getLogger(__name__)
+
+# IB error codes that are informational/system-level and not plugin-actionable
+_IB_INFO_CODES: frozenset = frozenset({2104, 2106, 2158, 2119, 10167})
 
 
 @dataclass
@@ -150,6 +154,14 @@ class StreamManager:
             self._data_feed.unsubscribe(symbol, subscriber=plugin_name)
         logger.info(f"StreamManager: plugin '{plugin_name}' cancelled stream for {symbol}")
         return True
+
+    def plugins_for_symbol(self, symbol: str) -> List[str]:
+        """Return plugin names currently subscribed to the given symbol."""
+        with self._lock:
+            return [
+                name for name, streams in self._plugin_streams.items()
+                if symbol in streams
+            ]
 
     def cancel_all_streams(self, plugin_name: str):
         """
@@ -595,10 +607,14 @@ class PluginExecutive:
         self._execution_log_writer = ExecutionLogWriter()
         self._pending_commissions: Dict[int, Dict] = {}  # order_id -> execution info
         self._exec_id_to_order: Dict[str, int] = {}  # exec_id -> order_id
+        self._order_id_to_plugins: Dict[int, List[str]] = {}  # order_id -> plugin names
 
-        # Register commission callback with portfolio if available
+        # Register portfolio callbacks if available
         if portfolio and hasattr(portfolio, "_on_commission"):
             portfolio._on_commission = self._handle_commission_report
+        if portfolio and hasattr(portfolio, "_callbacks"):
+            portfolio._callbacks["orderStatus"] = self._handle_order_status_for_plugins
+            portfolio._callbacks["error"] = self._handle_ib_error_for_plugins
 
         # Statistics
         self._stats = {
@@ -3127,6 +3143,108 @@ class PluginExecutive:
         return self._order_rate_limiter.stats
 
     # =========================================================================
+    # Order Status Routing to Plugins
+    # =========================================================================
+
+    def register_order_for_plugin(self, order_id: int, plugin_name: str) -> None:
+        """
+        Register an order placed directly by a plugin for fill/status callbacks.
+
+        Call this when a plugin places an order via portfolio directly (i.e.
+        not through the reconciler).  Reconciler-placed orders are registered
+        automatically via _register_pending_execution.
+
+        Args:
+            order_id: The IB order ID
+            plugin_name: Name of the plugin that owns the order
+        """
+        with self._lock:
+            names = self._order_id_to_plugins.setdefault(order_id, [])
+            if plugin_name not in names:
+                names.append(plugin_name)
+
+    def _handle_order_status_for_plugins(self, order_record) -> None:
+        """
+        Route an order status update to the plugins that own the order.
+
+        Registered as portfolio._callbacks["orderStatus"] so it fires on
+        every IB orderStatus callback.  Calls plugin.on_order_status() for
+        all owning plugins and plugin.on_order_fill() when the order is
+        fully filled.
+        """
+        order_id = order_record.order_id
+        with self._lock:
+            plugin_names = list(self._order_id_to_plugins.get(order_id, []))
+            plugins = []
+            for name in plugin_names:
+                _, config = self._resolve_plugin(name)
+                if config:
+                    plugins.append(config.plugin)
+
+        for plugin in plugins:
+            try:
+                plugin.on_order_status(order_record)
+            except Exception as e:
+                logger.error(f"[{plugin.name}] on_order_status error: {e}")
+            if order_record.is_filled:
+                try:
+                    plugin.on_order_fill(order_record)
+                except Exception as e:
+                    logger.error(f"[{plugin.name}] on_order_fill error: {e}")
+
+    def _handle_ib_error_for_plugins(
+        self, req_id: int, error_code: int, error_string: str
+    ) -> None:
+        """
+        Route an IB error to the plugin(s) that own the failing request.
+
+        Registered as portfolio._callbacks["error"]. Skips system messages
+        (reqId == -1) and informational codes that are not plugin-actionable.
+
+        Routing priority:
+          1. Order errors   — req_id is in _order_id_to_plugins
+          2. Stream errors  — req_id maps to a symbol subscribed by plugins
+        """
+        if req_id == -1 or error_code in _IB_INFO_CODES:
+            return
+
+        plugins = []
+
+        # Order-error routing
+        with self._lock:
+            order_names = list(self._order_id_to_plugins.get(req_id, []))
+            for name in order_names:
+                _, config = self._resolve_plugin(name)
+                if config:
+                    plugins.append(config.plugin)
+
+        # Stream-error routing (only if not already attributed to an order)
+        if not plugins and self.portfolio:
+            symbol = (
+                self.portfolio._stream_subscriptions.get(req_id)
+                or self.portfolio._bar_subscriptions.get(req_id)
+            )
+            if symbol:
+                stream_names = self.stream_manager.plugins_for_symbol(symbol)
+                with self._lock:
+                    for name in stream_names:
+                        _, config = self._resolve_plugin(name)
+                        if config:
+                            plugins.append(config.plugin)
+
+        if not plugins:
+            logger.debug(
+                f"IB error reqId={req_id} code={error_code} not attributed to any plugin"
+            )
+            return
+
+        for plugin in plugins:
+            try:
+                plugin.on_ib_error(req_id, error_code, error_string)
+            except Exception as e:
+                logger.error(f"[{plugin.name}] on_ib_error raised: {e}")
+
+    # =========================================================================
     # Commission Tracking and Execution Logging
     # =========================================================================
 
@@ -3153,6 +3271,9 @@ class PluginExecutive:
                 "contributing_signals": reconciled.contributing_signals,
                 "created_at": datetime.now(),
             }
+            self._order_id_to_plugins[order_id] = [
+                ps.algorithm_name for ps in reconciled.contributing_signals
+            ]
 
     def _handle_commission_report(
         self,
@@ -3389,7 +3510,7 @@ class PluginExecutive:
         signal = TradeSignal(
             symbol=symbol,
             action=action,
-            quantity=quantity,
+            quantity=Decimal(quantity),
             reason=f"[MANUAL] {reason}",
             confidence=1.0,
             urgency="Normal",

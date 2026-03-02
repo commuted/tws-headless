@@ -18,6 +18,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Set, Tuple, Callable
@@ -269,7 +270,7 @@ class TradeSignal:
     """A signal to trade from a plugin"""
     symbol: str
     action: str  # BUY, SELL, HOLD
-    quantity: int = 0
+    quantity: Decimal = Decimal("0")
     target_weight: float = 0.0
     current_weight: float = 0.0
     reason: str = ""
@@ -660,6 +661,56 @@ class PluginBase(ABC):
     def set_executive(self, executive) -> None:
         """Set the PluginExecutive reference for stream management"""
         self._executive = executive
+
+    # =========================================================================
+    # Order Fill / Status Callbacks
+    # =========================================================================
+
+    def register_order(self, order_id: int) -> None:
+        """
+        Register a directly-placed order for fill/status callbacks.
+
+        Call this after placing an order via portfolio.place_order_custom() so
+        that on_order_fill() and on_order_status() are invoked when IB reports
+        status changes for that order.
+        """
+        if self._executive:
+            self._executive.register_order_for_plugin(order_id, self.name)
+
+    def on_order_fill(self, order_record) -> None:
+        """
+        Called when an order attributed to this plugin is fully filled.
+
+        Override to react to fills (update holdings, wake waiting threads, etc.).
+
+        Args:
+            order_record: ib.models.OrderRecord with fill details
+        """
+
+    def on_order_status(self, order_record) -> None:
+        """
+        Called on every status change for an order attributed to this plugin.
+
+        Override to detect rejections, partial fills, INACTIVE orders, etc.
+
+        Args:
+            order_record: ib.models.OrderRecord with current status
+        """
+
+    def on_ib_error(self, req_id: int, error_code: int, error_string: str) -> None:
+        """
+        Called when IB reports an error for a request attributed to this plugin.
+
+        Covers order errors (req_id == order_id) and market data errors
+        (req_id == subscription request ID).  Informational codes (2104,
+        2106, 2119, 2158, 10167) and system messages (req_id == -1) are
+        filtered out before this method is called.
+
+        Args:
+            req_id:       IB request/order ID that errored
+            error_code:   IB error code
+            error_string: Human-readable IB error description
+        """
 
     # =========================================================================
     # Stream Management (via PluginExecutive's StreamManager)

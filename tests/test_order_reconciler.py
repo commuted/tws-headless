@@ -4,6 +4,7 @@ Tests for order_reconciler.py - Order reconciliation and netting
 
 import pytest
 from datetime import datetime
+from decimal import Decimal
 from unittest.mock import Mock, MagicMock
 from ibapi.contract import Contract
 from ibapi.order import Order
@@ -28,12 +29,12 @@ def create_contract(symbol: str) -> Contract:
     return contract
 
 
-def create_signal(symbol: str, action: str, quantity: int, confidence: float = 0.8) -> TradeSignal:
+def create_signal(symbol: str, action: str, quantity: Decimal, confidence: float = 0.8) -> TradeSignal:
     """Helper to create a test trade signal"""
     return TradeSignal(
         symbol=symbol,
         action=action,
-        quantity=quantity,
+        quantity=Decimal(quantity),
         confidence=confidence,
         reason="test signal",
     )

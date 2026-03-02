@@ -11,6 +11,7 @@ A reallocation plugin that:
 import logging
 from dataclasses import dataclass, asdict
 from datetime import datetime
+from decimal import Decimal
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 
@@ -402,7 +403,7 @@ class Momentum5DayPlugin(PluginBase):
                 signals.append(TradeSignal(
                     symbol=symbol,
                     action="HOLD",
-                    quantity=0,
+                    quantity=Decimal("0"),
                     target_weight=target_weight,
                     current_weight=current_weight,
                     reason=f"Within threshold ({weight_diff:.1f}% < {self.rebalance_threshold}%)",
@@ -433,7 +434,7 @@ class Momentum5DayPlugin(PluginBase):
             signals.append(TradeSignal(
                 symbol=symbol,
                 action=action,
-                quantity=abs(qty_diff),
+                quantity=Decimal(abs(qty_diff)),
                 target_weight=target_weight,
                 current_weight=current_weight,
                 reason=reason,
