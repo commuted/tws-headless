@@ -183,16 +183,11 @@ class UnassignedPlugin(PluginBase):
     # Trading Interface (no-op for this plugin)
     # =========================================================================
 
-    def calculate_signals(self, market_data: Dict[str, List[Dict]]) -> List[TradeSignal]:
+    def calculate_signals(self) -> List[TradeSignal]:
         """
         This plugin does not generate trade signals.
         """
         return []
-
-    @property
-    def required_bars(self) -> int:
-        """No market data required"""
-        return 0
 
     # =========================================================================
     # Sync Methods

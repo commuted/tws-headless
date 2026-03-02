@@ -89,7 +89,7 @@ class MyPlugin(PluginBase):
     def freeze(self) -> bool:  ...
     def resume(self) -> bool:  ...
 
-    def calculate_signals(self, market_data: Dict) -> List[TradeSignal]:
+    def calculate_signals(self) -> List[TradeSignal]:
         return []
 
     def handle_request(self, request_type: str, payload: Dict) -> Dict:
@@ -227,19 +227,19 @@ def resume(self) -> bool:
     return True
 ```
 
-### `calculate_signals(self, market_data: Dict) -> List[TradeSignal]`
+### `calculate_signals(self) -> List[TradeSignal]`
 
 Called by the executive on every bar event (or tick, depending on
-`ExecutionMode`). The `market_data` argument is currently unused — plugins
-receive data through stream callbacks registered in `start()`, not through
-this argument.
+`ExecutionMode`). Plugins receive market data through stream callbacks
+registered in `start()` and maintain their own internal state; this method
+reads that state and returns signals.
 
 Return a list of `TradeSignal` objects to request order execution, or an
 empty list. Exceptions raised here are caught, logged, and counted toward
 the circuit breaker.
 
 ```python
-def calculate_signals(self, market_data: Dict) -> List[TradeSignal]:
+def calculate_signals(self) -> List[TradeSignal]:
     if self._signal_pending:
         self._signal_pending = False
         return [TradeSignal(symbol="SPY", action="BUY", quantity=Decimal("10"))]
@@ -994,7 +994,7 @@ class DailyReportPlugin(PluginBase):
     def resume(self) -> bool:
         return True
 
-    def calculate_signals(self, market_data: Dict) -> List[TradeSignal]:
+    def calculate_signals(self) -> List[TradeSignal]:
         return []
 
     def handle_request(self, request_type: str, payload: Dict) -> Dict:
@@ -1063,7 +1063,7 @@ class RSIPublisherPlugin(PluginBase):
     def resume(self) -> bool:
         return True
 
-    def calculate_signals(self, market_data):
+    def calculate_signals(self):
         return []
 
     def handle_request(self, request_type, payload):
@@ -1133,7 +1133,7 @@ class RSIStrategyPlugin(PluginBase):
     def resume(self) -> bool:
         return True
 
-    def calculate_signals(self, market_data):
+    def calculate_signals(self):
         signals, self._pending = self._pending[:], []
         return signals
 

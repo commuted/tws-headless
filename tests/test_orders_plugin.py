@@ -126,13 +126,8 @@ class TestOrdersPluginBasic:
     def test_no_signals(self):
         """Test plugin doesn't generate signals"""
         plugin = OrdersPlugin()
-        signals = plugin.calculate_signals({"SPY": [{"close": 450.0}]})
+        signals = plugin.calculate_signals()
         assert signals == []
-
-    def test_required_bars_zero(self):
-        """Test no bars are required"""
-        plugin = OrdersPlugin()
-        assert plugin.required_bars == 0
 
     def test_no_holdings(self):
         """Test plugin doesn't hold positions"""

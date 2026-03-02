@@ -75,9 +75,6 @@ class DummyPlugin(PluginBase):
             "and always returns HOLD signals. Use as a template for new plugins."
         )
 
-    @property
-    def required_bars(self) -> int:
-        return 1  # Minimal requirement
 
     # =========================================================================
     # MANDATORY LIFECYCLE METHODS
@@ -192,17 +189,11 @@ class DummyPlugin(PluginBase):
     # TRADING INTERFACE
     # =========================================================================
 
-    def calculate_signals(
-        self,
-        market_data: Dict[str, List[Dict]],
-    ) -> List[TradeSignal]:
+    def calculate_signals(self) -> List[TradeSignal]:
         """
         Calculate trading signals - always returns HOLD.
 
         This is a placeholder implementation that doesn't analyze data.
-
-        Args:
-            market_data: Dict mapping symbol to list of daily bars (ignored)
 
         Returns:
             List of HOLD signals for all instruments

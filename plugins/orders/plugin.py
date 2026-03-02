@@ -151,11 +151,7 @@ class OrdersPlugin(PluginBase):
     def description(self) -> str:
         return self._description
 
-    @property
-    def required_bars(self) -> int:
-        return 0
-
-    def calculate_signals(self, market_data: Dict) -> List:
+    def calculate_signals(self) -> List:
         """This plugin does not generate signals"""
         return []
 

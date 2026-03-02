@@ -15,6 +15,7 @@ from decimal import Decimal
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 
+from ib.contract_builder import ContractBuilder
 from ..base import (
     PluginBase,
     TradeSignal,
@@ -110,10 +111,6 @@ class Momentum5DayPlugin(PluginBase):
             "overweighting assets with positive 5-day returns and underweighting "
             "those with negative returns."
         )
-
-    @property
-    def required_bars(self) -> int:
-        return self.lookback_days
 
     @property
     def momentum_metrics(self) -> Dict[str, MomentumMetrics]:
@@ -328,16 +325,9 @@ class Momentum5DayPlugin(PluginBase):
     # TRADING INTERFACE
     # =========================================================================
 
-    def calculate_signals(
-        self,
-        market_data: Dict[str, List[Dict]],
-    ) -> List[TradeSignal]:
+    def calculate_signals(self) -> List[TradeSignal]:
         """
         Calculate trading signals based on 5-day momentum.
-
-        Args:
-            market_data: Dict mapping symbol to list of daily bars
-                        Each bar: {"date", "open", "high", "low", "close", "volume"}
 
         Returns:
             List of TradeSignal objects
@@ -351,6 +341,13 @@ class Momentum5DayPlugin(PluginBase):
         if not instruments:
             logger.warning("No enabled instruments")
             return signals
+
+        # Fetch daily bars for each instrument
+        market_data = {}
+        for inst in instruments:
+            bars = self._fetch_daily_bars(inst)
+            if bars:
+                market_data[inst.symbol] = bars
 
         # Calculate momentum for each instrument
         for inst in instruments:
@@ -603,6 +600,31 @@ class Momentum5DayPlugin(PluginBase):
             target_weights = {s: w * factor for s, w in target_weights.items()}
 
         return target_weights
+
+    def _fetch_daily_bars(self, inst: PluginInstrument) -> List[Dict]:
+        """Fetch recent daily bars for an instrument using historical data API."""
+        if not self.portfolio:
+            return []
+        raw = self.get_historical_data(
+            contract=inst.to_contract(),
+            duration_str=f"{self.lookback_days + 5} D",
+            bar_size_setting="1 day",
+            what_to_show="TRADES",
+            use_rth=True,
+        )
+        if not raw:
+            return []
+        return [
+            {
+                "date": b.date,
+                "open": float(b.open),
+                "high": float(b.high),
+                "low": float(b.low),
+                "close": float(b.close),
+                "volume": float(b.volume),
+            }
+            for b in raw
+        ]
 
     def _get_current_prices(self, market_data: Dict[str, List[Dict]]) -> Dict[str, float]:
         """Get current prices from market data"""

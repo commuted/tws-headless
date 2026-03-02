@@ -79,7 +79,7 @@ class SMASubscriberPlugin(PluginBase):
     def resume(self) -> bool:
         return True
 
-    def calculate_signals(self, market_data: Dict) -> List[TradeSignal]:
+    def calculate_signals(self) -> List[TradeSignal]:
         return []
 
     # -------------------------------------------------------------------------

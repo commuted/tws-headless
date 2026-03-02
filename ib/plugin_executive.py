@@ -2562,11 +2562,7 @@ class PluginExecutive:
             )
 
         try:
-            # Prepare market data from feed
-            market_data = self._prepare_market_data(plugin)
-
-            # Run plugin
-            result = plugin.run(market_data=market_data)
+            result = plugin.run()
 
             config.last_run = datetime.now()
             config.run_count += 1
@@ -2635,44 +2631,6 @@ class PluginExecutive:
                 success=False,
                 error=str(e),
             )
-
-    def _prepare_market_data(
-        self,
-        plugin: PluginBase,
-    ) -> Dict[str, List[Dict]]:
-        """Prepare market data for a plugin from the data feed"""
-        market_data = {}
-
-        for instrument in plugin.enabled_instruments:
-            symbol = instrument.symbol
-
-            # Get bars from feed
-            bars = self.data_feed.get_bars(
-                symbol,
-                DataType.BAR_1MIN,
-                count=plugin.required_bars * 2
-            )
-
-            if not bars:
-                bars = self.data_feed.get_bars(
-                    symbol,
-                    DataType.BAR_5SEC,
-                    count=plugin.required_bars * 12
-                )
-
-            market_data[symbol] = [
-                {
-                    "date": bar.timestamp,
-                    "open": bar.open,
-                    "high": bar.high,
-                    "low": bar.low,
-                    "close": bar.close,
-                    "volume": bar.volume,
-                }
-                for bar in bars
-            ]
-
-        return market_data
 
     def _process_signal(self, plugin_name: str, signal: TradeSignal):
         """Process a trade signal from a plugin"""

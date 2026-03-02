@@ -105,23 +105,14 @@ class TestUnassignedPluginNoSignals:
     def test_calculate_signals_empty(self):
         """Test calculate_signals returns empty list"""
         plugin = UnassignedPlugin()
-        signals = plugin.calculate_signals({})
+        signals = plugin.calculate_signals()
         assert signals == []
 
     def test_calculate_signals_with_data(self):
-        """Test calculate_signals ignores market data"""
+        """Test calculate_signals returns empty list regardless of portfolio state"""
         plugin = UnassignedPlugin()
-        market_data = {
-            "SPY": [{"close": 450.0}],
-            "QQQ": [{"close": 380.0}],
-        }
-        signals = plugin.calculate_signals(market_data)
+        signals = plugin.calculate_signals()
         assert signals == []
-
-    def test_required_bars_zero(self):
-        """Test no bars are required"""
-        plugin = UnassignedPlugin()
-        assert plugin.required_bars == 0
 
 
 class TestUnassignedPluginSync:

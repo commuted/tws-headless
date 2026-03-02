@@ -404,7 +404,6 @@ class PluginBase(ABC):
         # Data stores
         self._instruments: Dict[str, PluginInstrument] = {}
         self._holdings: Optional[Holdings] = None
-        self._market_data: Dict[str, List[Dict]] = {}
 
         # Plugin state
         self._state = PluginState.UNLOADED
@@ -543,16 +542,9 @@ class PluginBase(ABC):
     # =========================================================================
 
     @abstractmethod
-    def calculate_signals(
-        self,
-        market_data: Dict[str, List[Dict]],
-    ) -> List[TradeSignal]:
+    def calculate_signals(self) -> List[TradeSignal]:
         """
-        Calculate trading signals based on market data.
-
-        Args:
-            market_data: Dict mapping symbol to list of bar data
-                        Each bar: {"date", "open", "high", "low", "close", "volume"}
+        Calculate trading signals.
 
         Returns:
             List of TradeSignal objects
@@ -564,11 +556,6 @@ class PluginBase(ABC):
     def description(self) -> str:
         """Human-readable description of the plugin"""
         pass
-
-    @property
-    def required_bars(self) -> int:
-        """Number of historical bars required for calculation"""
-        return 1
 
     # =========================================================================
     # State Persistence
@@ -1204,37 +1191,12 @@ class PluginBase(ABC):
         return [i.to_contract() for i in self.enabled_instruments]
 
     # =========================================================================
-    # Market Data Management
-    # =========================================================================
-
-    def set_market_data(self, symbol: str, bars: List[Dict]):
-        """
-        Set market data for a symbol.
-
-        Args:
-            symbol: Trading symbol
-            bars: List of bar data, each with date, open, high, low, close, volume
-        """
-        self._market_data[symbol.upper()] = bars
-
-    def get_market_data(self, symbol: str) -> List[Dict]:
-        """Get market data for a symbol"""
-        return self._market_data.get(symbol.upper(), [])
-
-    def clear_market_data(self):
-        """Clear all market data"""
-        self._market_data.clear()
-
-    # =========================================================================
     # Execution
     # =========================================================================
 
-    def run(self, market_data: Optional[Dict[str, List[Dict]]] = None) -> PluginResult:
+    def run(self) -> PluginResult:
         """
         Run the plugin and generate signals.
-
-        Args:
-            market_data: Optional market data (uses stored data if not provided)
 
         Returns:
             PluginResult with signals and metrics
@@ -1255,21 +1217,8 @@ class PluginBase(ABC):
                 error=f"Plugin in {self._state.value} state, cannot run",
             )
 
-        # Use provided data or stored data
-        data = market_data or self._market_data
-
-        # Validate we have enough data
-        for symbol in [i.symbol for i in self.enabled_instruments]:
-            bars = data.get(symbol, [])
-            if len(bars) < self.required_bars:
-                logger.warning(
-                    f"Insufficient data for {symbol}: {len(bars)} bars, "
-                    f"need {self.required_bars}"
-                )
-
         try:
-            # Calculate signals
-            signals = self.calculate_signals(data)
+            signals = self.calculate_signals()
 
             self._last_run = datetime.now()
 

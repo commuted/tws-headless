@@ -44,7 +44,7 @@ class ConcretePlugin(PluginBase):
     def freeze(self): return True
     def resume(self): return True
     def handle_request(self, request_type, payload): return {}
-    def calculate_signals(self, market_data): return []
+    def calculate_signals(self): return []
 
     def on_order_fill(self, order_record):
         self.fill_calls.append(order_record)

@@ -44,7 +44,7 @@ class TestPlugin(PluginBase):
     def handle_request(self, request_type: str, payload: dict) -> dict:
         return {"success": True}
 
-    def calculate_signals(self, market_data: dict) -> list:
+    def calculate_signals(self) -> list:
         return []
 '''
 
@@ -158,7 +158,7 @@ class Plugin{i}(PluginBase):
     def handle_request(self, request_type, payload):
         return {{"success": True}}
 
-    def calculate_signals(self, market_data):
+    def calculate_signals(self):
         return []
 '''
                 with open(os.path.join(tmpdir, f"plugin_{i}.py"), "w") as f:

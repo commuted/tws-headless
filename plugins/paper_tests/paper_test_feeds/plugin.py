@@ -130,10 +130,7 @@ class PaperTestFeedsPlugin(PluginBase):
         logger.info(f"Resuming plugin '{self.name}'")
         return True
 
-    def calculate_signals(
-        self,
-        market_data: Dict[str, List[Dict]],
-    ) -> List[TradeSignal]:
+    def calculate_signals(self) -> List[TradeSignal]:
         return []
 
     # =========================================================================

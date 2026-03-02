@@ -90,9 +90,6 @@ class PanicPlugin(PluginBase):
             "close them, highest urgency first."
         )
 
-    @property
-    def required_bars(self) -> int:
-        return 0
 
     # =========================================================================
     # MANDATORY LIFECYCLE METHODS
@@ -255,10 +252,7 @@ class PanicPlugin(PluginBase):
     # TRADING INTERFACE
     # =========================================================================
 
-    def calculate_signals(
-        self,
-        market_data: Dict[str, List[Dict]],
-    ) -> List[TradeSignal]:
+    def calculate_signals(self) -> List[TradeSignal]:
         """
         Generate SELL signals for all queued positions.
 

@@ -305,7 +305,7 @@ class ConcreteTestPlugin(PluginBase):
             return {"success": True, "echo": payload}
         return {"success": False, "error": "Unknown request"}
 
-    def calculate_signals(self, market_data: dict) -> list:
+    def calculate_signals(self) -> list:
         return [TradeSignal("SPY", "HOLD", reason="Test")]
 
 
@@ -377,7 +377,7 @@ class TestPluginBase:
         plugin.add_instrument(PluginInstrument("SPY", "Test"))
         plugin.load()
 
-        result = plugin.run({})
+        result = plugin.run()
 
         assert result.success is True
         assert len(result.signals) == 1
