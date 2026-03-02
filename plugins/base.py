@@ -710,6 +710,8 @@ class PluginBase(ABC):
         data_types: Optional[Set] = None,
         on_tick: Optional[Callable] = None,
         on_bar: Optional[Callable] = None,
+        on_tick_by_tick: Optional[Callable] = None,
+        on_depth: Optional[Callable] = None,
         what_to_show: str = "TRADES",
         use_rth: bool = True,
     ) -> bool:
@@ -722,6 +724,8 @@ class PluginBase(ABC):
             data_types: Set of DataType values (defaults to TICK + BAR_5SEC)
             on_tick: Callback(tick: TickData) for tick data (price or size tick)
             on_bar: Callback(bar) for bar data
+            on_tick_by_tick: Callback(tbt: TickByTickData) for tick-by-tick events
+            on_depth: Callback(depth: MarketDepth) for market depth updates
             what_to_show: TRADES, MIDPOINT, BID, ASK
             use_rth: Regular trading hours only
 
@@ -733,7 +737,8 @@ class PluginBase(ABC):
             return False
         return self._executive.stream_manager.request_stream(
             self.name, symbol, contract, data_types,
-            on_tick, on_bar, what_to_show, use_rth,
+            on_tick, on_bar, on_tick_by_tick, on_depth,
+            what_to_show, use_rth,
         )
 
     def cancel_stream(self, symbol: str) -> bool:

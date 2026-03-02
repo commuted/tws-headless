@@ -33,6 +33,10 @@ class DataType(Enum):
     BAR_5MIN = "bar_5min"
     BAR_15MIN = "bar_15min"
     BAR_1HOUR = "bar_1hour"
+    TICK_BY_TICK_LAST = "tick_by_tick_last"
+    TICK_BY_TICK_BIDASK = "tick_by_tick_bidask"
+    TICK_BY_TICK_MIDPOINT = "tick_by_tick_midpoint"
+    MARKET_DEPTH = "market_depth"
 
 
 @dataclass
@@ -43,6 +47,48 @@ class TickData:
     tick_type: str
     size: Optional[int] = None  # set for size ticks (BID_SIZE, ASK_SIZE, LAST_SIZE, VOLUME)
     timestamp: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class TickByTickData:
+    """A single tick-by-tick event from reqTickByTick"""
+    symbol: str
+    tick_type: str       # "Last", "AllLast", "BidAsk", "MidPoint"
+    timestamp: datetime
+    # Last / AllLast fields
+    price: float = 0.0
+    size: int = 0
+    exchange: str = ""
+    special_conditions: str = ""
+    past_limit: bool = False
+    unreported: bool = False
+    # BidAsk fields
+    bid_price: float = 0.0
+    ask_price: float = 0.0
+    bid_size: int = 0
+    ask_size: int = 0
+    bid_past_low: bool = False
+    ask_past_high: bool = False
+    # MidPoint field
+    mid_point: float = 0.0
+
+
+@dataclass
+class DepthLevel:
+    """One price level in an order book"""
+    price: float
+    size: int
+    market_maker: str = ""  # populated for L2 (reqMktDepthL2)
+
+
+@dataclass
+class MarketDepth:
+    """L2 order book snapshot for a symbol"""
+    symbol: str
+    bids: List["DepthLevel"]   # best bid first (highest price)
+    asks: List["DepthLevel"]   # best ask first (lowest price)
+    timestamp: datetime = field(default_factory=datetime.now)
+    is_smart_depth: bool = False
 
 
 @dataclass
@@ -57,6 +103,11 @@ class InstrumentSubscription:
     subscribed_at: datetime = field(default_factory=datetime.now)
     # Track which algorithms/subscribers want this data
     subscribers: Set[str] = field(default_factory=set)
+    # Per-subtype active flags for tick-by-tick and depth
+    tbt_last_active: bool = False
+    tbt_bidask_active: bool = False
+    tbt_midpoint_active: bool = False
+    depth_active: bool = False
 
 
 @dataclass
@@ -76,6 +127,8 @@ class DataBuffer:
     bars_5min: deque = field(default_factory=lambda: deque(maxlen=500))
     bars_15min: deque = field(default_factory=lambda: deque(maxlen=200))
     bars_1hour: deque = field(default_factory=lambda: deque(maxlen=100))
+    tbt_ticks: deque = field(default_factory=lambda: deque(maxlen=10000))
+    depth: Optional["MarketDepth"] = None
 
     def __post_init__(self):
         # Ensure maxlen is set
@@ -85,6 +138,7 @@ class DataBuffer:
         self.bars_5min = deque(maxlen=self.max_bars // 2)
         self.bars_15min = deque(maxlen=self.max_bars // 5)
         self.bars_1hour = deque(maxlen=self.max_bars // 10)
+        self.tbt_ticks = deque(maxlen=10000)
 
 
 class BarAggregator:
@@ -313,6 +367,8 @@ class DataFeed:
         self.on_tick: Optional[Callable[[str, TickData], None]] = None
         self.on_bar: Optional[Callable[[str, Bar, DataType], None]] = None
         self.on_error: Optional[Callable[[str, Exception], None]] = None
+        self.on_tick_by_tick: Optional[Callable[[str, "TickByTickData"], None]] = None
+        self.on_depth: Optional[Callable[[str, "MarketDepth"], None]] = None
 
         # Statistics
         self._stats = {
@@ -504,11 +560,15 @@ class DataFeed:
         self._original_on_tick = self.portfolio._on_tick
         self._original_on_tick_size = getattr(self.portfolio, '_on_tick_size', None)
         self._original_on_bar = self.portfolio._on_bar
+        self._original_on_tick_by_tick = getattr(self.portfolio, '_on_tick_by_tick', None)
+        self._original_on_depth = getattr(self.portfolio, '_on_depth', None)
 
         # Set our handlers
         self.portfolio._on_tick = self._handle_tick
         self.portfolio._on_tick_size = self._handle_tick_size
         self.portfolio._on_bar = self._handle_bar
+        self.portfolio._on_tick_by_tick = self._handle_tick_by_tick
+        self.portfolio._on_depth = self._handle_depth
 
     def _teardown_callbacks(self):
         """Restore original portfolio callbacks"""
@@ -518,6 +578,10 @@ class DataFeed:
             self.portfolio._on_tick_size = self._original_on_tick_size
         if hasattr(self, '_original_on_bar'):
             self.portfolio._on_bar = self._original_on_bar
+        if hasattr(self, '_original_on_tick_by_tick'):
+            self.portfolio._on_tick_by_tick = self._original_on_tick_by_tick
+        if hasattr(self, '_original_on_depth'):
+            self.portfolio._on_depth = self._original_on_depth
 
     def _start_subscription(self, symbol: str, sub: InstrumentSubscription):
         """Start data subscription for a symbol"""
@@ -536,6 +600,22 @@ class DataFeed:
                 symbol, sub.contract, sub.what_to_show, sub.use_rth
             )
 
+        # Start tick-by-tick streams
+        if DataType.TICK_BY_TICK_LAST in sub.data_types and not sub.tbt_last_active:
+            self.portfolio.request_tick_by_tick(symbol, sub.contract, "Last")
+            sub.tbt_last_active = True
+        if DataType.TICK_BY_TICK_BIDASK in sub.data_types and not sub.tbt_bidask_active:
+            self.portfolio.request_tick_by_tick(symbol, sub.contract, "BidAsk")
+            sub.tbt_bidask_active = True
+        if DataType.TICK_BY_TICK_MIDPOINT in sub.data_types and not sub.tbt_midpoint_active:
+            self.portfolio.request_tick_by_tick(symbol, sub.contract, "MidPoint")
+            sub.tbt_midpoint_active = True
+
+        # Start market depth stream
+        if DataType.MARKET_DEPTH in sub.data_types and not sub.depth_active:
+            self.portfolio.request_market_depth(symbol, sub.contract)
+            sub.depth_active = True
+
         sub.active = True
         logger.debug(f"Started subscription for {symbol}")
 
@@ -552,6 +632,18 @@ class DataFeed:
                     DataType.BAR_15MIN, DataType.BAR_1HOUR}
         if sub.data_types & bar_types:
             self.portfolio.unstream_bar_symbol(symbol)
+
+        # Stop tick-by-tick streams
+        if sub.tbt_last_active or sub.tbt_bidask_active or sub.tbt_midpoint_active:
+            self.portfolio.cancel_tick_by_tick(symbol)
+            sub.tbt_last_active = False
+            sub.tbt_bidask_active = False
+            sub.tbt_midpoint_active = False
+
+        # Stop market depth stream
+        if sub.depth_active:
+            self.portfolio.cancel_market_depth(symbol)
+            sub.depth_active = False
 
         sub.active = False
         logger.debug(f"Stopped subscription for {symbol}")
@@ -676,6 +768,40 @@ class DataFeed:
                 if self.on_error:
                     self.on_error(symbol, e)
 
+    def _handle_tick_by_tick(self, symbol: str, tbt: "TickByTickData"):
+        """Handle incoming tick-by-tick data"""
+        # Buffer the event
+        with self._lock:
+            if symbol in self._buffers:
+                self._buffers[symbol].tbt_ticks.append(tbt)
+
+        # Route to callback
+        if self.on_tick_by_tick:
+            try:
+                self.on_tick_by_tick(symbol, tbt)
+            except Exception as e:
+                self._stats["errors"] += 1
+                logger.error(f"Error in tick_by_tick callback for {symbol}: {e}")
+                if self.on_error:
+                    self.on_error(symbol, e)
+
+    def _handle_depth(self, symbol: str, depth: "MarketDepth"):
+        """Handle incoming market depth (L2) update"""
+        # Store latest snapshot
+        with self._lock:
+            if symbol in self._buffers:
+                self._buffers[symbol].depth = depth
+
+        # Route to callback
+        if self.on_depth:
+            try:
+                self.on_depth(symbol, depth)
+            except Exception as e:
+                self._stats["errors"] += 1
+                logger.error(f"Error in depth callback for {symbol}: {e}")
+                if self.on_error:
+                    self.on_error(symbol, e)
+
     # =========================================================================
     # Data Access Methods
     # =========================================================================
@@ -788,6 +914,51 @@ class DataFeed:
             return bar.close
 
         return None
+
+    def get_tick_by_ticks(
+        self,
+        symbol: str,
+        count: Optional[int] = None,
+        since: Optional[datetime] = None,
+    ) -> List["TickByTickData"]:
+        """
+        Get buffered tick-by-tick events for a symbol.
+
+        Args:
+            symbol: Symbol to get events for
+            count: Maximum number of events (None = all)
+            since: Only events after this time (None = all)
+
+        Returns:
+            List of TickByTickData objects (most recent last)
+        """
+        with self._lock:
+            if symbol not in self._buffers:
+                return []
+            tbt_ticks = list(self._buffers[symbol].tbt_ticks)
+
+        if since:
+            tbt_ticks = [t for t in tbt_ticks if t.timestamp >= since]
+
+        if count:
+            tbt_ticks = tbt_ticks[-count:]
+
+        return tbt_ticks
+
+    def get_depth(self, symbol: str) -> Optional["MarketDepth"]:
+        """
+        Get the latest market depth snapshot for a symbol.
+
+        Args:
+            symbol: Symbol to get depth for
+
+        Returns:
+            MarketDepth snapshot or None if not available
+        """
+        with self._lock:
+            if symbol not in self._buffers:
+                return None
+            return self._buffers[symbol].depth
 
     def clear_buffers(self, symbol: Optional[str] = None):
         """

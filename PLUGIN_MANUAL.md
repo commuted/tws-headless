@@ -14,6 +14,11 @@ Complete reference for writing plugins for the IB trading engine.
 6. [Lifecycle Methods](#6-lifecycle-methods)
 7. [State Persistence](#7-state-persistence)
 8. [Market Data Streams](#8-market-data-streams)
+   - 8.1 [Throttled ticks and bars](#81-throttled-ticks-and-bars-reqmktdata--reqrealtimebars)
+   - 8.2 [Tick-by-tick data](#82-tick-by-tick-data-reqtickbytick)
+   - 8.3 [Market depth (L2)](#83-market-depth-l2-reqmktdepth)
+   - 8.4 [Cancelling streams](#84-cancelling-streams)
+   - 8.5 [Buffered data accessors](#85-buffered-data-accessors)
 9. [Historical Data](#9-historical-data)
 10. [MessageBus — Publish / Subscribe](#10-messagebus--publish--subscribe)
 11. [Request Handling](#11-request-handling)
@@ -288,105 +293,294 @@ symbol; all plugins that request the same symbol receive all data via
 their own callbacks. Cancelling a stream decrements a reference count —
 the IB subscription is only torn down when no plugins remain subscribed.
 
-### `request_stream(...) -> bool`
+### Full `request_stream` signature
 
 ```python
 self.request_stream(
     symbol="SPY",                          # str — key used for cancel_stream
     contract=ContractBuilder.us_stock("SPY"),
     data_types={DataType.BAR_5SEC},        # set of DataType values
-    on_tick=self._on_tick,                 # optional callback
-    on_bar=self._on_bar,                   # optional callback
+    on_tick=self._on_tick,                 # optional: throttled price/size updates
+    on_bar=self._on_bar,                   # optional: 5-sec bars and aggregates
+    on_tick_by_tick=self._on_tbt,          # optional: every trade / quote
+    on_depth=self._on_depth,               # optional: L2 order book updates
     what_to_show="TRADES",                 # "TRADES" | "MIDPOINT" | "BID" | "ASK"
     use_rth=True,                          # regular trading hours only
 )
 ```
 
-**`data_types`** — pass a set of `DataType` enum values:
+All four callbacks are independent and optional. You can combine them
+freely in a single `request_stream` call.
 
-| DataType | IB source | Notes |
-|----------|-----------|-------|
-| `DataType.TICK` | `reqMktData` | Every price update |
+**`data_types`** — controls which IB subscriptions are opened. Pass any
+combination of `DataType` values:
+
+| DataType | IB API call | Notes |
+|----------|-------------|-------|
+| `DataType.TICK` | `reqMktData` | Throttled price/size updates |
 | `DataType.BAR_5SEC` | `reqRealTimeBars` | 5-second OHLCV; market hours only |
-| `DataType.BAR_1MIN` | aggregated from 5-sec | Completed when minute boundary passes |
+| `DataType.BAR_1MIN` | aggregated from 5-sec | Completed at minute boundary |
 | `DataType.BAR_5MIN` | aggregated from 5-sec | Completed at 5-min boundary |
 | `DataType.BAR_15MIN` | aggregated from 5-sec | Completed at 15-min boundary |
 | `DataType.BAR_1HOUR` | aggregated from 5-sec | Completed at hour boundary |
+| `DataType.TICK_BY_TICK_LAST` | `reqTickByTick("Last")` | Every last-sale trade |
+| `DataType.TICK_BY_TICK_BIDASK` | `reqTickByTick("BidAsk")` | Every quote change |
+| `DataType.TICK_BY_TICK_MIDPOINT` | `reqTickByTick("MidPoint")` | Every mid-point change |
+| `DataType.MARKET_DEPTH` | `reqMktDepth` | L2 order book (10 levels) |
 
 Default when `data_types` is `None`: `{DataType.TICK, DataType.BAR_5SEC}`.
 
-**`what_to_show`** applies to both tick and bar subscriptions. For US
-equity ticks on a paper account, use delayed mode (call
-`self.portfolio.reqMarketDataType(3)` before subscribing). For
-`reqRealTimeBars`, delayed mode silently suppresses all callbacks — use
-live mode (`reqMarketDataType(1)`) for bars.
+`what_to_show` applies to `TICK` and `BAR_*` subscriptions. On paper
+accounts, use delayed mode (`self.portfolio.reqMarketDataType(3)`) for
+ticks and live mode (`reqMarketDataType(1)`) for bars — `reqRealTimeBars`
+silently suppresses all callbacks in delayed mode.
 
-### Tick callback signature
+---
 
-The callback receives a single `TickData` object containing all tick fields:
+### 8.1 Throttled ticks and bars (`reqMktData` / `reqRealTimeBars`)
+
+These are the standard IB data streams that most plugins need.
+
+#### Tick callback
+
+Receives one `TickData` per price or size event. IB throttles these
+(typically ~250 ms intervals), so they are suitable for UI-style updates
+but miss individual trades. For unthrottled trade data see
+[Section 8.2](#82-tick-by-tick-data-reqtickbytick).
 
 ```python
 from ib.data_feed import TickData
 
 def _on_tick(self, tick: TickData) -> None:
     # tick.symbol     str            — e.g. "SPY"
-    # tick.tick_type  str            — e.g. "LAST", "BID", "ASK", "CLOSE",
-    #                                        "DELAYED_LAST", "DELAYED_BID",
-    #                                        "BID_SIZE", "ASK_SIZE", "LAST_SIZE",
-    #                                        "VOLUME", "DELAYED_VOLUME", ...
-    # tick.price      float          — last traded price; 0.0 for size-only ticks
-    # tick.size       Optional[int]  — bid/ask/last size or volume; None for price ticks
-    # tick.timestamp  datetime       — wall-clock time the tick was received
+    # tick.tick_type  str            — "LAST", "BID", "ASK", "CLOSE",
+    #                                  "DELAYED_LAST", "BID_SIZE", "ASK_SIZE",
+    #                                  "LAST_SIZE", "VOLUME", ...
+    # tick.price      float          — traded price; 0.0 for size-only ticks
+    # tick.size       Optional[int]  — bid/ask/last size; None for price ticks
+    # tick.timestamp  datetime       — wall-clock receipt time
     pass
 ```
 
-Price ticks (LAST, BID, ASK, CLOSE, …) have `tick.price > 0` and `tick.size is None`.
-Size ticks (BID_SIZE, ASK_SIZE, LAST_SIZE, VOLUME, …) have `tick.size >= 0` and `tick.price == 0.0`.
+Price ticks (`tick.size is None`) carry `tick.price > 0`.
+Size ticks (`tick.size >= 0`) carry `tick.price == 0.0`.
 
-```python
-def _on_tick(self, tick: TickData) -> None:
-    if tick.size is not None:
-        logger.debug(f"{tick.symbol} {tick.tick_type}: size={tick.size}")
-    else:
-        logger.debug(f"{tick.symbol} {tick.tick_type}: price={tick.price:.4f}")
-```
-
-### Bar callback signature
+#### Bar callback
 
 ```python
 def _on_bar(self, bar) -> None:
     # bar is ib.models.Bar
     # bar.symbol    str
-    # bar.timestamp str  ISO format, e.g. "2026-02-26T09:30:00"
+    # bar.timestamp str   ISO format — e.g. "2026-02-26T09:30:00"
     # bar.open      float
     # bar.high      float
     # bar.low       float
     # bar.close     float
     # bar.volume    int
-    # bar.wap       float   weighted average price
-    # bar.bar_count int     number of trades in bar
+    # bar.wap       float  weighted average price
+    # bar.bar_count int    number of trades in bar
     #
     # Computed properties:
-    # bar.range     float   high - low
-    # bar.body      float   abs(close - open)
+    # bar.range      float  high - low
+    # bar.body       float  abs(close - open)
     # bar.is_bullish bool   close > open
     # bar.is_bearish bool   close < open
-    # bar.mid       float   (high + low) / 2
+    # bar.mid        float  (high + low) / 2
 ```
 
-The same `on_bar` callback receives bars from all `DataType` values the
-plugin subscribed to. The bar's `timestamp` boundary identifies its
-timeframe (e.g. `09:35:00` = 5-min bar opening at 09:35).
+The same `on_bar` callback receives bars from every `BAR_*` DataType the
+plugin subscribed to. The bar's `timestamp` boundary identifies the
+timeframe (e.g. `09:35:00` = 5-min bar that opened at 09:35).
 
-### `cancel_stream(symbol: str) -> bool`
+---
+
+### 8.2 Tick-by-tick data (`reqTickByTick`)
+
+Tick-by-tick delivers **every individual trade or quote** without the
+throttling that `reqMktData` applies. Use it for microstructure analysis,
+trade-level auditing, or latency-sensitive strategies.
+
+Three subtypes are available as separate `DataType` values:
+
+| DataType | IB tick_type | Delivers |
+|----------|--------------|---------|
+| `TICK_BY_TICK_LAST` | `"Last"` | Last-sale prints, including `AllLast` |
+| `TICK_BY_TICK_BIDASK` | `"BidAsk"` | Every NBBO quote change |
+| `TICK_BY_TICK_MIDPOINT` | `"MidPoint"` | Every mid-point change |
+
+You can subscribe to any combination in one call:
+
+```python
+self.request_stream(
+    symbol="SPY",
+    contract=ContractBuilder.us_stock("SPY", primary_exchange="ARCA"),
+    data_types={DataType.TICK_BY_TICK_LAST, DataType.TICK_BY_TICK_BIDASK},
+    on_tick_by_tick=self._on_tbt,
+)
+```
+
+#### `TickByTickData` fields
+
+The callback receives a single `TickByTickData` object. Not all fields
+are populated for every `tick_type` — only the fields relevant to that
+subtype carry meaningful values.
+
+```python
+from ib.data_feed import TickByTickData
+
+def _on_tbt(self, tbt: TickByTickData) -> None:
+    # tbt.symbol     str       — e.g. "SPY"
+    # tbt.tick_type  str       — "Last", "AllLast", "BidAsk", or "MidPoint"
+    # tbt.timestamp  datetime  — exchange timestamp (not wall-clock)
+
+    # Last / AllLast fields
+    # tbt.price              float  — trade price
+    # tbt.size               int    — trade size (shares)
+    # tbt.exchange           str    — executing exchange (e.g. "ARCA")
+    # tbt.special_conditions str    — sale condition flags
+    # tbt.past_limit         bool   — trade was outside the NBBO
+    # tbt.unreported         bool   — trade not yet officially reported
+
+    # BidAsk fields
+    # tbt.bid_price    float  — NBBO bid price
+    # tbt.ask_price    float  — NBBO ask price
+    # tbt.bid_size     int    — NBBO bid size
+    # tbt.ask_size     int    — NBBO ask size
+    # tbt.bid_past_low   bool  — bid is below the day's low
+    # tbt.ask_past_high  bool  — ask is above the day's high
+
+    # MidPoint field
+    # tbt.mid_point  float  — (bid + ask) / 2
+    pass
+```
+
+#### Example: logging every trade
+
+```python
+def _on_tbt(self, tbt: TickByTickData) -> None:
+    if tbt.tick_type in ("Last", "AllLast"):
+        logger.info(
+            f"{tbt.symbol} trade: {tbt.size:,} @ {tbt.price:.2f} "
+            f"on {tbt.exchange} at {tbt.timestamp.isoformat()}"
+        )
+    elif tbt.tick_type == "BidAsk":
+        spread = tbt.ask_price - tbt.bid_price
+        logger.debug(
+            f"{tbt.symbol} quote: {tbt.bid_size} × {tbt.bid_price:.2f} "
+            f"/ {tbt.ask_price:.2f} × {tbt.ask_size}  spread={spread:.4f}"
+        )
+```
+
+---
+
+### 8.3 Market depth (L2) (`reqMktDepth`)
+
+Market depth delivers incremental updates to the full L2 order book.
+After each update the engine reconstructs and delivers a sorted
+`MarketDepth` snapshot.
+
+```python
+self.request_stream(
+    symbol="SPY",
+    contract=ContractBuilder.us_stock("SPY", primary_exchange="ARCA"),
+    data_types={DataType.MARKET_DEPTH},
+    on_depth=self._on_depth,
+)
+```
+
+#### `MarketDepth` and `DepthLevel` fields
+
+```python
+from ib.data_feed import MarketDepth, DepthLevel
+
+def _on_depth(self, depth: MarketDepth) -> None:
+    # depth.symbol        str           — e.g. "SPY"
+    # depth.timestamp     datetime      — wall-clock snapshot time
+    # depth.is_smart_depth bool         — True when using SMART depth aggregation
+    # depth.bids          List[DepthLevel]  — sorted best-first (highest price first)
+    # depth.asks          List[DepthLevel]  — sorted best-first (lowest price first)
+
+    # Each DepthLevel:
+    # level.price         float  — price of this level
+    # level.size          int    — total size at this price
+    # level.market_maker  str    — market maker ID (L2 only; "" for L1)
+    pass
+```
+
+#### Example: logging the top of book
+
+```python
+def _on_depth(self, depth: MarketDepth) -> None:
+    best_bid = depth.bids[0] if depth.bids else None
+    best_ask = depth.asks[0] if depth.asks else None
+    if best_bid and best_ask:
+        spread = best_ask.price - best_bid.price
+        logger.debug(
+            f"{depth.symbol}  "
+            f"bid {best_bid.size:,} @ {best_bid.price:.2f}  "
+            f"ask {best_ask.size:,} @ {best_ask.price:.2f}  "
+            f"spread {spread:.4f}"
+        )
+```
+
+#### Example: imbalance from multiple levels
+
+```python
+def _on_depth(self, depth: MarketDepth) -> None:
+    bid_vol = sum(l.size for l in depth.bids[:5])
+    ask_vol = sum(l.size for l in depth.asks[:5])
+    total = bid_vol + ask_vol
+    if total > 0:
+        imbalance = (bid_vol - ask_vol) / total   # −1.0 … +1.0
+        self._last_imbalance = imbalance
+```
+
+**Note:** L2 data requires an appropriate IB market data subscription.
+`reqMktDepth` is unavailable for some contract types and exchanges.
+
+---
+
+### 8.4 Cancelling streams
 
 ```python
 self.cancel_stream("SPY")
 ```
 
-Call in `stop()` for every symbol requested in `start()`. The engine also
-calls `cancel_all_streams` automatically when a plugin is stopped or
-unloaded, so this is defensive cleanup.
+Cancels all data types (tick, bar, tick-by-tick, depth) that this plugin
+requested for the given symbol. Call in `stop()` for every symbol
+requested in `start()`. The engine also calls `cancel_all_streams`
+automatically when a plugin is stopped or unloaded, so this is defensive
+cleanup.
+
+---
+
+### 8.5 Buffered data accessors
+
+The `DataFeed` object (accessible via `self._executive.data_feed` when an
+executive is set) maintains circular buffers for all received data.
+
+```python
+feed = self._executive.data_feed
+
+# Throttled ticks (most recent last)
+ticks = feed.get_ticks("SPY", count=100)
+ticks = feed.get_ticks("SPY", since=datetime(2026, 3, 1, 9, 30))
+
+# OHLCV bars
+bars = feed.get_bars("SPY", DataType.BAR_1MIN, count=50)
+
+# Tick-by-tick events (most recent last; buffer holds up to 10 000)
+tbt = feed.get_tick_by_ticks("SPY", count=500)
+tbt = feed.get_tick_by_ticks("SPY", since=datetime(2026, 3, 1, 9, 30))
+
+# Latest L2 snapshot (None if no depth update received yet)
+depth = feed.get_depth("SPY")
+if depth:
+    top_bid = depth.bids[0]
+```
+
+These methods are thread-safe and return plain Python lists / `None`.
+They read from the in-memory buffer — no IB API calls are made.
 
 ---
 
@@ -925,9 +1119,11 @@ is a non-abstract subclass of `PluginBase`, instantiates it (passing
 
 ## 18. Threading Rules
 
-- **Stream callbacks** (`on_tick`, `on_bar`) are called on the IB reader
-  thread. They must return quickly. Do not call blocking operations or
-  acquire long-held locks.
+- **Stream callbacks** (`on_tick`, `on_bar`, `on_tick_by_tick`,
+  `on_depth`) are all called on the IB reader thread. They must return
+  quickly. Do not call blocking operations or acquire long-held locks.
+  `on_tick_by_tick` in particular fires at trade-level frequency and can
+  be very hot during active markets — keep it minimal.
 
 - **MessageBus callbacks** are called on the publisher's thread (the
   thread that called `publish()`). The same rules apply.
@@ -952,10 +1148,10 @@ is a non-abstract subclass of `PluginBase`, instantiates it (passing
   dedicated thread started in `start()` and stopped in `stop()`.
 
 - **Never** call `request_stream`, `cancel_stream`, `publish`, or
-  `save_state` from inside the IB reader thread (i.e. from an `on_tick`
-  or `on_bar` callback) without confirming the operation is thread-safe.
-  `publish()` acquires an `RLock` and is safe. `save_state()` does file
-  I/O and should be off the hot path.
+  `save_state` from inside the IB reader thread (i.e. from an `on_tick`,
+  `on_bar`, `on_tick_by_tick`, or `on_depth` callback) without confirming
+  the operation is thread-safe. `publish()` acquires an `RLock` and is
+  safe. `save_state()` does file I/O and should be off the hot path.
 
 - The circuit breaker trips after 5 consecutive exceptions from
   `calculate_signals`. It resets automatically after 5 minutes (enters
@@ -1116,6 +1312,112 @@ class RSIPublisherPlugin(PluginBase):
             "close": bar.close,
         })
 ```
+
+### Tick-by-tick trade monitor with order-book imbalance
+
+Subscribes to both tick-by-tick Last prints and L2 depth for a single
+symbol. Publishes a rolling volume-weighted average price (VWAP) and the
+current bid/ask imbalance to the MessageBus each time a trade arrives.
+
+```python
+from collections import deque
+from datetime import datetime, timedelta
+from ib.contract_builder import ContractBuilder
+from ib.data_feed import DataType, TickByTickData, MarketDepth
+from plugins.base import PluginBase, TradeSignal
+
+class VWAPMonitorPlugin(PluginBase):
+    VERSION = "1.0.0"
+    IS_SYSTEM_PLUGIN = False
+    SYMBOL = "SPY"
+    CHANNEL = "vwap_monitor"
+    WINDOW = timedelta(minutes=5)
+
+    def __init__(self, base_path=None, portfolio=None,
+                 shared_holdings=None, message_bus=None):
+        super().__init__("vwap_monitor", base_path, portfolio,
+                         shared_holdings, message_bus)
+        self._trades: deque = deque()   # (timestamp, price, size)
+        self._last_imbalance: float = 0.0
+
+    @property
+    def description(self) -> str:
+        return "Publishes rolling 5-min VWAP and L2 imbalance for SPY."
+
+    def start(self) -> bool:
+        contract = ContractBuilder.us_stock(self.SYMBOL, primary_exchange="ARCA")
+        self.request_stream(
+            symbol=self.SYMBOL,
+            contract=contract,
+            data_types={DataType.TICK_BY_TICK_LAST, DataType.MARKET_DEPTH},
+            on_tick_by_tick=self._on_tbt,
+            on_depth=self._on_depth,
+        )
+        return True
+
+    def stop(self) -> bool:
+        self.cancel_stream(self.SYMBOL)
+        return True
+
+    def freeze(self) -> bool:
+        return True
+
+    def resume(self) -> bool:
+        return True
+
+    def calculate_signals(self) -> list:
+        return []
+
+    def handle_request(self, request_type, payload):
+        if request_type == "get_status":
+            return {
+                "success": True,
+                "data": {
+                    "vwap": self._compute_vwap(),
+                    "imbalance": self._last_imbalance,
+                    "trade_count": len(self._trades),
+                },
+            }
+        return {"success": False, "message": f"Unknown: {request_type}"}
+
+    def _on_tbt(self, tbt: TickByTickData) -> None:
+        if tbt.tick_type not in ("Last", "AllLast") or tbt.size <= 0:
+            return
+
+        now = datetime.now()
+        cutoff = now - self.WINDOW
+        self._trades.append((tbt.timestamp, tbt.price, tbt.size))
+
+        # Trim events outside the rolling window
+        while self._trades and self._trades[0][0] < cutoff:
+            self._trades.popleft()
+
+        vwap = self._compute_vwap()
+        if vwap is not None:
+            self.publish(self.CHANNEL, {
+                "symbol": self.SYMBOL,
+                "vwap": round(vwap, 4),
+                "imbalance": self._last_imbalance,
+                "trade_count": len(self._trades),
+                "last_price": tbt.price,
+                "last_size": tbt.size,
+            })
+
+    def _on_depth(self, depth: MarketDepth) -> None:
+        bid_vol = sum(l.size for l in depth.bids[:5])
+        ask_vol = sum(l.size for l in depth.asks[:5])
+        total = bid_vol + ask_vol
+        self._last_imbalance = (bid_vol - ask_vol) / total if total else 0.0
+
+    def _compute_vwap(self):
+        if not self._trades:
+            return None
+        total_pv = sum(p * s for _, p, s in self._trades)
+        total_v  = sum(s for _, _, s in self._trades)
+        return total_pv / total_v if total_v else None
+```
+
+---
 
 ### Subscriber / strategy plugin
 

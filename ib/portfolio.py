@@ -166,6 +166,17 @@ class Portfolio(IBClient):
         self._commission_reports: Dict[str, "CommissionAndFeesReport"] = {}
         self._on_commission: Optional[Callable[[str, float, float], None]] = None
 
+        # Tick-by-tick subscriptions
+        self._tbt_subscriptions: Dict[int, str] = {}   # reqId -> symbol
+        self._tbt_req_ids: Dict[str, Dict[str, int]] = {}  # symbol -> {tick_type -> reqId}
+        self._on_tick_by_tick: Optional[Callable] = None
+
+        # Market depth subscriptions and books
+        self._depth_subscriptions: Dict[int, str] = {}  # reqId -> symbol
+        self._depth_req_ids: Dict[str, int] = {}         # symbol -> reqId
+        self._depth_books: Dict[str, dict] = {}          # symbol -> {"bids": {pos: level}, "asks": {pos: level}}
+        self._on_depth: Optional[Callable] = None
+
     @property
     def positions(self) -> List[Position]:
         """Get list of all positions including synthetic forex positions"""
@@ -284,6 +295,25 @@ class Portfolio(IBClient):
                 self.stop_bar_streaming()
             except Exception as e:
                 logger.error(f"Error stopping bar streams: {e}")
+
+        # Cancel tick-by-tick subscriptions
+        for req_id in list(self._tbt_subscriptions.keys()):
+            try:
+                self.cancelTickByTick(req_id)
+            except Exception:
+                pass
+        self._tbt_subscriptions.clear()
+        self._tbt_req_ids.clear()
+
+        # Cancel market depth subscriptions
+        for req_id, symbol in list(self._depth_subscriptions.items()):
+            try:
+                self.cancelMktDepth(req_id, False)
+            except Exception:
+                pass
+        self._depth_subscriptions.clear()
+        self._depth_req_ids.clear()
+        self._depth_books.clear()
 
         # Cancel pending market data requests
         for req_id in list(self._market_data_requests.keys()):
@@ -657,6 +687,116 @@ class Portfolio(IBClient):
         del self._bar_req_ids[symbol]
 
         logger.debug(f"Stopped bar stream for {symbol}")
+
+    # =========================================================================
+    # Tick-by-Tick Data (reqTickByTick)
+    # =========================================================================
+
+    def request_tick_by_tick(
+        self,
+        symbol: str,
+        contract,
+        tick_type: str = "Last",
+        numberOfTicks: int = 0,
+        ignoreSize: bool = False,
+    ) -> int:
+        """
+        Subscribe to tick-by-tick data for a symbol.
+
+        Args:
+            symbol: Symbol identifier
+            contract: IB Contract
+            tick_type: "Last", "AllLast", "BidAsk", or "MidPoint"
+            numberOfTicks: Historical ticks to deliver first (0 = streaming only)
+            ignoreSize: Ignore size in BidAsk filter
+
+        Returns:
+            Request ID
+        """
+        req_id = self.get_next_req_id()
+
+        self._tbt_subscriptions[req_id] = symbol
+        if symbol not in self._tbt_req_ids:
+            self._tbt_req_ids[symbol] = {}
+        self._tbt_req_ids[symbol][tick_type] = req_id
+
+        self.reqTickByTick(req_id, contract, tick_type, numberOfTicks, ignoreSize)
+        logger.debug(f"Started tick-by-tick stream for {symbol} type={tick_type} (reqId={req_id})")
+        return req_id
+
+    def cancel_tick_by_tick(self, symbol: str, tick_type: Optional[str] = None):
+        """
+        Cancel tick-by-tick subscriptions for a symbol.
+
+        Args:
+            symbol: Symbol to cancel
+            tick_type: Specific type to cancel, or None to cancel all types
+        """
+        if symbol not in self._tbt_req_ids:
+            return
+
+        if tick_type is not None:
+            req_id = self._tbt_req_ids[symbol].pop(tick_type, None)
+            if req_id is not None:
+                self.cancelTickByTick(req_id)
+                self._tbt_subscriptions.pop(req_id, None)
+                logger.debug(f"Stopped tick-by-tick {tick_type} for {symbol}")
+        else:
+            for tt, req_id in list(self._tbt_req_ids[symbol].items()):
+                self.cancelTickByTick(req_id)
+                self._tbt_subscriptions.pop(req_id, None)
+                logger.debug(f"Stopped tick-by-tick {tt} for {symbol}")
+            del self._tbt_req_ids[symbol]
+
+    # =========================================================================
+    # Market Depth Data (reqMktDepth)
+    # =========================================================================
+
+    def request_market_depth(
+        self,
+        symbol: str,
+        contract,
+        numRows: int = 10,
+        isSmartDepth: bool = False,
+    ) -> int:
+        """
+        Subscribe to L2 market depth for a symbol.
+
+        Args:
+            symbol: Symbol identifier
+            contract: IB Contract
+            numRows: Number of depth levels to receive
+            isSmartDepth: Use SMART depth aggregation
+
+        Returns:
+            Request ID
+        """
+        req_id = self.get_next_req_id()
+
+        self._depth_subscriptions[req_id] = symbol
+        self._depth_req_ids[symbol] = req_id
+        self._depth_books[symbol] = {"bids": {}, "asks": {}}
+
+        self.reqMktDepth(req_id, contract, numRows, isSmartDepth, [])
+        logger.debug(f"Started market depth for {symbol} (reqId={req_id})")
+        return req_id
+
+    def cancel_market_depth(self, symbol: str):
+        """
+        Cancel market depth subscription for a symbol.
+
+        Args:
+            symbol: Symbol to cancel
+        """
+        req_id = self._depth_req_ids.pop(symbol, None)
+        if req_id is None:
+            return
+
+        is_smart = False  # we never set smart depth in request_market_depth default
+        self.cancelMktDepth(req_id, is_smart)
+        self._depth_subscriptions.pop(req_id, None)
+        self._depth_books.pop(symbol, None)
+        logger.debug(f"Stopped market depth for {symbol}")
 
     # =========================================================================
     # Historical Data
@@ -1314,6 +1454,127 @@ class Portfolio(IBClient):
         # Also invoke registered callback
         if "bar" in self._callbacks:
             self._callbacks["bar"](bar)
+
+    # =========================================================================
+    # EWrapper Callbacks for Tick-by-Tick Data
+    # =========================================================================
+
+    def tickByTickAllLast(
+        self, reqId, tickType, time, price, size,
+        tickAttribLast, exchange, specialConditions,
+    ):
+        """IB callback: tick-by-tick Last or AllLast trade event"""
+        from .data_feed import TickByTickData
+        symbol = self._tbt_subscriptions.get(reqId)
+        if not symbol:
+            return
+
+        tbt = TickByTickData(
+            symbol=symbol,
+            tick_type="Last" if tickType == 1 else "AllLast",
+            timestamp=datetime.fromtimestamp(time),
+            price=price,
+            size=int(size),
+            exchange=exchange,
+            special_conditions=specialConditions,
+            past_limit=bool(getattr(tickAttribLast, 'pastLimit', False)),
+            unreported=bool(getattr(tickAttribLast, 'unreported', False)),
+        )
+
+        if self._on_tick_by_tick:
+            try:
+                self._on_tick_by_tick(symbol, tbt)
+            except Exception as e:
+                logger.error(f"Error in tick_by_tick callback for {symbol}: {e}")
+
+    def tickByTickBidAsk(
+        self, reqId, tickType, time, bidPrice, askPrice,
+        bidSize, askSize, tickAttribBidAsk,
+    ):
+        """IB callback: tick-by-tick BidAsk quote event"""
+        from .data_feed import TickByTickData
+        symbol = self._tbt_subscriptions.get(reqId)
+        if not symbol:
+            return
+
+        tbt = TickByTickData(
+            symbol=symbol,
+            tick_type="BidAsk",
+            timestamp=datetime.fromtimestamp(time),
+            bid_price=bidPrice,
+            ask_price=askPrice,
+            bid_size=int(bidSize),
+            ask_size=int(askSize),
+            bid_past_low=bool(getattr(tickAttribBidAsk, 'bidPastLow', False)),
+            ask_past_high=bool(getattr(tickAttribBidAsk, 'askPastHigh', False)),
+        )
+
+        if self._on_tick_by_tick:
+            try:
+                self._on_tick_by_tick(symbol, tbt)
+            except Exception as e:
+                logger.error(f"Error in tick_by_tick callback for {symbol}: {e}")
+
+    def tickByTickMidPoint(self, reqId, tickType, time, midPoint):
+        """IB callback: tick-by-tick MidPoint event"""
+        from .data_feed import TickByTickData
+        symbol = self._tbt_subscriptions.get(reqId)
+        if not symbol:
+            return
+
+        tbt = TickByTickData(
+            symbol=symbol,
+            tick_type="MidPoint",
+            timestamp=datetime.fromtimestamp(time),
+            mid_point=midPoint,
+        )
+
+        if self._on_tick_by_tick:
+            try:
+                self._on_tick_by_tick(symbol, tbt)
+            except Exception as e:
+                logger.error(f"Error in tick_by_tick callback for {symbol}: {e}")
+
+    # =========================================================================
+    # EWrapper Callbacks for Market Depth
+    # =========================================================================
+
+    def _apply_depth_update(self, symbol, position, operation, side, price, size, market_maker=""):
+        """Apply a depth book update and fire the depth callback."""
+        from .data_feed import DepthLevel, MarketDepth
+        book = self._depth_books.get(symbol)
+        if book is None:
+            return
+
+        side_key = "bids" if side == 1 else "asks"
+        if operation in (0, 1):  # insert or update
+            book[side_key][position] = DepthLevel(price=price, size=int(size), market_maker=market_maker)
+        elif operation == 2:  # delete
+            book[side_key].pop(position, None)
+
+        bids = sorted(book["bids"].values(), key=lambda l: -l.price)
+        asks = sorted(book["asks"].values(), key=lambda l: l.price)
+        depth = MarketDepth(symbol=symbol, bids=bids, asks=asks)
+
+        if self._on_depth:
+            try:
+                self._on_depth(symbol, depth)
+            except Exception as e:
+                logger.error(f"Error in depth callback for {symbol}: {e}")
+
+    def updateMktDepth(self, reqId, position, operation, side, price, size):
+        """IB callback: L1 market depth update"""
+        symbol = self._depth_subscriptions.get(reqId)
+        if not symbol:
+            return
+        self._apply_depth_update(symbol, position, operation, side, price, size)
+
+    def updateMktDepthL2(self, reqId, position, marketMaker, operation, side, price, size, isSmartDepth):
+        """IB callback: L2 market depth update (includes market maker)"""
+        symbol = self._depth_subscriptions.get(reqId)
+        if not symbol:
+            return
+        self._apply_depth_update(symbol, position, operation, side, price, size, market_maker=marketMaker)
 
     # =========================================================================
     # EWrapper Callbacks for Historical Data

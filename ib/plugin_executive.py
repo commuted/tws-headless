@@ -29,7 +29,7 @@ from ibapi.order import Order
 
 from plugins.base import PluginBase, PluginResult, TradeSignal, PluginState
 from plugins.unassigned import UnassignedPlugin, UNASSIGNED_PLUGIN_NAME
-from .data_feed import DataFeed, DataType, TickData
+from .data_feed import DataFeed, DataType, TickData, TickByTickData, MarketDepth
 from .models import Bar
 from .message_bus import MessageBus
 from .order_reconciler import OrderReconciler, ReconciledOrder, ReconciliationMode
@@ -45,8 +45,10 @@ _IB_INFO_CODES: frozenset = frozenset({2104, 2106, 2158, 2119, 10167})
 @dataclass
 class PluginStreamCallbacks:
     """Per-plugin, per-symbol callbacks for stream data"""
-    on_tick: Optional[Callable] = None  # (tick: TickData) -> None
-    on_bar: Optional[Callable] = None   # (bar) -> None
+    on_tick: Optional[Callable] = None           # (tick: TickData) -> None
+    on_bar: Optional[Callable] = None            # (bar) -> None
+    on_tick_by_tick: Optional[Callable] = None   # (tbt: TickByTickData) -> None
+    on_depth: Optional[Callable] = None          # (depth: MarketDepth) -> None
 
 
 class StreamManager:
@@ -69,11 +71,17 @@ class StreamManager:
         # chain through our dispatchers correctly.
         self._original_on_tick = None
         self._original_on_bar = None
+        self._original_on_tick_by_tick = None
+        self._original_on_depth = None
         if data_feed is not None:
             self._original_on_tick = data_feed.on_tick
             self._original_on_bar = data_feed.on_bar
+            self._original_on_tick_by_tick = data_feed.on_tick_by_tick
+            self._original_on_depth = data_feed.on_depth
             data_feed.on_tick = self._dispatch_tick
             data_feed.on_bar = self._dispatch_bar
+            data_feed.on_tick_by_tick = self._dispatch_tick_by_tick
+            data_feed.on_depth = self._dispatch_depth
 
     def request_stream(
         self,
@@ -83,6 +91,8 @@ class StreamManager:
         data_types: Optional[Set[DataType]] = None,
         on_tick: Optional[Callable] = None,
         on_bar: Optional[Callable] = None,
+        on_tick_by_tick: Optional[Callable] = None,
+        on_depth: Optional[Callable] = None,
         what_to_show: str = "TRADES",
         use_rth: bool = True,
     ) -> bool:
@@ -96,6 +106,8 @@ class StreamManager:
             data_types: Set of DataType values (defaults to TICK + BAR_5SEC)
             on_tick: Callback(tick: TickData) for tick data (price or size)
             on_bar: Callback(bar) for bar data
+            on_tick_by_tick: Callback(tbt: TickByTickData) for tick-by-tick events
+            on_depth: Callback(depth: MarketDepth) for market depth updates
             what_to_show: IB data type (TRADES, MIDPOINT, BID, ASK)
             use_rth: Regular trading hours only
 
@@ -115,6 +127,8 @@ class StreamManager:
             self._plugin_streams[plugin_name][symbol] = PluginStreamCallbacks(
                 on_tick=on_tick,
                 on_bar=on_bar,
+                on_tick_by_tick=on_tick_by_tick,
+                on_depth=on_depth,
             )
 
         success = self._data_feed.subscribe(
@@ -234,6 +248,50 @@ class StreamManager:
                 callback(bar)
             except Exception as e:
                 logger.error(f"Error in plugin bar callback for {symbol}: {e}")
+
+    def _dispatch_tick_by_tick(self, symbol: str, tbt: TickByTickData):
+        """Dispatch tick-by-tick data to subscribed plugins and chain to original callback."""
+        if self._original_on_tick_by_tick:
+            try:
+                self._original_on_tick_by_tick(symbol, tbt)
+            except Exception as e:
+                logger.error(f"Error in chained tick_by_tick callback: {e}")
+
+        with self._lock:
+            callbacks = [
+                cb.on_tick_by_tick
+                for streams in self._plugin_streams.values()
+                if symbol in streams and streams[symbol].on_tick_by_tick
+                for cb in [streams[symbol]]
+            ]
+
+        for callback in callbacks:
+            try:
+                callback(tbt)
+            except Exception as e:
+                logger.error(f"Error in plugin tick_by_tick callback for {symbol}: {e}")
+
+    def _dispatch_depth(self, symbol: str, depth: MarketDepth):
+        """Dispatch market depth data to subscribed plugins and chain to original callback."""
+        if self._original_on_depth:
+            try:
+                self._original_on_depth(symbol, depth)
+            except Exception as e:
+                logger.error(f"Error in chained depth callback: {e}")
+
+        with self._lock:
+            callbacks = [
+                cb.on_depth
+                for streams in self._plugin_streams.values()
+                if symbol in streams and streams[symbol].on_depth
+                for cb in [streams[symbol]]
+            ]
+
+        for callback in callbacks:
+            try:
+                callback(depth)
+            except Exception as e:
+                logger.error(f"Error in plugin depth callback for {symbol}: {e}")
 
     def get_status(self) -> Dict[str, Any]:
         """

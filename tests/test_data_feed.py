@@ -15,6 +15,9 @@ from data_feed import (
     DataFeed,
     DataType,
     TickData,
+    TickByTickData,
+    DepthLevel,
+    MarketDepth,
     InstrumentSubscription,
     DataBuffer,
     BarAggregator,
@@ -28,10 +31,16 @@ def create_mock_portfolio():
     portfolio.connected = True
     portfolio._on_tick = None
     portfolio._on_bar = None
+    portfolio._on_tick_by_tick = None
+    portfolio._on_depth = None
     portfolio.stream_symbol = Mock(return_value=True)
     portfolio.bar_stream_symbol = Mock(return_value=True)
     portfolio.unstream_symbol = Mock()
     portfolio.unstream_bar_symbol = Mock()
+    portfolio.request_tick_by_tick = Mock(return_value=1)
+    portfolio.cancel_tick_by_tick = Mock()
+    portfolio.request_market_depth = Mock(return_value=2)
+    portfolio.cancel_market_depth = Mock()
     return portfolio
 
 
@@ -1021,3 +1030,357 @@ class TestResetStats:
         stats = feed.stats
 
         assert "last_reset" in stats
+
+
+# =============================================================================
+# Tick-by-Tick and Market Depth Tests
+# =============================================================================
+
+class TestNewDataTypes:
+    """Tests for TICK_BY_TICK_* and MARKET_DEPTH DataType values"""
+
+    def test_tick_by_tick_data_types_exist(self):
+        assert DataType.TICK_BY_TICK_LAST.value == "tick_by_tick_last"
+        assert DataType.TICK_BY_TICK_BIDASK.value == "tick_by_tick_bidask"
+        assert DataType.TICK_BY_TICK_MIDPOINT.value == "tick_by_tick_midpoint"
+        assert DataType.MARKET_DEPTH.value == "market_depth"
+
+
+class TestTickByTickData:
+    """Tests for TickByTickData dataclass"""
+
+    def test_last_tick_creation(self):
+        ts = datetime(2024, 1, 15, 10, 30, 0)
+        tbt = TickByTickData(
+            symbol="SPY",
+            tick_type="Last",
+            timestamp=ts,
+            price=450.50,
+            size=100,
+            exchange="NASDAQ",
+        )
+        assert tbt.symbol == "SPY"
+        assert tbt.tick_type == "Last"
+        assert tbt.timestamp == ts
+        assert tbt.price == 450.50
+        assert tbt.size == 100
+        assert tbt.exchange == "NASDAQ"
+
+    def test_bidask_tick_creation(self):
+        ts = datetime(2024, 1, 15, 10, 30, 0)
+        tbt = TickByTickData(
+            symbol="SPY",
+            tick_type="BidAsk",
+            timestamp=ts,
+            bid_price=450.40,
+            ask_price=450.50,
+            bid_size=200,
+            ask_size=150,
+        )
+        assert tbt.bid_price == 450.40
+        assert tbt.ask_price == 450.50
+        assert tbt.bid_size == 200
+        assert tbt.ask_size == 150
+
+    def test_midpoint_tick_creation(self):
+        ts = datetime(2024, 1, 15, 10, 30, 0)
+        tbt = TickByTickData(
+            symbol="SPY",
+            tick_type="MidPoint",
+            timestamp=ts,
+            mid_point=450.45,
+        )
+        assert tbt.mid_point == 450.45
+
+    def test_default_boolean_flags(self):
+        ts = datetime.now()
+        tbt = TickByTickData(symbol="SPY", tick_type="Last", timestamp=ts)
+        assert tbt.past_limit is False
+        assert tbt.unreported is False
+        assert tbt.bid_past_low is False
+        assert tbt.ask_past_high is False
+
+
+class TestDepthLevelAndMarketDepth:
+    """Tests for DepthLevel and MarketDepth dataclasses"""
+
+    def test_depth_level_creation(self):
+        level = DepthLevel(price=450.0, size=500)
+        assert level.price == 450.0
+        assert level.size == 500
+        assert level.market_maker == ""
+
+    def test_depth_level_with_market_maker(self):
+        level = DepthLevel(price=450.0, size=500, market_maker="ARCA")
+        assert level.market_maker == "ARCA"
+
+    def test_market_depth_creation(self):
+        bids = [DepthLevel(450.0, 300), DepthLevel(449.9, 200)]
+        asks = [DepthLevel(450.1, 100), DepthLevel(450.2, 400)]
+        depth = MarketDepth(symbol="SPY", bids=bids, asks=asks)
+        assert depth.symbol == "SPY"
+        assert len(depth.bids) == 2
+        assert len(depth.asks) == 2
+        assert isinstance(depth.timestamp, datetime)
+        assert depth.is_smart_depth is False
+
+    def test_market_depth_stores_bids_as_given(self):
+        """MarketDepth stores bids in whatever order they are provided."""
+        bids = [DepthLevel(450.0, 200), DepthLevel(449.5, 150), DepthLevel(449.0, 100)]
+        depth = MarketDepth(symbol="SPY", bids=bids, asks=[])
+        assert [b.price for b in depth.bids] == [450.0, 449.5, 449.0]
+
+    def test_market_depth_stores_asks_as_given(self):
+        """MarketDepth stores asks in whatever order they are provided."""
+        asks = [DepthLevel(450.1, 200), DepthLevel(450.5, 150), DepthLevel(451.0, 100)]
+        depth = MarketDepth(symbol="SPY", bids=[], asks=asks)
+        assert [a.price for a in depth.asks] == [450.1, 450.5, 451.0]
+
+
+class TestDataFeedTickByTick:
+    """Tests for DataFeed tick-by-tick handling"""
+
+    def test_handle_tick_by_tick_buffers(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        ts = datetime.now()
+        tbt = TickByTickData(symbol="SPY", tick_type="Last", timestamp=ts, price=450.0, size=100)
+        feed._handle_tick_by_tick("SPY", tbt)
+
+        assert len(feed._buffers["SPY"].tbt_ticks) == 1
+        assert feed._buffers["SPY"].tbt_ticks[0] is tbt
+
+    def test_handle_tick_by_tick_fires_callback(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        received = []
+        feed.on_tick_by_tick = lambda s, t: received.append((s, t))
+
+        ts = datetime.now()
+        tbt = TickByTickData(symbol="SPY", tick_type="Last", timestamp=ts, price=450.0, size=100)
+        feed._handle_tick_by_tick("SPY", tbt)
+
+        assert len(received) == 1
+        assert received[0][0] == "SPY"
+        assert received[0][1] is tbt
+
+    def test_handle_tick_by_tick_no_callback(self):
+        """Should not raise when no callback is set"""
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        ts = datetime.now()
+        tbt = TickByTickData(symbol="SPY", tick_type="Last", timestamp=ts)
+        feed._handle_tick_by_tick("SPY", tbt)  # Should not raise
+
+    def test_handle_tick_by_tick_unknown_symbol(self):
+        """Should not raise for unknown symbol (just skips buffering)"""
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+
+        ts = datetime.now()
+        tbt = TickByTickData(symbol="UNKNOWN", tick_type="Last", timestamp=ts)
+        feed._handle_tick_by_tick("UNKNOWN", tbt)  # Should not raise
+
+    def test_get_tick_by_ticks_empty(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        result = feed.get_tick_by_ticks("SPY")
+        assert result == []
+
+    def test_get_tick_by_ticks_returns_all(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        for i in range(5):
+            tbt = TickByTickData(symbol="SPY", tick_type="Last", timestamp=datetime.now(), price=450.0 + i)
+            feed._handle_tick_by_tick("SPY", tbt)
+
+        result = feed.get_tick_by_ticks("SPY")
+        assert len(result) == 5
+
+    def test_get_tick_by_ticks_count(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        for i in range(10):
+            tbt = TickByTickData(symbol="SPY", tick_type="Last", timestamp=datetime.now(), price=450.0 + i)
+            feed._handle_tick_by_tick("SPY", tbt)
+
+        result = feed.get_tick_by_ticks("SPY", count=3)
+        assert len(result) == 3
+
+    def test_get_tick_by_ticks_since(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        base = datetime(2024, 1, 15, 10, 0, 0)
+        for i in range(5):
+            ts = base + timedelta(minutes=i)
+            tbt = TickByTickData(symbol="SPY", tick_type="Last", timestamp=ts, price=450.0 + i)
+            feed._handle_tick_by_tick("SPY", tbt)
+
+        cutoff = base + timedelta(minutes=2)
+        result = feed.get_tick_by_ticks("SPY", since=cutoff)
+        assert all(t.timestamp >= cutoff for t in result)
+
+    def test_get_tick_by_ticks_nonexistent_symbol(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+
+        result = feed.get_tick_by_ticks("NONE")
+        assert result == []
+
+    def test_tick_by_tick_callback_error_counted(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        feed.on_tick_by_tick = lambda s, t: 1 / 0
+
+        tbt = TickByTickData(symbol="SPY", tick_type="Last", timestamp=datetime.now())
+        feed._handle_tick_by_tick("SPY", tbt)
+
+        assert feed.stats["errors"] == 1
+
+    def test_subscription_requests_tbt_last(self):
+        """subscribe() with TICK_BY_TICK_LAST starts tbt request on feed.start()"""
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        contract = create_contract("SPY")
+        feed._setup_callbacks()
+        feed._running = True
+        feed.subscribe("SPY", contract, {DataType.TICK_BY_TICK_LAST})
+
+        portfolio.request_tick_by_tick.assert_called_once_with("SPY", contract, "Last")
+
+    def test_subscription_requests_tbt_bidask(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        contract = create_contract("SPY")
+        feed._setup_callbacks()
+        feed._running = True
+        feed.subscribe("SPY", contract, {DataType.TICK_BY_TICK_BIDASK})
+
+        portfolio.request_tick_by_tick.assert_called_once_with("SPY", contract, "BidAsk")
+
+    def test_subscription_requests_tbt_midpoint(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        contract = create_contract("SPY")
+        feed._setup_callbacks()
+        feed._running = True
+        feed.subscribe("SPY", contract, {DataType.TICK_BY_TICK_MIDPOINT})
+
+        portfolio.request_tick_by_tick.assert_called_once_with("SPY", contract, "MidPoint")
+
+
+class TestDataFeedMarketDepth:
+    """Tests for DataFeed market depth handling"""
+
+    def _make_depth(self, symbol="SPY"):
+        bids = [DepthLevel(450.0, 300), DepthLevel(449.9, 200)]
+        asks = [DepthLevel(450.1, 100)]
+        return MarketDepth(symbol=symbol, bids=bids, asks=asks)
+
+    def test_handle_depth_stores_latest(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        depth = self._make_depth()
+        feed._handle_depth("SPY", depth)
+
+        assert feed._buffers["SPY"].depth is depth
+
+    def test_handle_depth_fires_callback(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        received = []
+        feed.on_depth = lambda s, d: received.append((s, d))
+
+        depth = self._make_depth()
+        feed._handle_depth("SPY", depth)
+
+        assert len(received) == 1
+        assert received[0][0] == "SPY"
+        assert received[0][1] is depth
+
+    def test_handle_depth_no_callback(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        depth = self._make_depth()
+        feed._handle_depth("SPY", depth)  # Should not raise
+
+    def test_handle_depth_replaces_previous(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        depth1 = self._make_depth()
+        depth2 = self._make_depth()
+        feed._handle_depth("SPY", depth1)
+        feed._handle_depth("SPY", depth2)
+
+        assert feed._buffers["SPY"].depth is depth2
+
+    def test_get_depth_returns_none_when_empty(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        assert feed.get_depth("SPY") is None
+
+    def test_get_depth_returns_snapshot(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        depth = self._make_depth()
+        feed._handle_depth("SPY", depth)
+
+        result = feed.get_depth("SPY")
+        assert result is depth
+
+    def test_get_depth_nonexistent_symbol(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+
+        assert feed.get_depth("NONE") is None
+
+    def test_depth_callback_error_counted(self):
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        feed.subscribe("SPY", create_contract("SPY"))
+
+        feed.on_depth = lambda s, d: 1 / 0
+
+        depth = self._make_depth()
+        feed._handle_depth("SPY", depth)
+
+        assert feed.stats["errors"] == 1
+
+    def test_subscription_requests_market_depth(self):
+        """subscribe() with MARKET_DEPTH starts depth request on feed.start()"""
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        contract = create_contract("SPY")
+        feed._setup_callbacks()
+        feed._running = True
+        feed.subscribe("SPY", contract, {DataType.MARKET_DEPTH})
+
+        portfolio.request_market_depth.assert_called_once_with("SPY", contract)

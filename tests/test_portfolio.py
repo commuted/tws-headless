@@ -124,6 +124,15 @@ def portfolio_instance(mock_ibapi):
         portfolio._executions_done = Event()
         portfolio._execution_db = None
 
+        # Tick-by-tick and market depth
+        portfolio._tbt_subscriptions = {}
+        portfolio._tbt_req_ids = {}
+        portfolio._on_tick_by_tick = None
+        portfolio._depth_subscriptions = {}
+        portfolio._depth_req_ids = {}
+        portfolio._depth_books = {}
+        portfolio._on_depth = None
+
         return portfolio
 
 
