@@ -720,7 +720,7 @@ class PluginBase(ABC):
             symbol: Symbol to stream
             contract: IB Contract
             data_types: Set of DataType values (defaults to TICK + BAR_5SEC)
-            on_tick: Callback(symbol, price, tick_type) for tick data
+            on_tick: Callback(tick: TickData) for tick data (price or size tick)
             on_bar: Callback(bar) for bar data
             what_to_show: TRADES, MIDPOINT, BID, ASK
             use_rth: Regular trading hours only

@@ -61,6 +61,30 @@ TICK_TYPE_NAMES = {
     TickTypeEnum.VOLUME: "VOLUME",
 }
 
+# Size tick types (from tickSize callback)
+SIZE_TICK_TYPES = (
+    TickTypeEnum.BID_SIZE,
+    TickTypeEnum.ASK_SIZE,
+    TickTypeEnum.LAST_SIZE,
+    TickTypeEnum.VOLUME,
+    TickTypeEnum.DELAYED_BID_SIZE,
+    TickTypeEnum.DELAYED_ASK_SIZE,
+    TickTypeEnum.DELAYED_LAST_SIZE,
+    TickTypeEnum.DELAYED_VOLUME,
+)
+
+# Mapping size tick type to name
+SIZE_TICK_TYPE_NAMES = {
+    TickTypeEnum.BID_SIZE: "BID_SIZE",
+    TickTypeEnum.ASK_SIZE: "ASK_SIZE",
+    TickTypeEnum.LAST_SIZE: "LAST_SIZE",
+    TickTypeEnum.VOLUME: "VOLUME",
+    TickTypeEnum.DELAYED_BID_SIZE: "DELAYED_BID_SIZE",
+    TickTypeEnum.DELAYED_ASK_SIZE: "DELAYED_ASK_SIZE",
+    TickTypeEnum.DELAYED_LAST_SIZE: "DELAYED_LAST_SIZE",
+    TickTypeEnum.DELAYED_VOLUME: "DELAYED_VOLUME",
+}
+
 
 class Portfolio(IBClient):
     """
@@ -98,7 +122,9 @@ class Portfolio(IBClient):
         self._stream_subscriptions: Dict[int, str] = {}  # reqId -> symbol
         self._stream_req_ids: Dict[str, int] = {}  # symbol -> reqId
         self._on_tick: Optional[Callable[[str, float, str], None]] = None
+        self._on_tick_size: Optional[Callable[[str, int, str], None]] = None
         self._last_prices: Dict[str, Dict[str, float]] = {}  # symbol -> {type: price}
+        self._last_sizes: Dict[str, Dict[str, int]] = {}  # symbol -> {type: size}
 
         # Streaming bar data
         self._bar_streaming: bool = False
@@ -1191,6 +1217,39 @@ class Portfolio(IBClient):
         # Also invoke registered callback
         if "tick" in self._callbacks:
             self._callbacks["tick"](symbol, price, tick_name)
+
+    def tickSize(self, reqId: int, tickType: int, size: int):
+        """Handle market data size updates (bid size, ask size, last size, volume)"""
+        if reqId in self._stream_subscriptions:
+            self._handle_stream_tick_size(reqId, tickType, size)
+
+    def _handle_stream_tick_size(self, reqId: int, tickType: int, size: int):
+        """Handle a streaming size tick update"""
+        if size < 0:
+            return
+
+        symbol = self._stream_subscriptions.get(reqId)
+        if not symbol:
+            return
+
+        # Only process size-related ticks
+        if tickType not in SIZE_TICK_TYPES:
+            return
+
+        # Get tick type name
+        tick_name = SIZE_TICK_TYPE_NAMES.get(tickType, f"SIZE_{tickType}")
+
+        # Store the size
+        if symbol not in self._last_sizes:
+            self._last_sizes[symbol] = {}
+        self._last_sizes[symbol][tick_name] = size
+
+        # Call the size callback if registered
+        if self._on_tick_size:
+            try:
+                self._on_tick_size(symbol, size, tick_name)
+            except Exception as e:
+                logger.error(f"Error in tick size callback: {e}")
 
     def tickSnapshotEnd(self, reqId: int):
         """Called when snapshot is complete"""

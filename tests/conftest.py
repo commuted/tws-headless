@@ -22,6 +22,14 @@ _ibapi_mock.ticktype.TickTypeEnum.DELAYED_LAST = 68
 _ibapi_mock.ticktype.TickTypeEnum.DELAYED_CLOSE = 75
 _ibapi_mock.ticktype.TickTypeEnum.BID = 1
 _ibapi_mock.ticktype.TickTypeEnum.ASK = 2
+_ibapi_mock.ticktype.TickTypeEnum.BID_SIZE = 0
+_ibapi_mock.ticktype.TickTypeEnum.ASK_SIZE = 3
+_ibapi_mock.ticktype.TickTypeEnum.LAST_SIZE = 5
+_ibapi_mock.ticktype.TickTypeEnum.VOLUME = 8
+_ibapi_mock.ticktype.TickTypeEnum.DELAYED_BID_SIZE = 69
+_ibapi_mock.ticktype.TickTypeEnum.DELAYED_ASK_SIZE = 70
+_ibapi_mock.ticktype.TickTypeEnum.DELAYED_LAST_SIZE = 71
+_ibapi_mock.ticktype.TickTypeEnum.DELAYED_VOLUME = 74
 
 
 # Create a proper Contract class so each instance has separate state

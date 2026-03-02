@@ -41,6 +41,7 @@ class TickData:
     symbol: str
     price: float
     tick_type: str
+    size: Optional[int] = None  # set for size ticks (BID_SIZE, ASK_SIZE, LAST_SIZE, VOLUME)
     timestamp: datetime = field(default_factory=datetime.now)
 
 
@@ -501,16 +502,20 @@ class DataFeed:
         """Set up callbacks on portfolio for data routing"""
         # Store original callbacks
         self._original_on_tick = self.portfolio._on_tick
+        self._original_on_tick_size = getattr(self.portfolio, '_on_tick_size', None)
         self._original_on_bar = self.portfolio._on_bar
 
         # Set our handlers
         self.portfolio._on_tick = self._handle_tick
+        self.portfolio._on_tick_size = self._handle_tick_size
         self.portfolio._on_bar = self._handle_bar
 
     def _teardown_callbacks(self):
         """Restore original portfolio callbacks"""
         if hasattr(self, '_original_on_tick'):
             self.portfolio._on_tick = self._original_on_tick
+        if hasattr(self, '_original_on_tick_size'):
+            self.portfolio._on_tick_size = self._original_on_tick_size
         if hasattr(self, '_original_on_bar'):
             self.portfolio._on_bar = self._original_on_bar
 
@@ -582,6 +587,32 @@ class DataFeed:
                 self._original_on_tick(symbol, price, tick_type)
             except Exception as e:
                 logger.error(f"Error in original tick callback: {e}")
+
+    def _handle_tick_size(self, symbol: str, size: int, tick_type: str):
+        """Handle incoming size tick data"""
+        self._stats["ticks_received"] += 1
+
+        tick = TickData(
+            symbol=symbol,
+            price=0.0,
+            tick_type=tick_type,
+            size=size,
+        )
+
+        # Buffer the tick
+        with self._lock:
+            if symbol in self._buffers:
+                self._buffers[symbol].ticks.append(tick)
+
+        # Route to callback
+        if self.on_tick:
+            try:
+                self.on_tick(symbol, tick)
+            except Exception as e:
+                self._stats["errors"] += 1
+                logger.error(f"Error in size tick callback for {symbol}: {e}")
+                if self.on_error:
+                    self.on_error(symbol, e)
 
     def _handle_bar(self, bar: Bar):
         """Handle incoming 5-second bar data"""

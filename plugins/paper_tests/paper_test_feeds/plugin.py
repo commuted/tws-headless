@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 
-from ib.data_feed import DataType
+from ib.data_feed import DataType, TickData
 from plugins.base import PluginBase, TradeSignal
 
 from .feed_test_specs import DEFAULT_TEST_PAIRS, FeedTestSpec, FeedTestPair
@@ -338,17 +338,18 @@ class PaperTestFeedsPlugin(PluginBase):
                 logger.info(f"  Cancelling tick stream: {spec.symbol}")
                 self.cancel_stream(spec.symbol)
 
-    def _on_test_tick(self, symbol, price, tick_type):
+    def _on_test_tick(self, tick: TickData):
         """Capture callback for tick testing."""
         with self._capture_lock:
-            if symbol in self._captured_ticks:
-                self._captured_ticks[symbol].append({
-                    "price": price,
-                    "tick_type": tick_type,
+            if tick.symbol in self._captured_ticks:
+                self._captured_ticks[tick.symbol].append({
+                    "price": tick.price,
+                    "tick_type": tick.tick_type,
+                    "size": tick.size,
                     "timestamp": datetime.now().isoformat(),
                 })
-                if symbol in self._tick_events:
-                    self._tick_events[symbol].set()
+                if tick.symbol in self._tick_events:
+                    self._tick_events[tick.symbol].set()
 
     def _validate_tick_result(self, spec: FeedTestSpec) -> FeedTestResult:
         """Validate tick test results for a spec."""

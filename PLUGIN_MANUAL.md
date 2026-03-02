@@ -323,10 +323,32 @@ live mode (`reqMarketDataType(1)`) for bars.
 
 ### Tick callback signature
 
+The callback receives a single `TickData` object containing all tick fields:
+
 ```python
-def _on_tick(self, symbol: str, price: float, tick_type: str) -> None:
-    # tick_type examples: "LAST", "BID", "ASK", "CLOSE",
-    #                      "DELAYED_LAST", "DELAYED_BID", "DELAYED_ASK"
+from ib.data_feed import TickData
+
+def _on_tick(self, tick: TickData) -> None:
+    # tick.symbol     str            — e.g. "SPY"
+    # tick.tick_type  str            — e.g. "LAST", "BID", "ASK", "CLOSE",
+    #                                        "DELAYED_LAST", "DELAYED_BID",
+    #                                        "BID_SIZE", "ASK_SIZE", "LAST_SIZE",
+    #                                        "VOLUME", "DELAYED_VOLUME", ...
+    # tick.price      float          — last traded price; 0.0 for size-only ticks
+    # tick.size       Optional[int]  — bid/ask/last size or volume; None for price ticks
+    # tick.timestamp  datetime       — wall-clock time the tick was received
+    pass
+```
+
+Price ticks (LAST, BID, ASK, CLOSE, …) have `tick.price > 0` and `tick.size is None`.
+Size ticks (BID_SIZE, ASK_SIZE, LAST_SIZE, VOLUME, …) have `tick.size >= 0` and `tick.price == 0.0`.
+
+```python
+def _on_tick(self, tick: TickData) -> None:
+    if tick.size is not None:
+        logger.debug(f"{tick.symbol} {tick.tick_type}: size={tick.size}")
+    else:
+        logger.debug(f"{tick.symbol} {tick.tick_type}: price={tick.price:.4f}")
 ```
 
 ### Bar callback signature

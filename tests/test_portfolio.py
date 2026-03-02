@@ -96,7 +96,9 @@ def portfolio_instance(mock_ibapi):
         portfolio._stream_subscriptions = {}
         portfolio._stream_req_ids = {}
         portfolio._on_tick = None
+        portfolio._on_tick_size = None
         portfolio._last_prices = {}
+        portfolio._last_sizes = {}
         portfolio._bar_streaming = False
         portfolio._bar_subscriptions = {}
         portfolio._bar_req_ids = {}
@@ -1286,6 +1288,102 @@ class TestHandleStreamTick:
         portfolio_instance._handle_stream_tick(1, 4, 450.0)
 
         callback.assert_called_once()
+
+
+# =============================================================================
+# Tick Size Callback Tests
+# =============================================================================
+
+class TestTickSizeCallback:
+    """Tests for tickSize EWrapper callback"""
+
+    def test_tickSize_routes_to_handle_stream_tick_size(self, portfolio_instance):
+        """Test tickSize calls _handle_stream_tick_size for streaming subscriptions"""
+        portfolio_instance._stream_subscriptions = {1: "SPY"}
+        portfolio_instance._last_sizes = {"SPY": {}}
+
+        with patch.object(portfolio_instance, '_handle_stream_tick_size') as mock_handle:
+            portfolio_instance.tickSize(1, 5, 200)  # 5 = LAST_SIZE
+
+        mock_handle.assert_called_once_with(1, 5, 200)
+
+    def test_tickSize_ignores_non_streaming_req_id(self, portfolio_instance):
+        """Test tickSize ignores reqIds not in stream subscriptions"""
+        portfolio_instance._stream_subscriptions = {}
+
+        with patch.object(portfolio_instance, '_handle_stream_tick_size') as mock_handle:
+            portfolio_instance.tickSize(999, 5, 100)
+
+        mock_handle.assert_not_called()
+
+
+class TestHandleStreamTickSize:
+    """Tests for _handle_stream_tick_size"""
+
+    def test_stores_last_size(self, portfolio_instance):
+        """Test _handle_stream_tick_size stores size"""
+        portfolio_instance._stream_subscriptions = {1: "SPY"}
+        portfolio_instance._last_sizes = {"SPY": {}}
+
+        portfolio_instance._handle_stream_tick_size(1, 5, 200)  # 5 = LAST_SIZE
+
+        assert portfolio_instance._last_sizes["SPY"]["LAST_SIZE"] == 200
+
+    def test_ignores_unknown_req_id(self, portfolio_instance):
+        """Test _handle_stream_tick_size ignores unknown reqId"""
+        portfolio_instance._stream_subscriptions = {}
+
+        # Should not raise
+        portfolio_instance._handle_stream_tick_size(999, 5, 100)
+
+    def test_ignores_negative_size(self, portfolio_instance):
+        """Test _handle_stream_tick_size ignores negative sizes"""
+        portfolio_instance._stream_subscriptions = {1: "SPY"}
+        portfolio_instance._last_sizes = {"SPY": {}}
+
+        portfolio_instance._handle_stream_tick_size(1, 5, -1)
+
+        assert portfolio_instance._last_sizes["SPY"] == {}
+
+    def test_ignores_unknown_tick_type(self, portfolio_instance):
+        """Test _handle_stream_tick_size ignores non-size tick types"""
+        portfolio_instance._stream_subscriptions = {1: "SPY"}
+        portfolio_instance._last_sizes = {"SPY": {}}
+
+        # Use a tick type that's not in SIZE_TICK_TYPES (e.g., 99)
+        portfolio_instance._handle_stream_tick_size(1, 99, 100)
+
+        assert portfolio_instance._last_sizes["SPY"] == {}
+
+    def test_calls_callback(self, portfolio_instance):
+        """Test _handle_stream_tick_size calls registered callback"""
+        portfolio_instance._stream_subscriptions = {1: "SPY"}
+        portfolio_instance._last_sizes = {"SPY": {}}
+
+        callback = MagicMock()
+        portfolio_instance._on_tick_size = callback
+
+        portfolio_instance._handle_stream_tick_size(1, 5, 300)  # LAST_SIZE=5
+
+        callback.assert_called_once_with("SPY", 300, "LAST_SIZE")
+
+    def test_bid_size_tick(self, portfolio_instance):
+        """Test BID_SIZE tick is stored correctly"""
+        portfolio_instance._stream_subscriptions = {1: "AAPL"}
+        portfolio_instance._last_sizes = {"AAPL": {}}
+
+        portfolio_instance._handle_stream_tick_size(1, 0, 500)  # BID_SIZE=0
+
+        assert portfolio_instance._last_sizes["AAPL"]["BID_SIZE"] == 500
+
+    def test_volume_tick(self, portfolio_instance):
+        """Test VOLUME tick is stored correctly"""
+        portfolio_instance._stream_subscriptions = {1: "SPY"}
+        portfolio_instance._last_sizes = {"SPY": {}}
+
+        portfolio_instance._handle_stream_tick_size(1, 8, 1234567)  # VOLUME=8
+
+        assert portfolio_instance._last_sizes["SPY"]["VOLUME"] == 1234567
 
 
 # =============================================================================

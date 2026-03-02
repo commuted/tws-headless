@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from ibapi.contract import Contract
 from ibapi.order import Order
 
-from ib.data_feed import DataType
+from ib.data_feed import DataType, TickData
 from plugins.base import PluginBase, TradeSignal
 
 logger = logging.getLogger(__name__)
@@ -387,9 +387,9 @@ class OrderTestPluginBase(PluginBase):
         price_event = threading.Event()
         captured: Dict[str, float] = {}
 
-        def on_tick(sym: str, price: float, tick_type: str):
-            if sym == symbol and price > 0 and not price_event.is_set():
-                captured["price"] = price
+        def on_tick(tick: TickData):
+            if tick.symbol == symbol and tick.price > 0 and not price_event.is_set():
+                captured["price"] = tick.price
                 price_event.set()
 
         self.request_stream(

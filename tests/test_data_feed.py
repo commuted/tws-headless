@@ -527,6 +527,55 @@ class TestDataFeedTickHandling:
         assert feed.stats["ticks_received"] == 1
 
 
+class TestDataFeedTickSizeHandling:
+    """Tests for _handle_tick_size"""
+
+    def test_handle_tick_size_buffers_data(self):
+        """Test that size ticks are buffered"""
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        contract = create_contract("SPY")
+        feed.subscribe("SPY", contract, {DataType.TICK})
+
+        feed._handle_tick_size("SPY", 500, "LAST_SIZE")
+
+        assert len(feed._buffers["SPY"].ticks) == 1
+        tick = feed._buffers["SPY"].ticks[0]
+        assert tick.size == 500
+        assert tick.tick_type == "LAST_SIZE"
+        assert tick.price == 0.0
+
+    def test_handle_tick_size_calls_on_tick_callback(self):
+        """Test that on_tick is called with TickData containing size"""
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        contract = create_contract("SPY")
+        feed.subscribe("SPY", contract, {DataType.TICK})
+
+        callback_data = []
+        feed.on_tick = lambda s, t: callback_data.append((s, t))
+
+        feed._handle_tick_size("SPY", 200, "BID_SIZE")
+
+        assert len(callback_data) == 1
+        assert callback_data[0][0] == "SPY"
+        tick = callback_data[0][1]
+        assert tick.size == 200
+        assert tick.tick_type == "BID_SIZE"
+        assert tick.price == 0.0
+
+    def test_handle_tick_size_updates_stats(self):
+        """Test that stats are updated for size ticks"""
+        portfolio = create_mock_portfolio()
+        feed = DataFeed(portfolio)
+        contract = create_contract("SPY")
+        feed.subscribe("SPY", contract)
+
+        feed._handle_tick_size("SPY", 1000, "VOLUME")
+
+        assert feed.stats["ticks_received"] == 1
+
+
 class TestDataFeedBarHandling:
     """Tests for bar data handling"""
 

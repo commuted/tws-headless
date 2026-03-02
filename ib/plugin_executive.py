@@ -45,7 +45,7 @@ _IB_INFO_CODES: frozenset = frozenset({2104, 2106, 2158, 2119, 10167})
 @dataclass
 class PluginStreamCallbacks:
     """Per-plugin, per-symbol callbacks for stream data"""
-    on_tick: Optional[Callable] = None  # (symbol, price, tick_type) -> None
+    on_tick: Optional[Callable] = None  # (tick: TickData) -> None
     on_bar: Optional[Callable] = None   # (bar) -> None
 
 
@@ -94,7 +94,7 @@ class StreamManager:
             symbol: Symbol to stream
             contract: IB Contract
             data_types: Set of DataType values (defaults to TICK + BAR_5SEC)
-            on_tick: Callback(symbol, price, tick_type) for tick data
+            on_tick: Callback(tick: TickData) for tick data (price or size)
             on_bar: Callback(bar) for bar data
             what_to_show: IB data type (TRADES, MIDPOINT, BID, ASK)
             use_rth: Regular trading hours only
@@ -207,7 +207,7 @@ class StreamManager:
 
         for callback in callbacks:
             try:
-                callback(symbol, tick.price, tick.tick_type)
+                callback(tick)
             except Exception as e:
                 logger.error(f"Error in plugin tick callback for {symbol}: {e}")
 
