@@ -9,7 +9,6 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
-from threading import RLock
 from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -124,7 +123,6 @@ class MessageBus:
         Args:
             max_message_history: Maximum messages to keep in history per channel
         """
-        self._lock = RLock()
         self._channels: Dict[str, ChannelInfo] = {}
         self._subscriptions: Dict[str, List[Subscription]] = defaultdict(list)
         self._sequence_numbers: Dict[str, int] = defaultdict(int)
@@ -157,52 +155,49 @@ class MessageBus:
         Returns:
             True if published (even if no subscribers)
         """
-        with self._lock:
-            # Ensure channel exists
-            if channel not in self._channels:
-                self._channels[channel] = ChannelInfo(name=channel)
+        # Ensure channel exists
+        if channel not in self._channels:
+            self._channels[channel] = ChannelInfo(name=channel)
 
-            channel_info = self._channels[channel]
-            channel_info.publishers.add(publisher)
+        channel_info = self._channels[channel]
+        channel_info.publishers.add(publisher)
 
-            # Create message with metadata
-            self._sequence_numbers[channel] += 1
-            metadata = MessageMetadata(
-                timestamp=datetime.now(),
-                source_plugin=publisher,
-                message_type=message_type,
-                sequence_number=self._sequence_numbers[channel],
-            )
+        # Create message with metadata
+        self._sequence_numbers[channel] += 1
+        metadata = MessageMetadata(
+            timestamp=datetime.now(),
+            source_plugin=publisher,
+            message_type=message_type,
+            sequence_number=self._sequence_numbers[channel],
+        )
 
-            message = Message(
-                channel=channel,
-                payload=payload,
-                metadata=metadata,
-            )
+        message = Message(
+            channel=channel,
+            payload=payload,
+            metadata=metadata,
+        )
 
-            # Update channel stats
-            channel_info.message_count += 1
-            channel_info.last_message_at = metadata.timestamp
+        # Update channel stats
+        channel_info.message_count += 1
+        channel_info.last_message_at = metadata.timestamp
 
-            # Store in history
-            history = self._message_history[channel]
-            history.append(message)
-            if len(history) > self._max_history:
-                self._message_history[channel] = history[-self._max_history :]
+        # Store in history
+        history = self._message_history[channel]
+        history.append(message)
+        if len(history) > self._max_history:
+            self._message_history[channel] = history[-self._max_history :]
 
-            # Get subscribers (copy list to avoid issues during iteration)
-            subscribers = list(self._subscriptions.get(channel, []))
-            self._stats["messages_published"] += 1
+        # Get subscribers (copy list to avoid issues during iteration)
+        subscribers = list(self._subscriptions.get(channel, []))
+        self._stats["messages_published"] += 1
 
         # Deliver to subscribers OUTSIDE the lock to prevent deadlocks
         for sub in subscribers:
             try:
                 sub.callback(message)
-                with self._lock:
-                    self._stats["messages_delivered"] += 1
+                self._stats["messages_delivered"] += 1
             except Exception as e:
-                with self._lock:
-                    self._stats["delivery_errors"] += 1
+                self._stats["delivery_errors"] += 1
                 logger.error(
                     f"Error delivering message to '{sub.subscriber}' "
                     f"on channel '{channel}': {e}"
@@ -227,32 +222,31 @@ class MessageBus:
         Returns:
             True if subscribed successfully
         """
-        with self._lock:
-            # Ensure channel exists
-            if channel not in self._channels:
-                self._channels[channel] = ChannelInfo(name=channel)
+        # Ensure channel exists
+        if channel not in self._channels:
+            self._channels[channel] = ChannelInfo(name=channel)
 
-            # Check if already subscribed
-            for sub in self._subscriptions[channel]:
-                if sub.subscriber == subscriber:
-                    # Update callback
-                    sub.callback = callback
-                    logger.debug(
-                        f"'{subscriber}' updated subscription to channel '{channel}'"
-                    )
-                    return True
+        # Check if already subscribed
+        for sub in self._subscriptions[channel]:
+            if sub.subscriber == subscriber:
+                # Update callback
+                sub.callback = callback
+                logger.debug(
+                    f"'{subscriber}' updated subscription to channel '{channel}'"
+                )
+                return True
 
-            # Add new subscription
-            subscription = Subscription(
-                channel=channel,
-                subscriber=subscriber,
-                callback=callback,
-            )
-            self._subscriptions[channel].append(subscription)
-            self._channels[channel].subscribers.add(subscriber)
+        # Add new subscription
+        subscription = Subscription(
+            channel=channel,
+            subscriber=subscriber,
+            callback=callback,
+        )
+        self._subscriptions[channel].append(subscription)
+        self._channels[channel].subscribers.add(subscriber)
 
-            logger.debug(f"'{subscriber}' subscribed to channel '{channel}'")
-            return True
+        logger.debug(f"'{subscriber}' subscribed to channel '{channel}'")
+        return True
 
     def unsubscribe(self, channel: str, subscriber: str) -> bool:
         """
@@ -265,23 +259,22 @@ class MessageBus:
         Returns:
             True if unsubscribed (False if wasn't subscribed)
         """
-        with self._lock:
-            if channel not in self._subscriptions:
-                return False
+        if channel not in self._subscriptions:
+            return False
 
-            original_count = len(self._subscriptions[channel])
-            self._subscriptions[channel] = [
-                s for s in self._subscriptions[channel] if s.subscriber != subscriber
-            ]
+        original_count = len(self._subscriptions[channel])
+        self._subscriptions[channel] = [
+            s for s in self._subscriptions[channel] if s.subscriber != subscriber
+        ]
 
-            if channel in self._channels:
-                self._channels[channel].subscribers.discard(subscriber)
+        if channel in self._channels:
+            self._channels[channel].subscribers.discard(subscriber)
 
-            removed = len(self._subscriptions[channel]) < original_count
-            if removed:
-                logger.debug(f"'{subscriber}' unsubscribed from channel '{channel}'")
+        removed = len(self._subscriptions[channel]) < original_count
+        if removed:
+            logger.debug(f"'{subscriber}' unsubscribed from channel '{channel}'")
 
-            return removed
+        return removed
 
     def unsubscribe_all(self, subscriber: str) -> int:
         """
@@ -293,12 +286,11 @@ class MessageBus:
         Returns:
             Number of channels unsubscribed from
         """
-        with self._lock:
-            count = 0
-            for channel in list(self._subscriptions.keys()):
-                if self.unsubscribe(channel, subscriber):
-                    count += 1
-            return count
+        count = 0
+        for channel in list(self._subscriptions.keys()):
+            if self.unsubscribe(channel, subscriber):
+                count += 1
+        return count
 
     def list_channels(self) -> List[ChannelInfo]:
         """
@@ -307,8 +299,7 @@ class MessageBus:
         Returns:
             List of ChannelInfo objects
         """
-        with self._lock:
-            return list(self._channels.values())
+        return list(self._channels.values())
 
     def get_channel(self, channel: str) -> Optional[ChannelInfo]:
         """
@@ -320,8 +311,7 @@ class MessageBus:
         Returns:
             ChannelInfo or None if channel doesn't exist
         """
-        with self._lock:
-            return self._channels.get(channel)
+        return self._channels.get(channel)
 
     def get_history(
         self,
@@ -340,13 +330,12 @@ class MessageBus:
         Returns:
             List of Message objects (most recent last)
         """
-        with self._lock:
-            messages = self._message_history.get(channel, [])
+        messages = self._message_history.get(channel, [])
 
-            if since:
-                messages = [m for m in messages if m.metadata.timestamp >= since]
+        if since:
+            messages = [m for m in messages if m.metadata.timestamp >= since]
 
-            return list(messages[-count:])
+        return list(messages[-count:])
 
     def create_channel(
         self,
@@ -363,13 +352,12 @@ class MessageBus:
         Returns:
             True if created (False if already exists)
         """
-        with self._lock:
-            if name in self._channels:
-                return False
+        if name in self._channels:
+            return False
 
-            self._channels[name] = ChannelInfo(name=name, description=description)
-            logger.debug(f"Created channel '{name}'")
-            return True
+        self._channels[name] = ChannelInfo(name=name, description=description)
+        logger.debug(f"Created channel '{name}'")
+        return True
 
     def delete_channel(self, name: str) -> bool:
         """
@@ -381,17 +369,16 @@ class MessageBus:
         Returns:
             True if deleted (False if didn't exist)
         """
-        with self._lock:
-            if name not in self._channels:
-                return False
+        if name not in self._channels:
+            return False
 
-            del self._channels[name]
-            self._subscriptions.pop(name, None)
-            self._message_history.pop(name, None)
-            self._sequence_numbers.pop(name, None)
+        del self._channels[name]
+        self._subscriptions.pop(name, None)
+        self._message_history.pop(name, None)
+        self._sequence_numbers.pop(name, None)
 
-            logger.debug(f"Deleted channel '{name}'")
-            return True
+        logger.debug(f"Deleted channel '{name}'")
+        return True
 
     def clear_history(self, channel: Optional[str] = None) -> bool:
         """
@@ -403,15 +390,14 @@ class MessageBus:
         Returns:
             True if cleared
         """
-        with self._lock:
-            if channel:
-                if channel in self._message_history:
-                    self._message_history[channel] = []
-                    return True
-                return False
-            else:
-                self._message_history.clear()
+        if channel:
+            if channel in self._message_history:
+                self._message_history[channel] = []
                 return True
+            return False
+        else:
+            self._message_history.clear()
+            return True
 
     def get_stats(self) -> Dict[str, Any]:
         """
@@ -420,23 +406,21 @@ class MessageBus:
         Returns:
             Dict with stats (messages_published, messages_delivered, etc.)
         """
-        with self._lock:
-            return {
-                **self._stats,
-                "channels": len(self._channels),
-                "total_subscriptions": sum(
-                    len(subs) for subs in self._subscriptions.values()
-                ),
-                "history_size": sum(
-                    len(msgs) for msgs in self._message_history.values()
-                ),
-            }
+        return {
+            **self._stats,
+            "channels": len(self._channels),
+            "total_subscriptions": sum(
+                len(subs) for subs in self._subscriptions.values()
+            ),
+            "history_size": sum(
+                len(msgs) for msgs in self._message_history.values()
+            ),
+        }
 
     def reset_stats(self):
         """Reset statistics counters."""
-        with self._lock:
-            self._stats = {
-                "messages_published": 0,
-                "messages_delivered": 0,
-                "delivery_errors": 0,
-            }
+        self._stats = {
+            "messages_published": 0,
+            "messages_delivered": 0,
+            "delivery_errors": 0,
+        }

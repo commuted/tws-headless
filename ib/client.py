@@ -1,37 +1,42 @@
 """
-client.py - Interactive Brokers API connection wrapper
+client.py - Interactive Brokers async API client
 
-Provides a base client for connecting to IB TWS/Gateway with proper
-threading and event handling.
+Async-native IB client: composes AsyncIBTransport for connection/dispatch,
+inherits EClient solely for its req* request methods (47 methods that build
+and send field-encoded or Protobuf-encoded messages to TWS).
+
+The threading model (EReader + queue.Queue + EClient.run()) is replaced by
+AsyncIBTransport.run(), an asyncio coroutine that runs as a Task.
 """
 
+import asyncio
 import logging
-from threading import Thread, Event, Lock
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict
 
+from ibapi import comm
 from ibapi.client import EClient
+from ibapi.server_versions import MIN_SERVER_VER_PROTOBUF
 from ibapi.wrapper import EWrapper
-from ibapi.common import TickerId
 
-# Configure module logger
+from ib.async_transport import AsyncIBTransport
+
 logger = logging.getLogger(__name__)
 
 
 class IBClient(EWrapper, EClient):
     """
-    Base Interactive Brokers API client with connection management.
+    Async Interactive Brokers API client.
 
-    Handles connection lifecycle, threading, and basic callbacks.
-    Subclass this to add specific functionality.
+    Inherits EClient for all req* request methods; overrides the transport
+    layer (connect, sendMsg, isConnected, serverVersion) to use asyncio.
 
     Usage:
         client = IBClient()
-        if client.connect():
-            # do work
-            client.disconnect()
+        if await client.connect():
+            await client.reqCurrentTime()
+            await client.disconnect()
     """
 
-    # Default ports for different IB configurations
     PORTS = {
         "tws_live": 7496,
         "tws_paper": 7497,
@@ -46,20 +51,9 @@ class IBClient(EWrapper, EClient):
         client_id: int = 1,
         timeout: float = 10.0,
     ):
-        """
-        Initialize the IB client.
-
-        Args:
-            host: IB Gateway/TWS host address
-            port: IB Gateway/TWS port
-            client_id: Unique client identifier
-            timeout: Default timeout for operations in seconds
-        """
         EWrapper.__init__(self)
-        EClient.__init__(self, self)
+        EClient.__init__(self, self)  # passes self as wrapper; inits req* method state
 
-        # Stable copies: EClient.disconnect() resets its own host/port to
-        # None, so we keep private copies for reconnect.
         self._host = host
         self._port = port
         self.host = host
@@ -67,161 +61,159 @@ class IBClient(EWrapper, EClient):
         self.client_id = client_id
         self.timeout = timeout
 
-        # Connection state
-        self._connected = Event()
+        self._transport: Optional[AsyncIBTransport] = None
+        self._connected = asyncio.Event()
         self._next_order_id: Optional[int] = None
-        self._thread: Optional[Thread] = None
-        self._lock = Lock()
-
-        # Account info
-        self.managed_accounts: list = []
-
-        # Request ID management
         self._next_req_id = 1
-
-        # Callback registry for custom handlers
+        self.managed_accounts: list = []
         self._callbacks: Dict[str, Callable] = {}
+        self._run_task: Optional[asyncio.Task] = None
+
+    # =========================================================================
+    # EClient overrides — transport layer
+    # =========================================================================
+
+    def serverVersion(self) -> int:
+        """Return server version (overrides EClient.serverVersion)."""
+        return self._transport.serverVersion if self._transport else 0
+
+    def isConnected(self) -> bool:
+        """Return True if the transport is connected (overrides EClient.isConnected)."""
+        return self._transport is not None and self._transport.isConnected()
+
+    def sendMsg(self, msgId: int, msg: str) -> None:
+        """
+        Build and write a field-encoded message (overrides EClient.sendMsg).
+
+        Called by all inherited req* methods. Synchronous: asyncio.StreamWriter.write()
+        buffers the bytes; the event loop drains when it next has I/O time.
+        """
+        use_raw = self.serverVersion() >= MIN_SERVER_VER_PROTOBUF
+        full_msg = comm.make_msg(msgId, use_raw, msg)
+        self._transport.send_msg(full_msg)
+
+    def sendMsgProtoBuf(self, msgId: int, msg: bytes) -> None:
+        """
+        Build and write a Protobuf-encoded message (overrides EClient.sendMsgProtoBuf).
+
+        Called by req* methods that use Protobuf serialization (placeOrder,
+        cancelOrder, reqExecutions, reqGlobalCancel) when serverVersion >= 203.
+        """
+        full_msg = comm.make_msg_proto(msgId, msg)
+        self._transport.send_msg(full_msg)
+
+    # =========================================================================
+    # Connection lifecycle
+    # =========================================================================
 
     @property
     def connected(self) -> bool:
-        """Check if client is connected to IB"""
         return self._connected.is_set()
 
     @property
     def next_order_id(self) -> Optional[int]:
-        """Get the next valid order ID"""
         return self._next_order_id
 
     def get_next_req_id(self) -> int:
-        """Get next unique request ID"""
-        with self._lock:
-            req_id = self._next_req_id
-            self._next_req_id += 1
-            return req_id
+        """Return next unique request ID. Safe to call from the event loop thread."""
+        req_id = self._next_req_id
+        self._next_req_id += 1
+        return req_id
 
-    def register_callback(self, event: str, callback: Callable):
-        """
-        Register a callback for an event.
-
-        Args:
-            event: Event name (e.g., 'position', 'error')
-            callback: Callable to invoke when event occurs
-        """
+    def register_callback(self, event: str, callback: Callable) -> None:
         self._callbacks[event] = callback
 
-    def connect(self) -> bool:
+    async def connect(self) -> bool:
         """
-        Connect to Interactive Brokers TWS/Gateway.
+        Connect to IB TWS/Gateway and wait for nextValidId.
 
-        Returns:
-            True if connection successful, False otherwise
+        Returns True if connection succeeds within timeout, False otherwise.
         """
         try:
-            # Use saved host/port: EClient.disconnect() resets its own
-            # host/port fields to None, so we preserve ours separately.
-            host, port = self._host, self._port
-            logger.info(f"Connecting to IB at {host}:{port}...")
-            EClient.connect(self, host, port, self.client_id)
-
-            # Start message processing thread
-            self._thread = Thread(target=self.run, daemon=True)
-            self._thread.start()
-
-            # Wait for connection confirmation
-            if self._connected.wait(timeout=self.timeout):
-                logger.info("Successfully connected to IB")
-                return True
-            else:
-                logger.error("Connection timeout - no response from IB")
-                return False
-
+            logger.info(f"Connecting to IB at {self._host}:{self._port}...")
+            self._connected.clear()
+            self._transport = AsyncIBTransport(wrapper=self)
+            await self._transport.connect(self._host, self._port, self.client_id)
+            self._run_task = asyncio.create_task(self._transport.run())
+            await asyncio.wait_for(self._connected.wait(), timeout=self.timeout)
+            logger.info("Successfully connected to IB")
+            return True
+        except asyncio.TimeoutError:
+            logger.error("Connection timeout - no response from IB")
+            return False
         except Exception as e:
             logger.error(f"Connection error: {e}")
             return False
 
-    def disconnect(self):
-        """Disconnect from Interactive Brokers"""
-        try:
-            self._connected.clear()
-            EClient.disconnect(self)
-            logger.info("Disconnected from IB")
-        except Exception as e:
-            logger.error(f"Disconnect error: {e}")
+    async def disconnect(self) -> None:
+        """Disconnect from IB and cancel the transport task."""
+        self._connected.clear()
+        if self._transport:
+            try:
+                self._transport.disconnect()
+            except Exception:
+                pass
+        if self._run_task:
+            self._run_task.cancel()
+            try:
+                await self._run_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Disconnected from IB")
 
-    def reconnect(self) -> bool:
-        """Disconnect and reconnect to IB"""
-        self.disconnect()
-        return self.connect()
+    async def reconnect(self) -> bool:
+        """Disconnect and reconnect."""
+        await self.disconnect()
+        return await self.connect()
 
     # =========================================================================
-    # EWrapper Callbacks
+    # EWrapper callbacks
     # =========================================================================
 
     def nextValidId(self, orderId: int):
-        """Called when connection is established with next valid order ID"""
+        """Called when connection is established; signals connect() to return."""
         self._next_order_id = orderId
         self._connected.set()
         logger.debug(f"Next valid order ID: {orderId}")
-
         if "nextValidId" in self._callbacks:
             self._callbacks["nextValidId"](orderId)
 
     def managedAccounts(self, accountsList: str):
-        """Called with list of managed accounts"""
         self.managed_accounts = [a.strip() for a in accountsList.split(",") if a.strip()]
         logger.info(f"Managed accounts: {self.managed_accounts}")
-
         if "managedAccounts" in self._callbacks:
             self._callbacks["managedAccounts"](self.managed_accounts)
 
-    def error(
-        self,
-        reqId: TickerId,
-        errorTime: int,
-        errorCode: int,
-        errorString: str,
-        advancedOrderRejectJson: str = "",
-    ):
-        """Handle error messages from IB"""
-        # Categorize errors
+    def error(self, reqId, errorTime: int, errorCode: int, errorString: str,
+              advancedOrderRejectJson: str = ""):
         if errorCode in (2104, 2106, 2158, 2119):
-            # Informational: market data farm connections
             logger.debug(f"IB Info [{errorCode}]: {errorString}")
         elif errorCode in (10167,):
-            # Delayed market data notification
             logger.debug(f"IB Note [{errorCode}]: {errorString}")
         elif reqId == -1:
-            # System message
             logger.warning(f"IB System [{errorCode}]: {errorString}")
         else:
-            # Actual error
             logger.error(f"IB Error [{errorCode}] reqId={reqId}: {errorString}")
             if advancedOrderRejectJson:
                 logger.error(f"Order reject details: {advancedOrderRejectJson}")
-
         if "error" in self._callbacks:
             self._callbacks["error"](reqId, errorCode, errorString)
 
     def connectionClosed(self):
-        """Called when connection to IB is closed"""
         self._connected.clear()
         logger.warning("Connection to IB closed")
-
         if "connectionClosed" in self._callbacks:
             self._callbacks["connectionClosed"]()
 
     def currentTime(self, time: int):
-        """Handle server time response"""
         logger.debug(f"IB server time: {time}")
 
-    def __enter__(self):
-        """Context manager entry"""
-        self.connect()
+    async def __aenter__(self):
+        await self.connect()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit"""
-        self.disconnect()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.disconnect()
         return False
 
     def __repr__(self):

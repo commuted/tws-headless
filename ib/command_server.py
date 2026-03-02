@@ -5,12 +5,11 @@ Provides a Unix socket server that accepts commands from external programs.
 Commands can trigger actions like liquidation, status queries, or shutdown.
 """
 
+import asyncio
 import json
 import logging
 import os
 import secrets
-import socket
-import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -79,38 +78,34 @@ class RequestQueue:
     def __init__(self):
         self._active: Dict[str, RequestEntry] = {}
         self._completed: deque = deque(maxlen=self.MAX_COMPLETED)
-        self._lock = threading.Lock()
 
     def try_enqueue(self, token: str, command: str) -> Optional[str]:
         """
         Add request. Returns None on success, suggested token on duplicate.
         """
-        with self._lock:
-            # Check active and completed for duplicates
-            completed_tokens = {e.token for e in self._completed}
-            if token in self._active or token in completed_tokens:
-                suggested = self._generate_token_locked()
-                return suggested
-            self._active[token] = RequestEntry(token=token, command=command)
-            return None
+        # Check active and completed for duplicates
+        completed_tokens = {e.token for e in self._completed}
+        if token in self._active or token in completed_tokens:
+            suggested = self._generate_token()
+            return suggested
+        self._active[token] = RequestEntry(token=token, command=command)
+        return None
 
     def complete(self, token: str, result: Optional[CommandResult] = None) -> None:
         """Move request from active to completed. deque(maxlen=8) auto-evicts oldest."""
-        with self._lock:
-            entry = self._active.pop(token, None)
-            if entry is not None:
-                entry.status = "completed"
-                entry.result = result
-                entry.completed_at = time.time()
-                self._completed.append(entry)
+        entry = self._active.pop(token, None)
+        if entry is not None:
+            entry.status = "completed"
+            entry.result = result
+            entry.completed_at = time.time()
+            self._completed.append(entry)
 
     def generate_token(self) -> str:
         """Generate a unique token not in the queue."""
-        with self._lock:
-            return self._generate_token_locked()
+        return self._generate_token()
 
-    def _generate_token_locked(self) -> str:
-        """Generate a unique token (must hold self._lock)."""
+    def _generate_token(self) -> str:
+        """Generate a unique token."""
         completed_tokens = {e.token for e in self._completed}
         while True:
             token = secrets.token_hex(8)
@@ -119,8 +114,7 @@ class RequestQueue:
 
     @property
     def size(self) -> int:
-        with self._lock:
-            return len(self._active) + len(self._completed)
+        return len(self._active) + len(self._completed)
 
 
 class CommandServer:
@@ -155,10 +149,9 @@ class CommandServer:
         self.socket_path = socket_path
         self.tcp_port = tcp_port
         self._handlers: Dict[str, Callable[[List[str]], CommandResult]] = {}
-        self._server_socket: Optional[socket.socket] = None
-        self._thread: Optional[threading.Thread] = None
+        self._server: Optional[asyncio.Server] = None
+        self._serve_task: Optional[asyncio.Task] = None
         self._running = False
-        self._lock = threading.Lock()
 
         # Authentication
         self._token_store: Optional[TokenStore] = None
@@ -212,54 +205,53 @@ class CommandServer:
 
     def start(self) -> bool:
         """
-        Start the command server.
+        Start the command server (sync — schedules async server via event loop task).
 
         Returns:
-            True if started successfully
+            True if startup was scheduled successfully
         """
         if self._running:
             logger.warning("Command server already running")
             return False
 
         try:
-            if self.tcp_port:
-                self._start_tcp()
-            else:
-                self._start_unix()
-
             self._running = True
-            self._thread = threading.Thread(target=self._run, daemon=True)
-            self._thread.start()
-
-            logger.info(f"Command server started on {self._address_str}")
+            self._serve_task = asyncio.get_event_loop().create_task(self._serve())
+            logger.info(f"Command server starting on {self._address_str}")
             return True
-
         except Exception as e:
+            self._running = False
             logger.error(f"Failed to start command server: {e}")
             return False
 
-    def _start_unix(self):
-        """Start Unix domain socket server"""
-        # Remove existing socket file
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
+    async def _serve(self):
+        """Async server loop — creates the asyncio server and serves forever."""
+        try:
+            if self.tcp_port:
+                self._server = await asyncio.start_server(
+                    self._handle_client, "127.0.0.1", self.tcp_port
+                )
+            else:
+                if os.path.exists(self.socket_path):
+                    os.unlink(self.socket_path)
+                self._server = await asyncio.start_unix_server(
+                    self._handle_client, self.socket_path
+                )
+                os.chmod(self.socket_path, 0o600)
 
-        self._server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_socket.bind(self.socket_path)
-        self._server_socket.listen(5)
-        self._server_socket.settimeout(1.0)  # Allow periodic checks
+            logger.info(f"Command server listening on {self._address_str}")
+            await self._server.serve_forever()
 
-        # Set permissions (owner only)
-        os.chmod(self.socket_path, 0o600)
-
-    def _start_tcp(self):
-        """Start TCP socket server"""
-        self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_socket.bind(("127.0.0.1", self.tcp_port))
-        self._server_socket.listen(5)
-        self._server_socket.settimeout(1.0)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Command server error: {e}")
+        finally:
+            if not self.tcp_port and os.path.exists(self.socket_path):
+                try:
+                    os.unlink(self.socket_path)
+                except Exception:
+                    pass
 
     @property
     def _address_str(self) -> str:
@@ -269,77 +261,40 @@ class CommandServer:
         return f"unix://{self.socket_path}"
 
     def stop(self):
-        """Stop the command server"""
+        """Stop the command server (sync — closes server and cancels task)."""
         if not self._running:
             return
 
         logger.info("Stopping command server...")
         self._running = False
 
-        # Close socket to interrupt accept()
-        if self._server_socket:
-            try:
-                self._server_socket.close()
-            except Exception:
-                pass
+        if self._server:
+            self._server.close()
+            self._server = None
 
-        # Wait for thread
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-
-        # Cleanup Unix socket file
-        if not self.tcp_port and os.path.exists(self.socket_path):
-            try:
-                os.unlink(self.socket_path)
-            except Exception:
-                pass
+        if self._serve_task:
+            self._serve_task.cancel()
+            self._serve_task = None
 
         logger.info("Command server stopped")
 
-    def _run(self):
-        """Main server loop"""
-        while self._running:
-            try:
-                client_socket, _ = self._server_socket.accept()
-                # Handle client in a separate thread
-                threading.Thread(
-                    target=self._handle_client,
-                    args=(client_socket,),
-                    daemon=True,
-                ).start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self._running:
-                    logger.error(f"Error accepting connection: {e}")
-
-    def _parse_request_token(self, command_line: str) -> tuple:
-        """Extract optional REQ <token> prefix. Returns (token, remaining)."""
-        parts = command_line.strip().split(None, 2)
-        if len(parts) >= 2 and parts[0].upper() == "REQ":
-            return parts[1], parts[2] if len(parts) > 2 else ""
-        return self._request_queue.generate_token(), command_line
-
-    def _handle_client(self, client_socket: socket.socket):
-        """Handle a client connection"""
+    async def _handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ):
+        """Handle a single client connection."""
         request_token = None
         try:
-            client_socket.settimeout(30.0)
-
-            # Read command (newline-terminated)
-            data = b""
-            while True:
-                chunk = client_socket.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                if b"\n" in data:
-                    break
+            # Read command (newline-terminated) with 30s timeout
+            try:
+                data = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=30.0)
+            except asyncio.TimeoutError:
+                return
+            except asyncio.IncompleteReadError:
+                return
 
             if not data:
                 return
 
-            # Parse command
             command_line = data.decode("utf-8").strip()
 
             # Extract request token (strips REQ prefix if present)
@@ -354,16 +309,15 @@ class CommandServer:
                     data={"suggested_token": suggested},
                     request_token=request_token,
                 )
-                response = result.to_json() + "\n"
-                client_socket.sendall(response.encode("utf-8"))
+                writer.write((result.to_json() + "\n").encode("utf-8"))
+                await writer.drain()
                 return
 
             result = self._execute_command(remaining)
             result.request_token = request_token
 
-            # Send response
-            response = result.to_json() + "\n"
-            client_socket.sendall(response.encode("utf-8"))
+            writer.write((result.to_json() + "\n").encode("utf-8"))
+            await writer.drain()
 
         except Exception as e:
             logger.error(f"Error handling client: {e}")
@@ -373,16 +327,25 @@ class CommandServer:
                     message=str(e),
                     request_token=request_token,
                 )
-                client_socket.sendall((error_result.to_json() + "\n").encode("utf-8"))
+                writer.write((error_result.to_json() + "\n").encode("utf-8"))
+                await writer.drain()
             except Exception:
                 pass
         finally:
             if request_token is not None:
                 self._request_queue.complete(request_token)
             try:
-                client_socket.close()
+                writer.close()
+                await writer.wait_closed()
             except Exception:
                 pass
+
+    def _parse_request_token(self, command_line: str) -> tuple:
+        """Extract optional REQ <token> prefix. Returns (token, remaining)."""
+        parts = command_line.strip().split(None, 2)
+        if len(parts) >= 2 and parts[0].upper() == "REQ":
+            return parts[1], parts[2] if len(parts) > 2 else ""
+        return self._request_queue.generate_token(), command_line
 
     def _execute_command(self, command_line: str) -> CommandResult:
         """Parse, authenticate, and execute a command"""
@@ -439,6 +402,9 @@ class CommandServer:
             status=CommandStatus.SUCCESS,
             message="pong",
         )
+
+
+import socket  # kept for send_command() used by standalone ibctl.py client
 
 
 def send_command(

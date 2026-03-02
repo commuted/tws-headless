@@ -4,6 +4,7 @@ Unit tests for command_server.py
 Tests CommandResult, CommandServer command handling, and socket communication.
 """
 
+import asyncio
 import json
 import os
 import socket
@@ -266,7 +267,7 @@ class TestCommandServerIntegration:
             os.unlink(path)
 
     @pytest.fixture
-    def running_server(self, temp_socket_path):
+    async def running_server(self, temp_socket_path):
         """Create and start a server, yield it, then stop"""
         server = CommandServer(socket_path=temp_socket_path)
 
@@ -283,93 +284,91 @@ class TestCommandServerIntegration:
         started = server.start()
         assert started, "Server failed to start"
 
-        # Give server time to start listening
-        time.sleep(0.1)
+        # Give event loop time to create socket
+        await asyncio.sleep(0.1)
 
         yield server, temp_socket_path
 
         server.stop()
+        await asyncio.sleep(0.05)
 
-    def test_server_start_stop(self, temp_socket_path):
+    async def test_server_start_stop(self, temp_socket_path):
         """Test server starts and stops cleanly"""
         server = CommandServer(socket_path=temp_socket_path)
 
         assert server.start() is True
+        # Yield control so _serve() can bind the socket
+        await asyncio.sleep(0.1)
         assert os.path.exists(temp_socket_path)
 
         server.stop()
-        # Socket file should be cleaned up
+        # Socket file cleaned up by _serve() finally block after cancellation
+        await asyncio.sleep(0.05)
         assert not os.path.exists(temp_socket_path)
 
-    def test_server_socket_permissions(self, temp_socket_path):
+    async def test_server_socket_permissions(self, temp_socket_path):
         """Test socket has correct permissions (owner only)"""
         server = CommandServer(socket_path=temp_socket_path)
         server.start()
+        await asyncio.sleep(0.1)
 
         mode = os.stat(temp_socket_path).st_mode & 0o777
         assert mode == 0o600, f"Socket permissions should be 0600, got {oct(mode)}"
 
         server.stop()
+        await asyncio.sleep(0.05)
 
-    def test_send_command_ping(self, running_server):
+    async def test_send_command_ping(self, running_server):
         """Test sending ping command via socket"""
         server, socket_path = running_server
 
-        result = send_command("ping", socket_path=socket_path)
+        result = await asyncio.to_thread(send_command, "ping", socket_path)
 
         assert result.status == CommandStatus.SUCCESS
         assert result.message == "pong"
 
-    def test_send_command_help(self, running_server):
+    async def test_send_command_help(self, running_server):
         """Test sending help command via socket"""
         server, socket_path = running_server
 
-        result = send_command("help", socket_path=socket_path)
+        result = await asyncio.to_thread(send_command, "help", socket_path)
 
         assert result.status == CommandStatus.SUCCESS
         assert "test" in result.message  # Our registered handler
         assert "commands" in result.data
 
-    def test_send_command_custom(self, running_server):
+    async def test_send_command_custom(self, running_server):
         """Test sending custom command via socket"""
         server, socket_path = running_server
 
-        result = send_command("test arg1 arg2", socket_path=socket_path)
+        result = await asyncio.to_thread(send_command, "test arg1 arg2", socket_path)
 
         assert result.status == CommandStatus.SUCCESS
         assert result.data["args"] == ["arg1", "arg2"]
 
-    def test_send_command_unknown(self, running_server):
+    async def test_send_command_unknown(self, running_server):
         """Test sending unknown command"""
         server, socket_path = running_server
 
-        result = send_command("nonexistent", socket_path=socket_path)
+        result = await asyncio.to_thread(send_command, "nonexistent", socket_path)
 
         assert result.status == CommandStatus.ERROR
         assert "Unknown command" in result.message
 
-    def test_send_command_server_not_running(self, temp_socket_path):
+    async def test_send_command_server_not_running(self, temp_socket_path):
         """Test sending command when server is not running"""
-        result = send_command("ping", socket_path=temp_socket_path)
+        result = await asyncio.to_thread(send_command, "ping", temp_socket_path)
 
         assert result.status == CommandStatus.ERROR
         assert "not running" in result.message.lower() or "not found" in result.message.lower()
 
-    def test_multiple_clients(self, running_server):
+    async def test_multiple_clients(self, running_server):
         """Test multiple clients can connect"""
         server, socket_path = running_server
 
-        results = []
-
-        def send_and_store():
-            result = send_command("ping", socket_path=socket_path)
-            results.append(result)
-
-        threads = [threading.Thread(target=send_and_store) for _ in range(5)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=5.0)
+        # send_command is sync/blocking — run each in a thread
+        tasks = [asyncio.to_thread(send_command, "ping", socket_path) for _ in range(5)]
+        results = await asyncio.gather(*tasks)
 
         assert len(results) == 5
         assert all(r.status == CommandStatus.SUCCESS for r in results)
@@ -535,7 +534,7 @@ class TestSendCommandWithToken:
             os.unlink(path)
 
     @pytest.fixture
-    def auth_server(self, temp_socket_path):
+    async def auth_server(self, temp_socket_path):
         """Create a server with authentication enabled"""
         from pathlib import Path
         from auth import TokenStore
@@ -549,34 +548,35 @@ class TestSendCommandWithToken:
             server = CommandServer(socket_path=temp_socket_path, token_file=token_path)
             started = server.start()
             assert started, "Server failed to start"
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
 
             yield server, temp_socket_path, token
 
             server.stop()
+            await asyncio.sleep(0.05)
 
-    def test_send_command_with_token(self, auth_server):
+    async def test_send_command_with_token(self, auth_server):
         """Test sending command with authentication token"""
         server, socket_path, token = auth_server
 
-        result = send_command("ping", socket_path=socket_path, token=token)
+        result = await asyncio.to_thread(send_command, "ping", socket_path=socket_path, token=token)
 
         assert result.status == CommandStatus.SUCCESS
         assert result.message == "pong"
 
-    def test_send_command_without_token_fails(self, auth_server):
+    async def test_send_command_without_token_fails(self, auth_server):
         """Test sending command without token fails when auth required"""
         server, socket_path, token = auth_server
 
-        result = send_command("ping", socket_path=socket_path)
+        result = await asyncio.to_thread(send_command, "ping", socket_path=socket_path)
 
         assert result.status == CommandStatus.UNAUTHORIZED
 
-    def test_send_command_with_wrong_token_fails(self, auth_server):
+    async def test_send_command_with_wrong_token_fails(self, auth_server):
         """Test sending command with wrong token fails"""
         server, socket_path, token = auth_server
 
-        result = send_command("ping", socket_path=socket_path, token="wrong_token")
+        result = await asyncio.to_thread(send_command, "ping", socket_path=socket_path, token="wrong_token")
 
         assert result.status == CommandStatus.UNAUTHORIZED
 
@@ -775,7 +775,7 @@ class TestRequestTokenIntegration:
             os.unlink(path)
 
     @pytest.fixture
-    def running_server(self, temp_socket_path):
+    async def running_server(self, temp_socket_path):
         """Create and start a server, yield it, then stop"""
         server = CommandServer(socket_path=temp_socket_path)
         server.register_handler("test", lambda args: CommandResult(
@@ -784,35 +784,36 @@ class TestRequestTokenIntegration:
         ))
         started = server.start()
         assert started
-        time.sleep(0.1)
+        await asyncio.sleep(0.1)
         yield server, temp_socket_path
         server.stop()
+        await asyncio.sleep(0.05)
 
-    def test_client_provided_token_in_response(self, running_server):
+    async def test_client_provided_token_in_response(self, running_server):
         """Test client-provided token appears in response"""
         server, socket_path = running_server
-        result = send_command("ping", socket_path=socket_path, request_token="my-req-1")
+        result = await asyncio.to_thread(send_command, "ping", socket_path=socket_path, request_token="my-req-1")
         assert result.request_token == "my-req-1"
         assert result.status == CommandStatus.SUCCESS
 
-    def test_server_generates_token_when_none_provided(self, running_server):
+    async def test_server_generates_token_when_none_provided(self, running_server):
         """Test server generates token when client doesn't provide one"""
         server, socket_path = running_server
-        result = send_command("ping", socket_path=socket_path)
+        result = await asyncio.to_thread(send_command, "ping", socket_path=socket_path)
         assert result.request_token is not None
         assert len(result.request_token) > 0
 
-    def test_duplicate_token_returns_error(self, running_server):
+    async def test_duplicate_token_returns_error(self, running_server):
         """Test duplicate token returns error with suggested alternative"""
         server, socket_path = running_server
 
         # Send first request — it will complete before the second arrives
         # so we need to use a token that lands in the completed queue
-        result1 = send_command("ping", socket_path=socket_path, request_token="dup-token")
+        result1 = await asyncio.to_thread(send_command, "ping", socket_path=socket_path, request_token="dup-token")
         assert result1.status == CommandStatus.SUCCESS
 
         # Send second request with same token — should fail (token in completed queue)
-        result2 = send_command("ping", socket_path=socket_path, request_token="dup-token")
+        result2 = await asyncio.to_thread(send_command, "ping", socket_path=socket_path, request_token="dup-token")
         assert result2.status == CommandStatus.ERROR
         assert "Duplicate" in result2.message
         assert "suggested_token" in result2.data

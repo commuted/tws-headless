@@ -17,7 +17,6 @@ Usage:
 """
 
 import logging
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
@@ -85,7 +84,6 @@ class RateLimiter:
         self.config = config or RateLimiterConfig()
         self._tokens: float = float(self.config.bucket_size)
         self._last_refill: float = time.monotonic()
-        self._lock = threading.Lock()
         self._stats = RateLimiterStats(started_at=datetime.now().isoformat())
 
     def _refill(self) -> None:
@@ -105,16 +103,15 @@ class RateLimiter:
         Returns:
             True if token acquired, False if not available
         """
-        with self._lock:
-            self._refill()
+        self._refill()
 
-            if self._tokens >= 1.0:
-                self._tokens -= 1.0
-                self._stats.requests_allowed += 1
-                self._stats.last_request_time = datetime.now().isoformat()
-                return True
+        if self._tokens >= 1.0:
+            self._tokens -= 1.0
+            self._stats.requests_allowed += 1
+            self._stats.last_request_time = datetime.now().isoformat()
+            return True
 
-            return False
+        return False
 
     def acquire(self, blocking: bool = True, timeout: Optional[float] = None) -> bool:
         """
@@ -134,31 +131,29 @@ class RateLimiter:
         waited = False
 
         while True:
-            with self._lock:
-                self._refill()
+            self._refill()
 
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    self._stats.requests_allowed += 1
-                    self._stats.last_request_time = datetime.now().isoformat()
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                self._stats.requests_allowed += 1
+                self._stats.last_request_time = datetime.now().isoformat()
 
-                    if waited:
-                        delay_ms = (time.monotonic() - start_time) * 1000
-                        self._stats.requests_delayed += 1
-                        self._stats.total_delay_ms += delay_ms
+                if waited:
+                    delay_ms = (time.monotonic() - start_time) * 1000
+                    self._stats.requests_delayed += 1
+                    self._stats.total_delay_ms += delay_ms
 
-                    return True
+                return True
 
-                # Calculate wait time for next token
-                tokens_needed = 1.0 - self._tokens
-                wait_time = tokens_needed / self.config.max_rate
+            # Calculate wait time for next token
+            tokens_needed = 1.0 - self._tokens
+            wait_time = tokens_needed / self.config.max_rate
 
             # Check timeout
             if timeout is not None:
                 elapsed = time.monotonic() - start_time
                 if elapsed >= timeout:
-                    with self._lock:
-                        self._stats.requests_rejected += 1
+                    self._stats.requests_rejected += 1
                     return False
                 # Don't wait longer than remaining timeout
                 wait_time = min(wait_time, timeout - elapsed)
@@ -170,20 +165,17 @@ class RateLimiter:
     @property
     def available_tokens(self) -> float:
         """Get current available tokens (may be stale)"""
-        with self._lock:
-            self._refill()
-            return self._tokens
+        self._refill()
+        return self._tokens
 
     @property
     def stats(self) -> Dict[str, Any]:
         """Get rate limiter statistics"""
-        with self._lock:
-            return self._stats.to_dict()
+        return self._stats.to_dict()
 
     def reset_stats(self) -> None:
         """Reset statistics counters"""
-        with self._lock:
-            self._stats = RateLimiterStats(started_at=datetime.now().isoformat())
+        self._stats = RateLimiterStats(started_at=datetime.now().isoformat())
 
 
 class OrderRateLimiter:
@@ -225,7 +217,6 @@ class OrderRateLimiter:
             "orders_rate_limited": 0,
             "orders_rejected": 0,
         }
-        self._lock = threading.Lock()
 
         logger.info(
             f"Order rate limiter initialized: {orders_per_second} orders/sec, "
@@ -245,17 +236,16 @@ class OrderRateLimiter:
         """
         result = self._limiter.acquire(blocking=blocking, timeout=timeout)
 
-        with self._lock:
-            if result:
-                self._order_stats["orders_submitted"] += 1
-                # Check if we had to wait (was rate limited)
-                if self._limiter._stats.requests_delayed > 0:
-                    prev_delayed = getattr(self, "_prev_delayed", 0)
-                    if self._limiter._stats.requests_delayed > prev_delayed:
-                        self._order_stats["orders_rate_limited"] += 1
-                    self._prev_delayed = self._limiter._stats.requests_delayed
-            else:
-                self._order_stats["orders_rejected"] += 1
+        if result:
+            self._order_stats["orders_submitted"] += 1
+            # Check if we had to wait (was rate limited)
+            if self._limiter._stats.requests_delayed > 0:
+                prev_delayed = getattr(self, "_prev_delayed", 0)
+                if self._limiter._stats.requests_delayed > prev_delayed:
+                    self._order_stats["orders_rate_limited"] += 1
+                self._prev_delayed = self._limiter._stats.requests_delayed
+        else:
+            self._order_stats["orders_rejected"] += 1
 
         return result
 
@@ -276,25 +266,23 @@ class OrderRateLimiter:
     @property
     def stats(self) -> Dict[str, Any]:
         """Get combined statistics"""
-        with self._lock:
-            limiter_stats = self._limiter.stats
-            return {
-                **limiter_stats,
-                **self._order_stats,
-                "orders_per_second_limit": self._limiter.config.max_rate,
-                "burst_size": self._limiter.config.bucket_size,
-            }
+        limiter_stats = self._limiter.stats
+        return {
+            **limiter_stats,
+            **self._order_stats,
+            "orders_per_second_limit": self._limiter.config.max_rate,
+            "burst_size": self._limiter.config.bucket_size,
+        }
 
     def reset_stats(self) -> None:
         """Reset all statistics"""
         self._limiter.reset_stats()
-        with self._lock:
-            self._order_stats = {
-                "orders_submitted": 0,
-                "orders_rate_limited": 0,
-                "orders_rejected": 0,
-            }
-            self._prev_delayed = 0
+        self._order_stats = {
+            "orders_submitted": 0,
+            "orders_rate_limited": 0,
+            "orders_rejected": 0,
+        }
+        self._prev_delayed = 0
 
     @property
     def orders_per_second(self) -> float:

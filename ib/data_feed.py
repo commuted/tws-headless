@@ -10,7 +10,6 @@ Provides a data feed system that:
 """
 
 import logging
-from threading import Thread, Event, Lock, RLock
 from typing import Optional, Callable, Dict, List, Set, Any, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -151,7 +150,6 @@ class BarAggregator:
 
     def __init__(self, symbol: str):
         self.symbol = symbol
-        self._lock = Lock()
 
         # Current bars being built
         self._current_1min: Optional[Bar] = None
@@ -175,26 +173,25 @@ class BarAggregator:
         Returns:
             Dictionary mapping DataType to completed Bar (or None if not complete)
         """
-        with self._lock:
-            completed = {
-                DataType.BAR_1MIN: None,
-                DataType.BAR_5MIN: None,
-                DataType.BAR_15MIN: None,
-                DataType.BAR_1HOUR: None,
-            }
+        completed = {
+            DataType.BAR_1MIN: None,
+            DataType.BAR_5MIN: None,
+            DataType.BAR_15MIN: None,
+            DataType.BAR_1HOUR: None,
+        }
 
-            try:
-                ts = datetime.fromisoformat(bar.timestamp)
-            except (ValueError, TypeError):
-                ts = datetime.now()
+        try:
+            ts = datetime.fromisoformat(bar.timestamp)
+        except (ValueError, TypeError):
+            ts = datetime.now()
 
-            # Aggregate into each timeframe
-            completed[DataType.BAR_1MIN] = self._aggregate_1min(bar, ts)
-            completed[DataType.BAR_5MIN] = self._aggregate_5min(bar, ts)
-            completed[DataType.BAR_15MIN] = self._aggregate_15min(bar, ts)
-            completed[DataType.BAR_1HOUR] = self._aggregate_1hour(bar, ts)
+        # Aggregate into each timeframe
+        completed[DataType.BAR_1MIN] = self._aggregate_1min(bar, ts)
+        completed[DataType.BAR_5MIN] = self._aggregate_5min(bar, ts)
+        completed[DataType.BAR_15MIN] = self._aggregate_15min(bar, ts)
+        completed[DataType.BAR_1HOUR] = self._aggregate_1hour(bar, ts)
 
-            return completed
+        return completed
 
     def _get_boundary(self, ts: datetime, minutes: int) -> datetime:
         """Get the bar boundary for a given timestamp and minute interval"""
@@ -352,7 +349,6 @@ class DataFeed:
 
         # State
         self._running = False
-        self._lock = RLock()
 
         # Subscriptions
         self._subscriptions: Dict[str, InstrumentSubscription] = {}
@@ -388,8 +384,7 @@ class DataFeed:
     @property
     def subscriptions(self) -> List[str]:
         """Get list of subscribed symbols"""
-        with self._lock:
-            return list(self._subscriptions.keys())
+        return list(self._subscriptions.keys())
 
     @property
     def stats(self) -> Dict[str, Any]:
@@ -426,45 +421,44 @@ class DataFeed:
         if data_types is None:
             data_types = {DataType.TICK, DataType.BAR_5SEC}
 
-        with self._lock:
-            # Create or update subscription
-            if symbol in self._subscriptions:
-                sub = self._subscriptions[symbol]
-                sub.data_types.update(data_types)
-                sub.subscribers.add(subscriber)
-                # Warn if settings differ from first subscriber
-                if sub.what_to_show != what_to_show:
-                    logger.warning(
-                        f"Subscriber '{subscriber}' requested what_to_show='{what_to_show}' "
-                        f"for {symbol}, but existing stream uses '{sub.what_to_show}'"
-                    )
-                if sub.use_rth != use_rth:
-                    logger.warning(
-                        f"Subscriber '{subscriber}' requested use_rth={use_rth} "
-                        f"for {symbol}, but existing stream uses use_rth={sub.use_rth}"
-                    )
-                logger.debug(f"Added subscriber '{subscriber}' to existing {symbol} stream")
-            else:
-                sub = InstrumentSubscription(
-                    symbol=symbol,
-                    contract=contract,
-                    data_types=data_types,
-                    what_to_show=what_to_show,
-                    use_rth=use_rth,
-                    subscribers={subscriber},
+        # Create or update subscription
+        if symbol in self._subscriptions:
+            sub = self._subscriptions[symbol]
+            sub.data_types.update(data_types)
+            sub.subscribers.add(subscriber)
+            # Warn if settings differ from first subscriber
+            if sub.what_to_show != what_to_show:
+                logger.warning(
+                    f"Subscriber '{subscriber}' requested what_to_show='{what_to_show}' "
+                    f"for {symbol}, but existing stream uses '{sub.what_to_show}'"
                 )
-                self._subscriptions[symbol] = sub
+            if sub.use_rth != use_rth:
+                logger.warning(
+                    f"Subscriber '{subscriber}' requested use_rth={use_rth} "
+                    f"for {symbol}, but existing stream uses use_rth={sub.use_rth}"
+                )
+            logger.debug(f"Added subscriber '{subscriber}' to existing {symbol} stream")
+        else:
+            sub = InstrumentSubscription(
+                symbol=symbol,
+                contract=contract,
+                data_types=data_types,
+                what_to_show=what_to_show,
+                use_rth=use_rth,
+                subscribers={subscriber},
+            )
+            self._subscriptions[symbol] = sub
 
-                # Create buffer and aggregator
-                self._buffers[symbol] = DataBuffer()
-                self._aggregators[symbol] = BarAggregator(symbol)
+            # Create buffer and aggregator
+            self._buffers[symbol] = DataBuffer()
+            self._aggregators[symbol] = BarAggregator(symbol)
 
-            # Start subscription if running (only starts once per symbol)
-            if self._running and not sub.active:
-                self._start_subscription(symbol, sub)
+        # Start subscription if running (only starts once per symbol)
+        if self._running and not sub.active:
+            self._start_subscription(symbol, sub)
 
-            logger.info(f"Subscribed '{subscriber}' to {symbol}: {[d.value for d in data_types]}")
-            return True
+        logger.info(f"Subscribed '{subscriber}' to {symbol}: {[d.value for d in data_types]}")
+        return True
 
     def unsubscribe(self, symbol: str, subscriber: str = "default"):
         """
@@ -476,32 +470,31 @@ class DataFeed:
             symbol: Symbol to unsubscribe
             subscriber: Subscriber identifier to remove
         """
-        with self._lock:
-            if symbol not in self._subscriptions:
-                return
+        if symbol not in self._subscriptions:
+            return
 
-            sub = self._subscriptions[symbol]
+        sub = self._subscriptions[symbol]
 
-            # Remove subscriber
-            sub.subscribers.discard(subscriber)
-            logger.debug(f"Removed subscriber '{subscriber}' from {symbol}")
+        # Remove subscriber
+        sub.subscribers.discard(subscriber)
+        logger.debug(f"Removed subscriber '{subscriber}' from {symbol}")
 
-            # Only stop stream if no subscribers remain
-            if not sub.subscribers:
-                # Stop subscriptions
-                if sub.active:
-                    self._stop_subscription(symbol, sub)
+        # Only stop stream if no subscribers remain
+        if not sub.subscribers:
+            # Stop subscriptions
+            if sub.active:
+                self._stop_subscription(symbol, sub)
 
-                # Clean up
-                del self._subscriptions[symbol]
-                if symbol in self._buffers:
-                    del self._buffers[symbol]
-                if symbol in self._aggregators:
-                    del self._aggregators[symbol]
+            # Clean up
+            del self._subscriptions[symbol]
+            if symbol in self._buffers:
+                del self._buffers[symbol]
+            if symbol in self._aggregators:
+                del self._aggregators[symbol]
 
-                logger.info(f"Unsubscribed from {symbol} (no subscribers remain)")
-            else:
-                logger.debug(f"{symbol} still has {len(sub.subscribers)} subscriber(s)")
+            logger.info(f"Unsubscribed from {symbol} (no subscribers remain)")
+        else:
+            logger.debug(f"{symbol} still has {len(sub.subscribers)} subscriber(s)")
 
     def start(self) -> bool:
         """
@@ -527,9 +520,8 @@ class DataFeed:
         self._setup_callbacks()
 
         # Start all subscriptions
-        with self._lock:
-            for symbol, sub in self._subscriptions.items():
-                self._start_subscription(symbol, sub)
+        for symbol, sub in self._subscriptions.items():
+            self._start_subscription(symbol, sub)
 
         logger.info(f"Data feed started with {len(self._subscriptions)} subscriptions")
         return True
@@ -547,10 +539,9 @@ class DataFeed:
         self._running = False
 
         # Stop all subscriptions
-        with self._lock:
-            for symbol, sub in self._subscriptions.items():
-                if sub.active:
-                    self._stop_subscription(symbol, sub)
+        for symbol, sub in self._subscriptions.items():
+            if sub.active:
+                self._stop_subscription(symbol, sub)
 
         logger.info("Data feed stopped")
 
@@ -659,9 +650,8 @@ class DataFeed:
         )
 
         # Buffer the tick
-        with self._lock:
-            if symbol in self._buffers:
-                self._buffers[symbol].ticks.append(tick)
+        if symbol in self._buffers:
+            self._buffers[symbol].ticks.append(tick)
 
         # Route to callback
         if self.on_tick:
@@ -692,9 +682,8 @@ class DataFeed:
         )
 
         # Buffer the tick
-        with self._lock:
-            if symbol in self._buffers:
-                self._buffers[symbol].ticks.append(tick)
+        if symbol in self._buffers:
+            self._buffers[symbol].ticks.append(tick)
 
         # Route to callback
         if self.on_tick:
@@ -711,39 +700,38 @@ class DataFeed:
         self._stats["bars_received"] += 1
         symbol = bar.symbol
 
-        with self._lock:
-            if symbol not in self._buffers:
-                return
+        if symbol not in self._buffers:
+            return
 
-            buffer = self._buffers[symbol]
-            aggregator = self._aggregators.get(symbol)
+        buffer = self._buffers[symbol]
+        aggregator = self._aggregators.get(symbol)
 
-            # Buffer the 5-second bar
-            buffer.bars_5sec.append(bar)
+        # Buffer the 5-second bar
+        buffer.bars_5sec.append(bar)
 
-            # Route 5-second bar
-            self._route_bar(symbol, bar, DataType.BAR_5SEC)
+        # Route 5-second bar
+        self._route_bar(symbol, bar, DataType.BAR_5SEC)
 
-            # Aggregate into larger timeframes
-            if aggregator:
-                completed_bars = aggregator.add_bar(bar)
+        # Aggregate into larger timeframes
+        if aggregator:
+            completed_bars = aggregator.add_bar(bar)
 
-                for data_type, completed_bar in completed_bars.items():
-                    if completed_bar is not None:
-                        self._stats["bars_aggregated"] += 1
+            for data_type, completed_bar in completed_bars.items():
+                if completed_bar is not None:
+                    self._stats["bars_aggregated"] += 1
 
-                        # Buffer aggregated bar
-                        if data_type == DataType.BAR_1MIN:
-                            buffer.bars_1min.append(completed_bar)
-                        elif data_type == DataType.BAR_5MIN:
-                            buffer.bars_5min.append(completed_bar)
-                        elif data_type == DataType.BAR_15MIN:
-                            buffer.bars_15min.append(completed_bar)
-                        elif data_type == DataType.BAR_1HOUR:
-                            buffer.bars_1hour.append(completed_bar)
+                    # Buffer aggregated bar
+                    if data_type == DataType.BAR_1MIN:
+                        buffer.bars_1min.append(completed_bar)
+                    elif data_type == DataType.BAR_5MIN:
+                        buffer.bars_5min.append(completed_bar)
+                    elif data_type == DataType.BAR_15MIN:
+                        buffer.bars_15min.append(completed_bar)
+                    elif data_type == DataType.BAR_1HOUR:
+                        buffer.bars_1hour.append(completed_bar)
 
-                        # Route aggregated bar
-                        self._route_bar(symbol, completed_bar, data_type)
+                    # Route aggregated bar
+                    self._route_bar(symbol, completed_bar, data_type)
 
         # Call original callback if set
         if hasattr(self, '_original_on_bar') and self._original_on_bar:
@@ -754,10 +742,9 @@ class DataFeed:
 
     def _route_bar(self, symbol: str, bar: Bar, data_type: DataType):
         """Route a bar to the callback if subscribed"""
-        with self._lock:
-            sub = self._subscriptions.get(symbol)
-            if not sub or data_type not in sub.data_types:
-                return
+        sub = self._subscriptions.get(symbol)
+        if not sub or data_type not in sub.data_types:
+            return
 
         if self.on_bar:
             try:
@@ -771,9 +758,8 @@ class DataFeed:
     def _handle_tick_by_tick(self, symbol: str, tbt: "TickByTickData"):
         """Handle incoming tick-by-tick data"""
         # Buffer the event
-        with self._lock:
-            if symbol in self._buffers:
-                self._buffers[symbol].tbt_ticks.append(tbt)
+        if symbol in self._buffers:
+            self._buffers[symbol].tbt_ticks.append(tbt)
 
         # Route to callback
         if self.on_tick_by_tick:
@@ -788,9 +774,8 @@ class DataFeed:
     def _handle_depth(self, symbol: str, depth: "MarketDepth"):
         """Handle incoming market depth (L2) update"""
         # Store latest snapshot
-        with self._lock:
-            if symbol in self._buffers:
-                self._buffers[symbol].depth = depth
+        if symbol in self._buffers:
+            self._buffers[symbol].depth = depth
 
         # Route to callback
         if self.on_depth:
@@ -823,11 +808,10 @@ class DataFeed:
         Returns:
             List of TickData objects (most recent last)
         """
-        with self._lock:
-            if symbol not in self._buffers:
-                return []
+        if symbol not in self._buffers:
+            return []
 
-            ticks = list(self._buffers[symbol].ticks)
+        ticks = list(self._buffers[symbol].ticks)
 
         if since:
             ticks = [t for t in ticks if t.timestamp >= since]
@@ -856,24 +840,23 @@ class DataFeed:
         Returns:
             List of Bar objects (most recent last)
         """
-        with self._lock:
-            if symbol not in self._buffers:
-                return []
+        if symbol not in self._buffers:
+            return []
 
-            buffer = self._buffers[symbol]
+        buffer = self._buffers[symbol]
 
-            if data_type == DataType.BAR_5SEC:
-                bars = list(buffer.bars_5sec)
-            elif data_type == DataType.BAR_1MIN:
-                bars = list(buffer.bars_1min)
-            elif data_type == DataType.BAR_5MIN:
-                bars = list(buffer.bars_5min)
-            elif data_type == DataType.BAR_15MIN:
-                bars = list(buffer.bars_15min)
-            elif data_type == DataType.BAR_1HOUR:
-                bars = list(buffer.bars_1hour)
-            else:
-                return []
+        if data_type == DataType.BAR_5SEC:
+            bars = list(buffer.bars_5sec)
+        elif data_type == DataType.BAR_1MIN:
+            bars = list(buffer.bars_1min)
+        elif data_type == DataType.BAR_5MIN:
+            bars = list(buffer.bars_5min)
+        elif data_type == DataType.BAR_15MIN:
+            bars = list(buffer.bars_15min)
+        elif data_type == DataType.BAR_1HOUR:
+            bars = list(buffer.bars_1hour)
+        else:
+            return []
 
         if since:
             bars = [
@@ -888,11 +871,10 @@ class DataFeed:
 
     def get_last_tick(self, symbol: str) -> Optional[TickData]:
         """Get the most recent tick for a symbol"""
-        with self._lock:
-            if symbol not in self._buffers:
-                return None
-            ticks = self._buffers[symbol].ticks
-            return ticks[-1] if ticks else None
+        if symbol not in self._buffers:
+            return None
+        ticks = self._buffers[symbol].ticks
+        return ticks[-1] if ticks else None
 
     def get_last_bar(
         self,
@@ -932,10 +914,9 @@ class DataFeed:
         Returns:
             List of TickByTickData objects (most recent last)
         """
-        with self._lock:
-            if symbol not in self._buffers:
-                return []
-            tbt_ticks = list(self._buffers[symbol].tbt_ticks)
+        if symbol not in self._buffers:
+            return []
+        tbt_ticks = list(self._buffers[symbol].tbt_ticks)
 
         if since:
             tbt_ticks = [t for t in tbt_ticks if t.timestamp >= since]
@@ -955,10 +936,9 @@ class DataFeed:
         Returns:
             MarketDepth snapshot or None if not available
         """
-        with self._lock:
-            if symbol not in self._buffers:
-                return None
-            return self._buffers[symbol].depth
+        if symbol not in self._buffers:
+            return None
+        return self._buffers[symbol].depth
 
     def clear_buffers(self, symbol: Optional[str] = None):
         """
@@ -967,15 +947,14 @@ class DataFeed:
         Args:
             symbol: Symbol to clear (None = clear all)
         """
-        with self._lock:
-            if symbol:
-                if symbol in self._buffers:
-                    self._buffers[symbol] = DataBuffer()
-                    self._aggregators[symbol] = BarAggregator(symbol)
-            else:
-                for sym in self._buffers:
-                    self._buffers[sym] = DataBuffer()
-                    self._aggregators[sym] = BarAggregator(sym)
+        if symbol:
+            if symbol in self._buffers:
+                self._buffers[symbol] = DataBuffer()
+                self._aggregators[symbol] = BarAggregator(symbol)
+        else:
+            for sym in self._buffers:
+                self._buffers[sym] = DataBuffer()
+                self._aggregators[sym] = BarAggregator(sym)
 
         logger.info(f"Cleared buffers for {symbol or 'all symbols'}")
 
@@ -1003,22 +982,21 @@ class DataFeed:
         Returns:
             Dictionary with status information
         """
-        with self._lock:
-            subs_status = {
-                symbol: {
-                    "active": sub.active,
-                    "data_types": [d.value for d in sub.data_types],
-                    "buffer_sizes": {
-                        "ticks": len(self._buffers[symbol].ticks)
-                            if symbol in self._buffers else 0,
-                        "bars_5sec": len(self._buffers[symbol].bars_5sec)
-                            if symbol in self._buffers else 0,
-                        "bars_1min": len(self._buffers[symbol].bars_1min)
-                            if symbol in self._buffers else 0,
-                    }
+        subs_status = {
+            symbol: {
+                "active": sub.active,
+                "data_types": [d.value for d in sub.data_types],
+                "buffer_sizes": {
+                    "ticks": len(self._buffers[symbol].ticks)
+                        if symbol in self._buffers else 0,
+                    "bars_5sec": len(self._buffers[symbol].bars_5sec)
+                        if symbol in self._buffers else 0,
+                    "bars_1min": len(self._buffers[symbol].bars_1min)
+                        if symbol in self._buffers else 0,
                 }
-                for symbol, sub in self._subscriptions.items()
             }
+            for symbol, sub in self._subscriptions.items()
+        }
 
         return {
             "running": self._running,

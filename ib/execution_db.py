@@ -5,6 +5,7 @@ Stores execution details and commission reports from IB for historical tracking,
 P&L analysis, and cost basis calculation.
 """
 
+import asyncio
 import sqlite3
 import logging
 from datetime import datetime
@@ -157,6 +158,14 @@ class ExecutionDatabase:
 
             conn.commit()
             logger.debug(f"Initialized execution database at {self.db_path}")
+
+    async def insert_execution_async(self, execution: ExecutionRecord) -> bool:
+        """Async wrapper — run sync insert in a thread pool."""
+        return await asyncio.to_thread(self.insert_execution, execution)
+
+    async def insert_commission_async(self, commission: CommissionRecord) -> bool:
+        """Async wrapper — run sync insert in a thread pool."""
+        return await asyncio.to_thread(self.insert_commission, commission)
 
     def insert_execution(self, execution: ExecutionRecord) -> bool:
         """

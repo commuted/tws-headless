@@ -11,15 +11,15 @@ Provides:
 - MessageBus integration for indicator feeds
 """
 
+import asyncio
 import logging
 from decimal import Decimal
-from threading import Thread, Event, Lock, RLock
 from typing import Optional, Callable, Dict, List, Set, Any, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import OrderedDict
-from queue import Queue, Empty
+from queue import Empty
 from pathlib import Path
 import time
 import traceback
@@ -30,7 +30,7 @@ from ibapi.order import Order
 from plugins.base import PluginBase, PluginResult, TradeSignal, PluginState
 from plugins.unassigned import UnassignedPlugin, UNASSIGNED_PLUGIN_NAME
 from .data_feed import DataFeed, DataType, TickData, TickByTickData, MarketDepth
-from .models import Bar
+from .models import Bar, PnLData
 from .message_bus import MessageBus
 from .order_reconciler import OrderReconciler, ReconciledOrder, ReconciliationMode
 from .rate_limiter import OrderRateLimiter
@@ -61,7 +61,6 @@ class StreamManager:
 
     def __init__(self, data_feed: Optional[DataFeed] = None):
         self._data_feed = data_feed
-        self._lock = Lock()
         # plugin_name -> {symbol -> PluginStreamCallbacks}
         self._plugin_streams: Dict[str, Dict[str, PluginStreamCallbacks]] = {}
 
@@ -121,15 +120,14 @@ class StreamManager:
         if data_types is None:
             data_types = {DataType.TICK, DataType.BAR_5SEC}
 
-        with self._lock:
-            if plugin_name not in self._plugin_streams:
-                self._plugin_streams[plugin_name] = {}
-            self._plugin_streams[plugin_name][symbol] = PluginStreamCallbacks(
-                on_tick=on_tick,
-                on_bar=on_bar,
-                on_tick_by_tick=on_tick_by_tick,
-                on_depth=on_depth,
-            )
+        if plugin_name not in self._plugin_streams:
+            self._plugin_streams[plugin_name] = {}
+        self._plugin_streams[plugin_name][symbol] = PluginStreamCallbacks(
+            on_tick=on_tick,
+            on_bar=on_bar,
+            on_tick_by_tick=on_tick_by_tick,
+            on_depth=on_depth,
+        )
 
         success = self._data_feed.subscribe(
             symbol, contract, data_types,
@@ -158,11 +156,10 @@ class StreamManager:
         Returns:
             True if cancelled successfully
         """
-        with self._lock:
-            if plugin_name in self._plugin_streams:
-                self._plugin_streams[plugin_name].pop(symbol, None)
-                if not self._plugin_streams[plugin_name]:
-                    del self._plugin_streams[plugin_name]
+        if plugin_name in self._plugin_streams:
+            self._plugin_streams[plugin_name].pop(symbol, None)
+            if not self._plugin_streams[plugin_name]:
+                del self._plugin_streams[plugin_name]
 
         if self._data_feed:
             self._data_feed.unsubscribe(symbol, subscriber=plugin_name)
@@ -171,11 +168,10 @@ class StreamManager:
 
     def plugins_for_symbol(self, symbol: str) -> List[str]:
         """Return plugin names currently subscribed to the given symbol."""
-        with self._lock:
-            return [
-                name for name, streams in self._plugin_streams.items()
-                if symbol in streams
-            ]
+        return [
+            name for name, streams in self._plugin_streams.items()
+            if symbol in streams
+        ]
 
     def cancel_all_streams(self, plugin_name: str):
         """
@@ -186,14 +182,12 @@ class StreamManager:
         Args:
             plugin_name: Name of the plugin
         """
-        with self._lock:
-            symbols = list(self._plugin_streams.get(plugin_name, {}).keys())
+        symbols = list(self._plugin_streams.get(plugin_name, {}).keys())
 
         for symbol in symbols:
             self.cancel_stream(plugin_name, symbol)
 
-        with self._lock:
-            self._plugin_streams.pop(plugin_name, None)
+        self._plugin_streams.pop(plugin_name, None)
 
         if symbols:
             logger.info(
@@ -211,13 +205,12 @@ class StreamManager:
                 logger.error(f"Error in chained tick callback: {e}")
 
         # Route to plugin callbacks
-        with self._lock:
-            callbacks = [
-                cb.on_tick
-                for streams in self._plugin_streams.values()
-                if symbol in streams and streams[symbol].on_tick
-                for cb in [streams[symbol]]
-            ]
+        callbacks = [
+            cb.on_tick
+            for streams in self._plugin_streams.values()
+            if symbol in streams and streams[symbol].on_tick
+            for cb in [streams[symbol]]
+        ]
 
         for callback in callbacks:
             try:
@@ -235,13 +228,12 @@ class StreamManager:
                 logger.error(f"Error in chained bar callback: {e}")
 
         # Route to plugin callbacks
-        with self._lock:
-            callbacks = [
-                cb.on_bar
-                for streams in self._plugin_streams.values()
-                if symbol in streams and streams[symbol].on_bar
-                for cb in [streams[symbol]]
-            ]
+        callbacks = [
+            cb.on_bar
+            for streams in self._plugin_streams.values()
+            if symbol in streams and streams[symbol].on_bar
+            for cb in [streams[symbol]]
+        ]
 
         for callback in callbacks:
             try:
@@ -257,13 +249,12 @@ class StreamManager:
             except Exception as e:
                 logger.error(f"Error in chained tick_by_tick callback: {e}")
 
-        with self._lock:
-            callbacks = [
-                cb.on_tick_by_tick
-                for streams in self._plugin_streams.values()
-                if symbol in streams and streams[symbol].on_tick_by_tick
-                for cb in [streams[symbol]]
-            ]
+        callbacks = [
+            cb.on_tick_by_tick
+            for streams in self._plugin_streams.values()
+            if symbol in streams and streams[symbol].on_tick_by_tick
+            for cb in [streams[symbol]]
+        ]
 
         for callback in callbacks:
             try:
@@ -279,13 +270,12 @@ class StreamManager:
             except Exception as e:
                 logger.error(f"Error in chained depth callback: {e}")
 
-        with self._lock:
-            callbacks = [
-                cb.on_depth
-                for streams in self._plugin_streams.values()
-                if symbol in streams and streams[symbol].on_depth
-                for cb in [streams[symbol]]
-            ]
+        callbacks = [
+            cb.on_depth
+            for streams in self._plugin_streams.values()
+            if symbol in streams and streams[symbol].on_depth
+            for cb in [streams[symbol]]
+        ]
 
         for callback in callbacks:
             try:
@@ -300,30 +290,28 @@ class StreamManager:
         Returns:
             Dict with per-plugin stream info and summary
         """
-        with self._lock:
-            plugin_streams = {}
-            total_streams = 0
-            for plugin_name, streams in self._plugin_streams.items():
-                symbols = list(streams.keys())
-                plugin_streams[plugin_name] = {
-                    "symbols": symbols,
-                    "stream_count": len(symbols),
-                    "has_tick_callbacks": [
-                        s for s in symbols if streams[s].on_tick is not None
-                    ],
-                    "has_bar_callbacks": [
-                        s for s in symbols if streams[s].on_bar is not None
-                    ],
-                }
-                total_streams += len(symbols)
+        plugin_streams = {}
+        total_streams = 0
+        for plugin_name, streams in self._plugin_streams.items():
+            symbols = list(streams.keys())
+            plugin_streams[plugin_name] = {
+                "symbols": symbols,
+                "stream_count": len(symbols),
+                "has_tick_callbacks": [
+                    s for s in symbols if streams[s].on_tick is not None
+                ],
+                "has_bar_callbacks": [
+                    s for s in symbols if streams[s].on_bar is not None
+                ],
+            }
+            total_streams += len(symbols)
 
         # Include DataFeed subscription info
         feed_subs = {}
         if self._data_feed:
             for symbol in self._data_feed.subscriptions:
-                with self._data_feed._lock:
-                    sub = self._data_feed._subscriptions.get(symbol)
-                    if sub:
+                sub = self._data_feed._subscriptions.get(symbol)
+                if sub:
                         feed_subs[symbol] = {
                             "active": sub.active,
                             "subscriber_count": len(sub.subscribers),
@@ -629,24 +617,22 @@ class PluginExecutive:
         # State
         self._running = False
         self._paused = False
-        self._shutdown_event = Event()
-        self._lock = RLock()
+        self._shutdown_event = asyncio.Event()
 
         # Registered plugins
         self._plugins: Dict[str, PluginConfig] = {}
 
         # Order execution
-        self._order_queue: Queue = Queue()
+        self._order_queue: asyncio.Queue = asyncio.Queue()
         self._pending_orders: Dict[int, PendingOrder] = {}
         self._execution_history: List[ExecutionResult] = []
         self._max_history = 1000
 
-        # Threads
-        self._runner_thread: Optional[Thread] = None
-        self._executor_thread: Optional[Thread] = None
-        self._health_thread: Optional[Thread] = None
+        # Tasks (replaces Threads)
+        self._executor_task: Optional[asyncio.Task] = None
+        self._health_task: Optional[asyncio.Task] = None
 
-        # Thread restart tracking
+        # Task restart tracking
         self._executor_restart_count = 0
         self._max_executor_restarts = 10
 
@@ -673,6 +659,9 @@ class PluginExecutive:
         if portfolio and hasattr(portfolio, "_callbacks"):
             portfolio._callbacks["orderStatus"] = self._handle_order_status_for_plugins
             portfolio._callbacks["error"] = self._handle_ib_error_for_plugins
+            portfolio._callbacks["execDetails"] = self._handle_exec_details_for_commission
+        if portfolio and hasattr(portfolio, "_on_pnl"):
+            portfolio._on_pnl = self._dispatch_pnl
 
         # Statistics
         self._stats = {
@@ -715,8 +704,7 @@ class PluginExecutive:
     @property
     def plugins(self) -> List[str]:
         """Get list of registered plugin instance IDs"""
-        with self._lock:
-            return list(self._plugins.keys())
+        return list(self._plugins.keys())
 
     @property
     def stats(self) -> Dict[str, Any]:
@@ -750,11 +738,10 @@ class PluginExecutive:
     @property
     def unassigned_plugin(self) -> Optional[UnassignedPlugin]:
         """Get the system unassigned plugin"""
-        with self._lock:
-            _, config = self._resolve_plugin(UNASSIGNED_PLUGIN_NAME)
-            if config:
-                return config.plugin
-            return None
+        _, config = self._resolve_plugin(UNASSIGNED_PLUGIN_NAME)
+        if config:
+            return config.plugin
+        return None
 
     @property
     def account_cash(self) -> float:
@@ -819,20 +806,19 @@ class PluginExecutive:
         """Get all symbols with actual positions held by non-system plugins"""
         claimed = set()
 
-        with self._lock:
-            for name, config in self._plugins.items():
-                plugin = config.plugin
+        for name, config in self._plugins.items():
+            plugin = config.plugin
 
-                # Skip system plugins
-                if plugin.is_system_plugin:
-                    continue
+            # Skip system plugins
+            if plugin.is_system_plugin:
+                continue
 
-                # Only claim symbols the plugin actually holds positions in
-                # (not just instruments it can trade)
-                if plugin.holdings:
-                    for pos in plugin.holdings.current_positions:
-                        if pos.quantity != 0:  # Only non-zero positions
-                            claimed.add(pos.symbol.upper())
+            # Only claim symbols the plugin actually holds positions in
+            # (not just instruments it can trade)
+            if plugin.holdings:
+                for pos in plugin.holdings.current_positions:
+                    if pos.quantity != 0:  # Only non-zero positions
+                        claimed.add(pos.symbol.upper())
 
         return claimed
 
@@ -840,17 +826,16 @@ class PluginExecutive:
         """Get total cash claimed by non-system plugins"""
         total = 0.0
 
-        with self._lock:
-            for name, config in self._plugins.items():
-                plugin = config.plugin
+        for name, config in self._plugins.items():
+            plugin = config.plugin
 
-                # Skip system plugins
-                if plugin.is_system_plugin:
-                    continue
+            # Skip system plugins
+            if plugin.is_system_plugin:
+                continue
 
-                # Add cash from plugin holdings
-                if plugin.holdings:
-                    total += plugin.holdings.current_cash
+            # Add cash from plugin holdings
+            if plugin.holdings:
+                total += plugin.holdings.current_cash
 
         return total
 
@@ -897,19 +882,18 @@ class PluginExecutive:
         plugin_claims: Dict[str, float] = {}  # symbol -> total claimed qty
         plugin_claimants: Dict[str, List[Tuple[str, Any, float]]] = {}  # symbol -> [(name, plugin, qty)]
 
-        with self._lock:
-            for iid, config in self._plugins.items():
-                plugin = config.plugin
-                if plugin.is_system_plugin:
-                    continue
-                holdings = plugin.get_effective_holdings()
-                for pos in holdings.get("positions", []):
-                    sym = pos["symbol"]
-                    qty = pos["quantity"]
-                    plugin_claims[sym] = plugin_claims.get(sym, 0) + qty
-                    if sym not in plugin_claimants:
-                        plugin_claimants[sym] = []
-                    plugin_claimants[sym].append((plugin.name, plugin, qty))
+        for iid, config in self._plugins.items():
+            plugin = config.plugin
+            if plugin.is_system_plugin:
+                continue
+            holdings = plugin.get_effective_holdings()
+            for pos in holdings.get("positions", []):
+                sym = pos["symbol"]
+                qty = pos["quantity"]
+                plugin_claims[sym] = plugin_claims.get(sym, 0) + qty
+                if sym not in plugin_claimants:
+                    plugin_claimants[sym] = []
+                plugin_claimants[sym].append((plugin.name, plugin, qty))
 
         # Count positions
         plugin_position_count = len(plugin_claims)
@@ -1036,13 +1020,12 @@ class PluginExecutive:
         account_cash = account_summary.available_funds if account_summary and account_summary.is_valid else 0.0
 
         total_claimed_cash = 0.0
-        with self._lock:
-            for name, config in self._plugins.items():
-                plugin = config.plugin
-                if plugin.is_system_plugin:
-                    continue
-                if plugin.holdings:
-                    total_claimed_cash += plugin.holdings.current_cash
+        for name, config in self._plugins.items():
+            plugin = config.plugin
+            if plugin.is_system_plugin:
+                continue
+            if plugin.holdings:
+                total_claimed_cash += plugin.holdings.current_cash
 
         expected_unassigned_cash = account_cash - total_claimed_cash
         actual_unassigned_cash = unassigned.holdings.current_cash if unassigned else 0.0
@@ -1195,25 +1178,24 @@ class PluginExecutive:
             if account and account.is_valid:
                 summary["account"]["total_cash"] = account.available_funds or 0.0
 
-        with self._lock:
-            for iid, config in self._plugins.items():
-                plugin = config.plugin
-                holdings = plugin.get_effective_holdings()
+        for iid, config in self._plugins.items():
+            plugin = config.plugin
+            holdings = plugin.get_effective_holdings()
 
-                plugin_summary = {
-                    "is_system_plugin": plugin.is_system_plugin,
-                    "state": plugin.state.value,
-                    "cash": holdings.get("cash", 0.0),
-                    "positions": holdings.get("positions", []),
-                    "total_value": holdings.get("total_value", 0.0),
-                }
+            plugin_summary = {
+                "is_system_plugin": plugin.is_system_plugin,
+                "state": plugin.state.value,
+                "cash": holdings.get("cash", 0.0),
+                "positions": holdings.get("positions", []),
+                "total_value": holdings.get("total_value", 0.0),
+            }
 
-                # Check specifically for _unassigned plugin (not just any system plugin)
-                if plugin.name == UNASSIGNED_PLUGIN_NAME:
-                    summary["unassigned"] = plugin_summary
-                elif not plugin.is_system_plugin:
-                    # Only include non-system plugins in the plugins dict
-                    summary["plugins"][plugin.name] = plugin_summary
+            # Check specifically for _unassigned plugin (not just any system plugin)
+            if plugin.name == UNASSIGNED_PLUGIN_NAME:
+                summary["unassigned"] = plugin_summary
+            elif not plugin.is_system_plugin:
+                # Only include non-system plugins in the plugins dict
+                summary["plugins"][plugin.name] = plugin_summary
 
         return summary
 
@@ -1241,42 +1223,41 @@ class PluginExecutive:
         if amount <= 0:
             return False, "Transfer amount must be positive"
 
-        with self._lock:
-            # Get source plugin
-            _, from_config = self._resolve_plugin(from_plugin)
-            if not from_config:
-                return False, f"Source plugin '{from_plugin}' not found"
+        # Get source plugin
+        _, from_config = self._resolve_plugin(from_plugin)
+        if not from_config:
+            return False, f"Source plugin '{from_plugin}' not found"
 
-            # Get destination plugin
-            _, to_config = self._resolve_plugin(to_plugin)
-            if not to_config:
-                return False, f"Destination plugin '{to_plugin}' not found"
+        # Get destination plugin
+        _, to_config = self._resolve_plugin(to_plugin)
+        if not to_config:
+            return False, f"Destination plugin '{to_plugin}' not found"
 
-            from_plugin_obj = from_config.plugin
-            to_plugin_obj = to_config.plugin
+        from_plugin_obj = from_config.plugin
+        to_plugin_obj = to_config.plugin
 
-            # Check source has sufficient cash
-            source_cash = from_plugin_obj.get_effective_cash()
-            if source_cash < amount:
-                return False, f"Insufficient cash in '{from_plugin}': ${source_cash:,.2f} < ${amount:,.2f}"
+        # Check source has sufficient cash
+        source_cash = from_plugin_obj.get_effective_cash()
+        if source_cash < amount:
+            return False, f"Insufficient cash in '{from_plugin}': ${source_cash:,.2f} < ${amount:,.2f}"
 
-            # Perform transfer
-            # For plugins with Holdings object
-            if from_plugin_obj.holdings:
-                from_plugin_obj.holdings.add_cash(-amount)
-                from_plugin_obj.save_holdings()
-            elif hasattr(from_plugin_obj, '_cash_balance'):
-                # For UnassignedPlugin
-                from_plugin_obj._cash_balance -= amount
+        # Perform transfer
+        # For plugins with Holdings object
+        if from_plugin_obj.holdings:
+            from_plugin_obj.holdings.add_cash(-amount)
+            from_plugin_obj.save_holdings()
+        elif hasattr(from_plugin_obj, '_cash_balance'):
+            # For UnassignedPlugin
+            from_plugin_obj._cash_balance -= amount
 
-            if to_plugin_obj.holdings:
-                to_plugin_obj.holdings.add_cash(amount)
-                to_plugin_obj.save_holdings()
-            elif hasattr(to_plugin_obj, '_cash_balance'):
-                to_plugin_obj._cash_balance += amount
+        if to_plugin_obj.holdings:
+            to_plugin_obj.holdings.add_cash(amount)
+            to_plugin_obj.save_holdings()
+        elif hasattr(to_plugin_obj, '_cash_balance'):
+            to_plugin_obj._cash_balance += amount
 
-            logger.info(f"Transferred ${amount:,.2f} cash: {from_plugin} -> {to_plugin}")
-            return True, f"Transferred ${amount:,.2f} from '{from_plugin}' to '{to_plugin}'"
+        logger.info(f"Transferred ${amount:,.2f} cash: {from_plugin} -> {to_plugin}")
+        return True, f"Transferred ${amount:,.2f} from '{from_plugin}' to '{to_plugin}'"
 
     def transfer_position(
         self,
@@ -1304,76 +1285,75 @@ class PluginExecutive:
 
         symbol = symbol.upper()
 
-        with self._lock:
-            # Get source plugin
-            _, from_config = self._resolve_plugin(from_plugin)
-            if not from_config:
-                return False, f"Source plugin '{from_plugin}' not found"
+        # Get source plugin
+        _, from_config = self._resolve_plugin(from_plugin)
+        if not from_config:
+            return False, f"Source plugin '{from_plugin}' not found"
 
-            # Get destination plugin
-            _, to_config = self._resolve_plugin(to_plugin)
-            if not to_config:
-                return False, f"Destination plugin '{to_plugin}' not found"
+        # Get destination plugin
+        _, to_config = self._resolve_plugin(to_plugin)
+        if not to_config:
+            return False, f"Destination plugin '{to_plugin}' not found"
 
-            from_plugin_obj = from_config.plugin
-            to_plugin_obj = to_config.plugin
+        from_plugin_obj = from_config.plugin
+        to_plugin_obj = to_config.plugin
 
-            # Get current price from portfolio if not provided
-            if price is None and self.portfolio:
-                pos = self.portfolio.get_position(symbol)
-                if pos:
-                    price = pos.current_price
-                else:
-                    price = 0.0
+        # Get current price from portfolio if not provided
+        if price is None and self.portfolio:
+            pos = self.portfolio.get_position(symbol)
+            if pos:
+                price = pos.current_price
+            else:
+                price = 0.0
 
-            # Check source has sufficient quantity
-            source_qty, _ = from_plugin_obj.get_effective_position(symbol)
-            if source_qty < quantity:
-                return False, f"Insufficient {symbol} in '{from_plugin}': {source_qty:.2f} < {quantity:.2f}"
+        # Check source has sufficient quantity
+        source_qty, _ = from_plugin_obj.get_effective_position(symbol)
+        if source_qty < quantity:
+            return False, f"Insufficient {symbol} in '{from_plugin}': {source_qty:.2f} < {quantity:.2f}"
 
-            # Get cost basis from source
-            cost_basis = 0.0
-            if from_plugin_obj.holdings:
-                pos = from_plugin_obj.holdings.get_position(symbol)
-                if pos:
-                    cost_basis = pos.cost_basis
-            elif hasattr(from_plugin_obj, '_holdings') and from_plugin_obj._holdings:
-                # For UnassignedPlugin with _holdings list
-                for hp in from_plugin_obj._holdings.current_positions:
-                    if hp.symbol == symbol:
-                        cost_basis = hp.cost_basis
-                        break
+        # Get cost basis from source
+        cost_basis = 0.0
+        if from_plugin_obj.holdings:
+            pos = from_plugin_obj.holdings.get_position(symbol)
+            if pos:
+                cost_basis = pos.cost_basis
+        elif hasattr(from_plugin_obj, '_holdings') and from_plugin_obj._holdings:
+            # For UnassignedPlugin with _holdings list
+            for hp in from_plugin_obj._holdings.current_positions:
+                if hp.symbol == symbol:
+                    cost_basis = hp.cost_basis
+                    break
 
-            # Perform transfer - remove from source
-            if from_plugin_obj.holdings:
-                if not from_plugin_obj.holdings.remove_position(symbol, quantity):
-                    return False, f"Failed to remove {quantity} {symbol} from '{from_plugin}'"
-                from_plugin_obj.save_holdings()
-            elif hasattr(from_plugin_obj, '_holdings') and from_plugin_obj._holdings:
-                # UnassignedPlugin uses _holdings directly
-                if not from_plugin_obj._holdings.remove_position(symbol, quantity):
-                    return False, f"Failed to remove {quantity} {symbol} from '{from_plugin}'"
+        # Perform transfer - remove from source
+        if from_plugin_obj.holdings:
+            if not from_plugin_obj.holdings.remove_position(symbol, quantity):
+                return False, f"Failed to remove {quantity} {symbol} from '{from_plugin}'"
+            from_plugin_obj.save_holdings()
+        elif hasattr(from_plugin_obj, '_holdings') and from_plugin_obj._holdings:
+            # UnassignedPlugin uses _holdings directly
+            if not from_plugin_obj._holdings.remove_position(symbol, quantity):
+                return False, f"Failed to remove {quantity} {symbol} from '{from_plugin}'"
 
-            # Add to destination
-            if to_plugin_obj.holdings:
-                to_plugin_obj.holdings.add_position(
-                    symbol=symbol,
-                    quantity=quantity,
-                    cost_basis=cost_basis,
-                    current_price=price or 0.0,
-                )
-                to_plugin_obj.save_holdings()
-            elif hasattr(to_plugin_obj, '_holdings') and to_plugin_obj._holdings:
-                to_plugin_obj._holdings.add_position(
-                    symbol=symbol,
-                    quantity=quantity,
-                    cost_basis=cost_basis,
-                    current_price=price or 0.0,
-                )
+        # Add to destination
+        if to_plugin_obj.holdings:
+            to_plugin_obj.holdings.add_position(
+                symbol=symbol,
+                quantity=quantity,
+                cost_basis=cost_basis,
+                current_price=price or 0.0,
+            )
+            to_plugin_obj.save_holdings()
+        elif hasattr(to_plugin_obj, '_holdings') and to_plugin_obj._holdings:
+            to_plugin_obj._holdings.add_position(
+                symbol=symbol,
+                quantity=quantity,
+                cost_basis=cost_basis,
+                current_price=price or 0.0,
+            )
 
-            value = quantity * (price or 0.0)
-            logger.info(f"Transferred {quantity} {symbol} (${value:,.2f}): {from_plugin} -> {to_plugin}")
-            return True, f"Transferred {quantity:.2f} {symbol} from '{from_plugin}' to '{to_plugin}'"
+        value = quantity * (price or 0.0)
+        logger.info(f"Transferred {quantity} {symbol} (${value:,.2f}): {from_plugin} -> {to_plugin}")
+        return True, f"Transferred {quantity:.2f} {symbol} from '{from_plugin}' to '{to_plugin}'"
 
     def get_transferable_positions(self, plugin_name: str) -> List[Dict[str, Any]]:
         """
@@ -1381,33 +1361,31 @@ class PluginExecutive:
 
         Returns list of dicts with symbol, quantity, value.
         """
-        with self._lock:
-            _, config = self._resolve_plugin(plugin_name)
-            if not config:
-                return []
+        _, config = self._resolve_plugin(plugin_name)
+        if not config:
+            return []
 
-            plugin = config.plugin
-            holdings = plugin.get_effective_holdings()
-            positions = holdings.get("positions", [])
+        plugin = config.plugin
+        holdings = plugin.get_effective_holdings()
+        positions = holdings.get("positions", [])
 
-            return [
-                {
-                    "symbol": p.get("symbol", p.get("symbol")),
-                    "quantity": p.get("quantity", 0),
-                    "value": p.get("market_value", p.get("quantity", 0) * p.get("current_price", 0)),
-                }
-                for p in positions
-                if p.get("quantity", 0) > 0
-            ]
+        return [
+            {
+                "symbol": p.get("symbol", p.get("symbol")),
+                "quantity": p.get("quantity", 0),
+                "value": p.get("market_value", p.get("quantity", 0) * p.get("current_price", 0)),
+            }
+            for p in positions
+            if p.get("quantity", 0) > 0
+        ]
 
     def get_transferable_cash(self, plugin_name: str) -> float:
         """Get available cash that can be transferred from a plugin."""
-        with self._lock:
-            _, config = self._resolve_plugin(plugin_name)
-            if not config:
-                return 0.0
+        _, config = self._resolve_plugin(plugin_name)
+        if not config:
+            return 0.0
 
-            return config.plugin.get_effective_cash()
+        return config.plugin.get_effective_cash()
 
     # =========================================================================
     # Account Reconciliation
@@ -1459,26 +1437,25 @@ class PluginExecutive:
         plugin_positions = {}  # symbol -> {plugin_name, quantity, ...}
         all_plugin_positions = {}  # symbol -> total quantity across all plugins
 
-        with self._lock:
-            for iid, config in self._plugins.items():
-                plugin = config.plugin
-                if plugin.is_system_plugin:
-                    continue
+        for iid, config in self._plugins.items():
+            plugin = config.plugin
+            if plugin.is_system_plugin:
+                continue
 
-                holdings = plugin.get_effective_holdings()
-                for pos in holdings.get("positions", []):
-                    symbol = pos.get("symbol")
-                    qty = pos.get("quantity", 0)
-                    if symbol and qty > 0:
-                        if symbol not in plugin_positions:
-                            plugin_positions[symbol] = []
-                        plugin_positions[symbol].append({
-                            "plugin": plugin.name,
-                            "quantity": qty,
-                            "cost_basis": pos.get("cost_basis", 0),
-                            "current_price": pos.get("current_price", 0),
-                        })
-                        all_plugin_positions[symbol] = all_plugin_positions.get(symbol, 0) + qty
+            holdings = plugin.get_effective_holdings()
+            for pos in holdings.get("positions", []):
+                symbol = pos.get("symbol")
+                qty = pos.get("quantity", 0)
+                if symbol and qty > 0:
+                    if symbol not in plugin_positions:
+                        plugin_positions[symbol] = []
+                    plugin_positions[symbol].append({
+                        "plugin": plugin.name,
+                        "quantity": qty,
+                        "cost_basis": pos.get("cost_basis", 0),
+                        "current_price": pos.get("current_price", 0),
+                    })
+                    all_plugin_positions[symbol] = all_plugin_positions.get(symbol, 0) + qty
 
         report["summary"]["plugin_positions"] = len(all_plugin_positions)
 
@@ -1610,10 +1587,9 @@ class PluginExecutive:
 
             # Calculate total cash claimed by plugins
             total_claimed_cash = 0.0
-            with self._lock:
-                for name, config in self._plugins.items():
-                    if not config.plugin.is_system_plugin:
-                        total_claimed_cash += config.plugin.get_effective_cash()
+            for name, config in self._plugins.items():
+                if not config.plugin.is_system_plugin:
+                    total_claimed_cash += config.plugin.get_effective_cash()
 
             # Unassigned gets the rest
             unassigned_cash = account_cash - total_claimed_cash
@@ -1645,13 +1621,12 @@ class PluginExecutive:
                     report["summary"]["cash_adjustment"] = cash_diff
 
         # Save holdings for all modified plugins
-        with self._lock:
-            for name, config in self._plugins.items():
-                if config.plugin.holdings:
-                    try:
-                        config.plugin.save_holdings()
-                    except Exception as e:
-                        logger.warning(f"Failed to save holdings for {name}: {e}")
+        for name, config in self._plugins.items():
+            if config.plugin.holdings:
+                try:
+                    config.plugin.save_holdings()
+                except Exception as e:
+                    logger.warning(f"Failed to save holdings for {name}: {e}")
 
         # Log summary
         if report["discrepancies"]:
@@ -1795,8 +1770,7 @@ class PluginExecutive:
                 return None
 
             # Track source file
-            with self._lock:
-                self._plugins[plugin.instance_id].source_file = Path(file_path)
+            self._plugins[plugin.instance_id].source_file = Path(file_path)
 
             self._stats["plugins_loaded"] += 1
             logger.info(
@@ -1827,50 +1801,49 @@ class PluginExecutive:
         Returns:
             True if unloaded successfully
         """
-        with self._lock:
-            iid, config = self._resolve_plugin(name)
-            if not config:
-                logger.warning(f"Plugin '{name}' not found")
-                return False
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            logger.warning(f"Plugin '{name}' not found")
+            return False
 
-            # Prevent unloading system plugins
-            if config.plugin.is_system_plugin:
-                logger.warning(f"Cannot unload system plugin '{name}'")
-                return False
+        # Prevent unloading system plugins
+        if config.plugin.is_system_plugin:
+            logger.warning(f"Cannot unload system plugin '{name}'")
+            return False
 
-            plugin_name = config.plugin.name
+        plugin_name = config.plugin.name
 
-            # Stop plugin if running
-            if config.plugin.state in (PluginState.STARTED, PluginState.FROZEN):
-                try:
-                    config.plugin.stop()
-                except Exception as e:
-                    logger.error(f"Error stopping plugin '{plugin_name}': {e}")
-
-            # Clean up any streams the plugin had open
-            self.stream_manager.cancel_all_streams(plugin_name)
-
-            # Unsubscribe from all channels
-            config.plugin.unsubscribe_all()
-
-            # Capture departure status
+        # Stop plugin if running
+        if config.plugin.state in (PluginState.STARTED, PluginState.FROZEN):
             try:
-                departure_msg = config.plugin.on_unload()
+                config.plugin.stop()
             except Exception as e:
-                departure_msg = f"on_unload() failed: {e}"
+                logger.error(f"Error stopping plugin '{plugin_name}': {e}")
 
-            key = f"{plugin_name}:{iid[:8]}"
-            self._departures[key] = DepartureEntry(
-                plugin_name=plugin_name,
-                instance_id=iid,
-                message=departure_msg,
-            )
-            # Evict oldest if over capacity
-            while len(self._departures) > self._max_departures:
-                self._departures.popitem(last=False)
+        # Clean up any streams the plugin had open
+        self.stream_manager.cancel_all_streams(plugin_name)
 
-            # Remove from registry
-            del self._plugins[iid]
+        # Unsubscribe from all channels
+        config.plugin.unsubscribe_all()
+
+        # Capture departure status
+        try:
+            departure_msg = config.plugin.on_unload()
+        except Exception as e:
+            departure_msg = f"on_unload() failed: {e}"
+
+        key = f"{plugin_name}:{iid[:8]}"
+        self._departures[key] = DepartureEntry(
+            plugin_name=plugin_name,
+            instance_id=iid,
+            message=departure_msg,
+        )
+        # Evict oldest if over capacity
+        while len(self._departures) > self._max_departures:
+            self._departures.popitem(last=False)
+
+        # Remove from registry
+        del self._plugins[iid]
 
         self._stats["plugins_unloaded"] += 1
         logger.info(f"Unloaded plugin '{plugin_name}' (instance_id={iid[:8]})")
@@ -1878,23 +1851,21 @@ class PluginExecutive:
 
     def deferred_unload_plugin(self, name: str) -> None:
         """
-        Schedule a plugin unload on a background thread.
+        Schedule a plugin unload as a background asyncio task.
 
         Safe to call from within a plugin's own handle_request() or
-        callback — avoids deadlock since unload_plugin() acquires
-        self._lock and calls plugin.stop().
+        callback — avoids re-entrancy since unload_plugin() calls plugin.stop().
 
         Args:
             name: Plugin name to unload
         """
-        def _do_unload():
+        async def _do_unload():
             try:
                 self.unload_plugin(name)
             except Exception as e:
                 logger.error(f"Deferred unload of plugin '{name}' failed: {e}")
 
-        thread = Thread(target=_do_unload, daemon=True, name=f"Unload-{name}")
-        thread.start()
+        asyncio.create_task(_do_unload())
         logger.info(f"Deferred unload scheduled for plugin '{name}'")
 
     def get_departures(self, clear: bool = False) -> Dict[str, Dict[str, Any]]:
@@ -1907,26 +1878,24 @@ class PluginExecutive:
         Returns:
             Dict keyed by "name:instance_id_short" with departure info
         """
-        with self._lock:
-            result = {
-                key: {
-                    "plugin_name": entry.plugin_name,
-                    "instance_id": entry.instance_id,
-                    "message": entry.message,
-                    "unloaded_at": entry.unloaded_at,
-                }
-                for key, entry in self._departures.items()
+        result = {
+            key: {
+                "plugin_name": entry.plugin_name,
+                "instance_id": entry.instance_id,
+                "message": entry.message,
+                "unloaded_at": entry.unloaded_at,
             }
-            if clear:
-                self._departures.clear()
-            return result
+            for key, entry in self._departures.items()
+        }
+        if clear:
+            self._departures.clear()
+        return result
 
     def clear_departures(self) -> int:
         """Clear all departure entries. Returns count cleared."""
-        with self._lock:
-            count = len(self._departures)
-            self._departures.clear()
-            return count
+        count = len(self._departures)
+        self._departures.clear()
+        return count
 
     # =========================================================================
     # Plugin Registration
@@ -1965,25 +1934,24 @@ class PluginExecutive:
         plugin.set_message_bus(self.message_bus)
         plugin.set_executive(self)
 
-        with self._lock:
-            if plugin.instance_id in self._plugins:
-                logger.warning(f"Plugin instance '{plugin.instance_id}' already registered")
-                return False
+        if plugin.instance_id in self._plugins:
+            logger.warning(f"Plugin instance '{plugin.instance_id}' already registered")
+            return False
 
-            # Create circuit breaker with custom or default settings
-            cb = CircuitBreaker(
-                max_failures=circuit_breaker_failures or self._default_cb_failures,
-                reset_after_seconds=circuit_breaker_reset_seconds or self._default_cb_reset_seconds,
-            )
+        # Create circuit breaker with custom or default settings
+        cb = CircuitBreaker(
+            max_failures=circuit_breaker_failures or self._default_cb_failures,
+            reset_after_seconds=circuit_breaker_reset_seconds or self._default_cb_reset_seconds,
+        )
 
-            config = PluginConfig(
-                plugin=plugin,
-                execution_mode=execution_mode,
-                bar_timeframe=bar_timeframe,
-                enabled=enabled,
-                circuit_breaker=cb,
-            )
-            self._plugins[plugin.instance_id] = config
+        config = PluginConfig(
+            plugin=plugin,
+            execution_mode=execution_mode,
+            bar_timeframe=bar_timeframe,
+            enabled=enabled,
+            circuit_breaker=cb,
+        )
+        self._plugins[plugin.instance_id] = config
 
         logger.info(
             f"Registered plugin '{plugin.name}' "
@@ -2020,19 +1988,18 @@ class PluginExecutive:
         Returns:
             True if started successfully
         """
-        with self._lock:
-            iid, config = self._resolve_plugin(name)
-            if not config:
-                logger.warning(f"Plugin '{name}' not found")
-                return False
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            logger.warning(f"Plugin '{name}' not found")
+            return False
 
-            plugin = config.plugin
+        plugin = config.plugin
 
-            if plugin.state not in (PluginState.LOADED, PluginState.STOPPED):
-                logger.warning(
-                    f"Plugin '{name}' cannot start from state {plugin.state.value}"
-                )
-                return False
+        if plugin.state not in (PluginState.LOADED, PluginState.STOPPED):
+            logger.warning(
+                f"Plugin '{name}' cannot start from state {plugin.state.value}"
+            )
+            return False
 
         try:
             if plugin.start():
@@ -2064,19 +2031,18 @@ class PluginExecutive:
         Returns:
             True if stopped successfully
         """
-        with self._lock:
-            iid, config = self._resolve_plugin(name)
-            if not config:
-                logger.warning(f"Plugin '{name}' not found")
-                return False
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            logger.warning(f"Plugin '{name}' not found")
+            return False
 
-            plugin = config.plugin
+        plugin = config.plugin
 
-            if plugin.state not in (PluginState.STARTED, PluginState.FROZEN):
-                logger.warning(
-                    f"Plugin '{name}' cannot stop from state {plugin.state.value}"
-                )
-                return False
+        if plugin.state not in (PluginState.STARTED, PluginState.FROZEN):
+            logger.warning(
+                f"Plugin '{name}' cannot stop from state {plugin.state.value}"
+            )
+            return False
 
         try:
             if plugin.stop():
@@ -2111,19 +2077,18 @@ class PluginExecutive:
         Returns:
             True if frozen successfully
         """
-        with self._lock:
-            iid, config = self._resolve_plugin(name)
-            if not config:
-                logger.warning(f"Plugin '{name}' not found")
-                return False
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            logger.warning(f"Plugin '{name}' not found")
+            return False
 
-            plugin = config.plugin
+        plugin = config.plugin
 
-            if plugin.state != PluginState.STARTED:
-                logger.warning(
-                    f"Plugin '{name}' cannot freeze from state {plugin.state.value}"
-                )
-                return False
+        if plugin.state != PluginState.STARTED:
+            logger.warning(
+                f"Plugin '{name}' cannot freeze from state {plugin.state.value}"
+            )
+            return False
 
         try:
             if plugin.freeze():
@@ -2155,19 +2120,18 @@ class PluginExecutive:
         Returns:
             True if resumed successfully
         """
-        with self._lock:
-            iid, config = self._resolve_plugin(name)
-            if not config:
-                logger.warning(f"Plugin '{name}' not found")
-                return False
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            logger.warning(f"Plugin '{name}' not found")
+            return False
 
-            plugin = config.plugin
+        plugin = config.plugin
 
-            if plugin.state != PluginState.FROZEN:
-                logger.warning(
-                    f"Plugin '{name}' cannot resume from state {plugin.state.value}"
-                )
-                return False
+        if plugin.state != PluginState.FROZEN:
+            logger.warning(
+                f"Plugin '{name}' cannot resume from state {plugin.state.value}"
+            )
+            return False
 
         try:
             if plugin.resume():
@@ -2208,12 +2172,11 @@ class PluginExecutive:
         Returns:
             Response dictionary with at least "success" key
         """
-        with self._lock:
-            iid, config = self._resolve_plugin(name)
-            if not config:
-                return {"success": False, "message": f"Plugin '{name}' not found"}
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return {"success": False, "message": f"Plugin '{name}' not found"}
 
-            plugin = config.plugin
+        plugin = config.plugin
 
         try:
             response = plugin.handle_request(request_type, payload)
@@ -2244,12 +2207,11 @@ class PluginExecutive:
         Returns:
             True if plugin was found and updated, False if not found
         """
-        with self._lock:
-            iid, config = self._resolve_plugin(name)
-            if config:
-                config.enabled = enabled
-                logger.info(f"Plugin '{name}' {'enabled' if enabled else 'disabled'}")
-                return True
+        iid, config = self._resolve_plugin(name)
+        if config:
+            config.enabled = enabled
+            logger.info(f"Plugin '{name}' {'enabled' if enabled else 'disabled'}")
+            return True
         return False
 
     # =========================================================================
@@ -2273,23 +2235,22 @@ class PluginExecutive:
         Returns:
             True if set successfully
         """
-        with self._lock:
-            iid, config = self._resolve_plugin(name)
-            if not config:
-                logger.warning(f"Plugin '{name}' not found")
-                return False
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            logger.warning(f"Plugin '{name}' not found")
+            return False
 
-            config.parameters[key] = value
+        config.parameters[key] = value
 
-            # Also try to set on the plugin itself
-            try:
-                if hasattr(config.plugin, 'set_parameter'):
-                    config.plugin.set_parameter(key, value)
-            except Exception as e:
-                logger.warning(f"Plugin '{name}' set_parameter failed: {e}")
+        # Also try to set on the plugin itself
+        try:
+            if hasattr(config.plugin, 'set_parameter'):
+                config.plugin.set_parameter(key, value)
+        except Exception as e:
+            logger.warning(f"Plugin '{name}' set_parameter failed: {e}")
 
-            logger.info(f"Plugin '{name}' parameter '{key}' set to '{value}'")
-            return True
+        logger.info(f"Plugin '{name}' parameter '{key}' set to '{value}'")
+        return True
 
     def get_plugin_parameters(self, name: str) -> Optional[Dict[str, Any]]:
         """
@@ -2305,22 +2266,21 @@ class PluginExecutive:
         Returns:
             Dict of parameter key/value pairs, or None if plugin not found
         """
-        with self._lock:
-            iid, config = self._resolve_plugin(name)
-            if not config:
-                return None
-            params = dict(config.parameters)
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return None
+        params = dict(config.parameters)
 
-            try:
-                if hasattr(config.plugin, 'get_parameters'):
-                    algo_params = config.plugin.get_parameters()
-                    if algo_params:
-                        algo_params.update(params)
-                        params = algo_params
-            except Exception as e:
-                logger.warning(f"Plugin '{name}' get_parameters failed: {e}")
+        try:
+            if hasattr(config.plugin, 'get_parameters'):
+                algo_params = config.plugin.get_parameters()
+                if algo_params:
+                    algo_params.update(params)
+                    params = algo_params
+        except Exception as e:
+            logger.warning(f"Plugin '{name}' get_parameters failed: {e}")
 
-            return params
+        return params
 
     # =========================================================================
     # Circuit Breaker Management
@@ -2339,15 +2299,14 @@ class PluginExecutive:
         Returns:
             True if plugin was found and circuit breaker reset, False if not found
         """
-        with self._lock:
-            iid, config = self._resolve_plugin(name)
-            if not config:
-                logger.warning(f"Plugin '{name}' not found")
-                return False
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            logger.warning(f"Plugin '{name}' not found")
+            return False
 
-            config.circuit_breaker.reset()
-            logger.info(f"Circuit breaker reset for plugin '{name}'")
-            return True
+        config.circuit_breaker.reset()
+        logger.info(f"Circuit breaker reset for plugin '{name}'")
+        return True
 
     def get_circuit_breaker_status(self, name: str) -> Optional[Dict[str, Any]]:
         """
@@ -2360,11 +2319,10 @@ class PluginExecutive:
             Dict with keys: state, consecutive_failures, max_failures,
             last_failure_time, reset_after_seconds. None if plugin not found.
         """
-        with self._lock:
-            iid, config = self._resolve_plugin(name)
-            if not config:
-                return None
-            return config.circuit_breaker.to_dict()
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return None
+        return config.circuit_breaker.to_dict()
 
     def get_all_circuit_breakers(self) -> Dict[str, Dict[str, Any]]:
         """
@@ -2374,11 +2332,10 @@ class PluginExecutive:
             Dict mapping plugin name to circuit breaker status dict
             (same structure as get_circuit_breaker_status)
         """
-        with self._lock:
-            return {
-                config.plugin.name: config.circuit_breaker.to_dict()
-                for iid, config in self._plugins.items()
-            }
+        return {
+            config.plugin.name: config.circuit_breaker.to_dict()
+            for iid, config in self._plugins.items()
+        }
 
     # =========================================================================
     # MessageBus / Feed Discovery
@@ -2416,7 +2373,7 @@ class PluginExecutive:
     # Continuous Execution
     # =========================================================================
 
-    def start(self) -> bool:
+    async def start(self) -> bool:
         """
         Start continuous execution.
 
@@ -2441,16 +2398,11 @@ class PluginExecutive:
         # Set up data feed callbacks
         self._setup_data_callbacks()
 
-        # Start executor thread
-        self._start_executor_thread()
+        # Start executor task
+        self._start_executor_task()
 
-        # Start health monitoring thread
-        self._health_thread = Thread(
-            target=self._health_monitor_loop,
-            daemon=True,
-            name="PluginExecutive-Health"
-        )
-        self._health_thread.start()
+        # Start health monitoring task
+        self._health_task = asyncio.create_task(self._health_monitor_loop())
 
         # Initial sync of unassigned holdings
         self.sync_unassigned_holdings()
@@ -2458,16 +2410,11 @@ class PluginExecutive:
         logger.info(f"Plugin executive started with {len(self._plugins)} plugins")
         return True
 
-    def _start_executor_thread(self):
-        """Start or restart the executor thread"""
-        self._executor_thread = Thread(
-            target=self._executor_loop_wrapper,
-            daemon=True,
-            name="PluginExecutive-Executor"
-        )
-        self._executor_thread.start()
+    def _start_executor_task(self):
+        """Start or restart the executor task"""
+        self._executor_task = asyncio.create_task(self._executor_loop_wrapper())
 
-    def stop(self):
+    async def stop(self):
         """Stop continuous execution"""
         if not self._running:
             return
@@ -2479,12 +2426,12 @@ class PluginExecutive:
         # Save state for all running plugins
         self._auto_save_all_states()
 
-        # Wait for threads
-        if self._executor_thread and self._executor_thread.is_alive():
-            self._executor_thread.join(timeout=5.0)
-
-        if self._health_thread and self._health_thread.is_alive():
-            self._health_thread.join(timeout=5.0)
+        # Cancel tasks
+        tasks = [t for t in [self._executor_task, self._health_task] if t and not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         # Process any remaining orders
         self._drain_order_queue()
@@ -2524,11 +2471,10 @@ class PluginExecutive:
         Returns:
             PluginResult or None
         """
-        with self._lock:
-            _, config = self._resolve_plugin(name)
-            if not config:
-                logger.error(f"Plugin '{name}' not found")
-                return None
+        _, config = self._resolve_plugin(name)
+        if not config:
+            logger.error(f"Plugin '{name}' not found")
+            return None
 
         return self._run_plugin(config)
 
@@ -2559,22 +2505,20 @@ class PluginExecutive:
 
     def _on_tick(self, symbol: str, tick: TickData):
         """Handle incoming tick - trigger ON_TICK plugins"""
-        with self._lock:
-            for name, config in self._plugins.items():
-                if (config.enabled and
-                    config.execution_mode == ExecutionMode.ON_TICK and
-                    config.plugin.state == PluginState.STARTED):
-                    self._schedule_run(config)
+        for name, config in self._plugins.items():
+            if (config.enabled and
+                config.execution_mode == ExecutionMode.ON_TICK and
+                config.plugin.state == PluginState.STARTED):
+                self._schedule_run(config)
 
     def _on_bar(self, symbol: str, bar: Bar, data_type: DataType):
         """Handle incoming bar - trigger ON_BAR plugins"""
-        with self._lock:
-            for name, config in self._plugins.items():
-                if (config.enabled and
-                    config.execution_mode == ExecutionMode.ON_BAR and
-                    config.bar_timeframe == data_type and
-                    config.plugin.state == PluginState.STARTED):
-                    self._schedule_run(config)
+        for name, config in self._plugins.items():
+            if (config.enabled and
+                config.execution_mode == ExecutionMode.ON_BAR and
+                config.bar_timeframe == data_type and
+                config.plugin.state == PluginState.STARTED):
+                self._schedule_run(config)
 
     def _schedule_run(self, config: PluginConfig):
         """Schedule a plugin run (respects cooldown and circuit breaker)"""
@@ -2590,9 +2534,9 @@ class PluginExecutive:
             if elapsed < config.cooldown_seconds:
                 return
 
-        # Run in executor thread
+        # Run in executor task
         try:
-            self._order_queue.put(("RUN", config.plugin.name), block=False)
+            self._order_queue.put_nowait(("RUN", config.plugin.name))
         except Exception as e:
             logger.error(f"Failed to schedule plugin run: {e}")
 
@@ -2743,7 +2687,7 @@ class PluginExecutive:
                 self._log_dry_run_reconciled(reconciled)
             else:
                 try:
-                    self._order_queue.put(("RECONCILED", reconciled), block=False)
+                    self._order_queue.put_nowait(("RECONCILED", reconciled))
                 except Exception as e:
                     logger.error(f"Failed to queue reconciled order: {e}")
 
@@ -2777,18 +2721,17 @@ class PluginExecutive:
         symbol: str,
     ) -> Optional[Contract]:
         """Get contract for a symbol from plugin instruments"""
-        with self._lock:
-            _, config = self._resolve_plugin(plugin_name)
-            if not config:
-                return None
+        _, config = self._resolve_plugin(plugin_name)
+        if not config:
+            return None
 
-            instrument = config.plugin.get_instrument(symbol)
-            if instrument:
-                return instrument.to_contract()
+        instrument = config.plugin.get_instrument(symbol)
+        if instrument:
+            return instrument.to_contract()
 
-            pos = self.portfolio.get_position(symbol)
-            if pos and pos.contract:
-                return pos.contract
+        pos = self.portfolio.get_position(symbol)
+        if pos and pos.contract:
+            return pos.contract
 
         return None
 
@@ -2796,60 +2739,65 @@ class PluginExecutive:
     # Executor Thread
     # =========================================================================
 
-    def _executor_loop_wrapper(self):
+    async def _executor_loop_wrapper(self):
         """Wrapper around executor loop that catches fatal exceptions"""
         try:
-            self._executor_loop()
+            await self._executor_loop()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.critical(f"Executor thread crashed: {e}")
+            logger.critical(f"Executor task crashed: {e}")
             logger.critical(traceback.format_exc())
 
-    def _executor_loop(self):
+    async def _executor_loop(self):
         """Background loop for order execution"""
-        logger.debug("Executor thread started")
+        logger.debug("Executor task started")
 
         while not self._shutdown_event.is_set():
             try:
-                item = self._order_queue.get(timeout=0.1)
+                item = await asyncio.wait_for(self._order_queue.get(), timeout=0.1)
 
                 if item[0] == "RUN":
                     plugin_name = item[1]
-                    with self._lock:
-                        _, config = self._resolve_plugin(plugin_name)
+                    _, config = self._resolve_plugin(plugin_name)
                     if config:
                         self._run_plugin(config)
 
                 elif item[0] == "RECONCILED":
                     reconciled = item[1]
-                    if self._acquire_rate_limit_token(timeout=5.0):
+                    if await self._acquire_rate_limit_token(timeout=5.0):
                         self._execute_reconciled_order(reconciled)
                     else:
                         logger.warning(
                             f"Order rate limit exceeded for {reconciled.symbol}, order dropped"
                         )
 
-            except Empty:
+            except asyncio.TimeoutError:
                 continue
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Executor error: {e}")
                 logger.debug(traceback.format_exc())
 
-        logger.debug("Executor thread stopped")
+        logger.debug("Executor task stopped")
 
-    def _acquire_rate_limit_token(self, timeout: float = 5.0) -> bool:
-        """Acquire a rate limit token for order execution"""
+    async def _acquire_rate_limit_token(self, timeout: float = 5.0) -> bool:
+        """Acquire a rate limit token for order execution (async-friendly)"""
         prev_delayed = self._order_rate_limiter._limiter._stats.requests_delayed
 
-        result = self._order_rate_limiter.acquire(blocking=True, timeout=timeout)
-
-        curr_delayed = self._order_rate_limiter._limiter._stats.requests_delayed
-        if curr_delayed > prev_delayed:
-            self._stats["rate_limit_delays"] += 1
-
-        if not result:
-            self._stats["rate_limit_rejects"] += 1
-
-        return result
+        start = time.monotonic()
+        while True:
+            if self._order_rate_limiter.acquire(blocking=False):
+                curr_delayed = self._order_rate_limiter._limiter._stats.requests_delayed
+                if curr_delayed > prev_delayed:
+                    self._stats["rate_limit_delays"] += 1
+                return True
+            elapsed = time.monotonic() - start
+            if elapsed >= timeout:
+                self._stats["rate_limit_rejects"] += 1
+                return False
+            await asyncio.sleep(0.01)  # yield and retry
 
     def _execute_reconciled_order(self, reconciled: ReconciledOrder):
         """Execute a reconciled order"""
@@ -2920,29 +2868,35 @@ class PluginExecutive:
     # Health Monitor
     # =========================================================================
 
-    def _health_monitor_loop(self):
-        """Background loop that monitors thread health"""
-        logger.debug("Health monitor thread started")
+    async def _health_monitor_loop(self):
+        """Background coroutine that monitors task health"""
+        logger.debug("Health monitor task started")
 
         while not self._shutdown_event.is_set():
             try:
-                if self._shutdown_event.wait(self._health_check_interval):
-                    break
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=self._health_check_interval,
+                    )
+                    break  # Shutdown requested
+                except asyncio.TimeoutError:
+                    pass
 
-                # Check executor thread
-                if self._executor_thread and not self._executor_thread.is_alive():
+                # Check executor task
+                if self._executor_task and self._executor_task.done():
                     if self._running and not self._shutdown_event.is_set():
                         if self._executor_restart_count < self._max_executor_restarts:
                             self._executor_restart_count += 1
                             self._stats["executor_restarts"] += 1
                             logger.warning(
-                                f"Executor thread died - restarting "
+                                f"Executor task died - restarting "
                                 f"(attempt {self._executor_restart_count}/{self._max_executor_restarts})"
                             )
-                            self._start_executor_thread()
+                            self._start_executor_task()
                         else:
                             logger.critical(
-                                f"Executor thread died and max restarts exceeded"
+                                f"Executor task died and max restarts exceeded"
                             )
 
                 # Auto-save state periodically
@@ -2953,46 +2907,46 @@ class PluginExecutive:
                         self._last_auto_save = datetime.now()
 
                 # Log circuit breaker status
-                with self._lock:
-                    for iid, config in self._plugins.items():
-                        cb = config.circuit_breaker
-                        if cb.state == "open":
-                            elapsed = 0
-                            if cb.tripped_at:
-                                elapsed = (datetime.now() - cb.tripped_at).total_seconds()
-                            remaining = cb.reset_after_seconds - elapsed
-                            if remaining > 0:
-                                logger.debug(
-                                    f"Circuit breaker for '{config.plugin.name}' is OPEN "
-                                    f"(resets in {remaining:.0f}s)"
-                                )
+                for iid, config in self._plugins.items():
+                    cb = config.circuit_breaker
+                    if cb.state == "open":
+                        elapsed = 0
+                        if cb.tripped_at:
+                            elapsed = (datetime.now() - cb.tripped_at).total_seconds()
+                        remaining = cb.reset_after_seconds - elapsed
+                        if remaining > 0:
+                            logger.debug(
+                                f"Circuit breaker for '{config.plugin.name}' is OPEN "
+                                f"(resets in {remaining:.0f}s)"
+                            )
 
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Health monitor error: {e}")
                 logger.debug(traceback.format_exc())
 
-        logger.debug("Health monitor thread stopped")
+        logger.debug("Health monitor task stopped")
 
     def _auto_save_all_states(self):
         """Auto-save state for all running plugins"""
-        with self._lock:
-            for iid, config in self._plugins.items():
-                plugin = config.plugin
-                if plugin.state in (PluginState.STARTED, PluginState.FROZEN):
-                    try:
-                        # Let plugin save its own state
-                        if hasattr(plugin, 'get_state_for_save'):
-                            state = plugin.get_state_for_save()
-                            plugin.save_state(state)
-                        else:
-                            # Basic state save
-                            plugin.save_state({
-                                "auto_saved": True,
-                                "run_count": config.run_count,
-                                "last_run": config.last_run.isoformat() if config.last_run else None,
-                            })
-                    except Exception as e:
-                        logger.error(f"Error auto-saving state for plugin '{plugin.name}': {e}")
+        for iid, config in self._plugins.items():
+            plugin = config.plugin
+            if plugin.state in (PluginState.STARTED, PluginState.FROZEN):
+                try:
+                    # Let plugin save its own state
+                    if hasattr(plugin, 'get_state_for_save'):
+                        state = plugin.get_state_for_save()
+                        plugin.save_state(state)
+                    else:
+                        # Basic state save
+                        plugin.save_state({
+                            "auto_saved": True,
+                            "run_count": config.run_count,
+                            "last_run": config.last_run.isoformat() if config.last_run else None,
+                        })
+                except Exception as e:
+                    logger.error(f"Error auto-saving state for plugin '{plugin.name}': {e}")
 
     def _add_to_history(self, result: ExecutionResult):
         """Add result to execution history"""
@@ -3011,7 +2965,7 @@ class PluginExecutive:
                         f"Discarding unexecuted order: "
                         f"{reconciled.action} {reconciled.net_quantity} {reconciled.symbol}"
                     )
-            except Empty:
+            except (Empty, asyncio.QueueEmpty):
                 break
 
     # =========================================================================
@@ -3032,31 +2986,30 @@ class PluginExecutive:
             circuit_breaker, parameters, subscribed_channels,
             source_file.  Returns None if the plugin is not found.
         """
-        with self._lock:
-            iid, config = self._resolve_plugin(name)
-            if not config:
-                return None
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return None
 
-            plugin = config.plugin
+        plugin = config.plugin
 
-            return {
-                "name": plugin.name,
-                "instance_id": iid,
-                "version": plugin.VERSION,
-                "state": plugin.state.value,
-                "is_system_plugin": plugin.is_system_plugin,
-                "enabled": config.enabled,
-                "execution_mode": config.execution_mode.value,
-                "bar_timeframe": config.bar_timeframe.value,
-                "run_count": config.run_count,
-                "error_count": config.error_count,
-                "last_run": config.last_run.isoformat() if config.last_run else None,
-                "last_error": config.last_error,
-                "circuit_breaker": config.circuit_breaker.to_dict(),
-                "parameters": dict(config.parameters),
-                "subscribed_channels": plugin.subscribed_channels,
-                "source_file": str(config.source_file) if config.source_file else None,
-            }
+        return {
+            "name": plugin.name,
+            "instance_id": iid,
+            "version": plugin.VERSION,
+            "state": plugin.state.value,
+            "is_system_plugin": plugin.is_system_plugin,
+            "enabled": config.enabled,
+            "execution_mode": config.execution_mode.value,
+            "bar_timeframe": config.bar_timeframe.value,
+            "run_count": config.run_count,
+            "error_count": config.error_count,
+            "last_run": config.last_run.isoformat() if config.last_run else None,
+            "last_error": config.last_error,
+            "circuit_breaker": config.circuit_breaker.to_dict(),
+            "parameters": dict(config.parameters),
+            "subscribed_channels": plugin.subscribed_channels,
+            "source_file": str(config.source_file) if config.source_file else None,
+        }
 
     def get_status(self) -> Dict[str, Any]:
         """
@@ -3077,32 +3030,29 @@ class PluginExecutive:
         - ``message_bus_channels``: number of active pub/sub channels
         - ``stream_manager``: StreamManager status dict
         """
-        with self._lock:
-            plugin_status = {
-                config.plugin.name: {
-                    "instance_id": iid,
-                    "state": config.plugin.state.value,
-                    "enabled": config.enabled,
-                    "run_count": config.run_count,
-                    "error_count": config.error_count,
-                    "circuit_breaker_state": config.circuit_breaker.state,
-                }
-                for iid, config in self._plugins.items()
+        plugin_status = {
+            config.plugin.name: {
+                "instance_id": iid,
+                "state": config.plugin.state.value,
+                "enabled": config.enabled,
+                "run_count": config.run_count,
+                "error_count": config.error_count,
+                "circuit_breaker_state": config.circuit_breaker.state,
             }
+            for iid, config in self._plugins.items()
+        }
 
-            open_circuit_breakers = [
-                config.plugin.name for iid, config in self._plugins.items()
-                if config.circuit_breaker.state == "open"
-            ]
+        open_circuit_breakers = [
+            config.plugin.name for iid, config in self._plugins.items()
+            if config.circuit_breaker.state == "open"
+        ]
 
         health_status = {
-            "executor_thread_alive": (
-                self._executor_thread.is_alive()
-                if self._executor_thread else False
+            "executor_task_alive": (
+                self._executor_task is not None and not self._executor_task.done()
             ),
-            "health_thread_alive": (
-                self._health_thread.is_alive()
-                if self._health_thread else False
+            "health_task_alive": (
+                self._health_task is not None and not self._health_task.done()
             ),
             "executor_restart_count": self._executor_restart_count,
             "max_executor_restarts": self._max_executor_restarts,
@@ -3174,10 +3124,9 @@ class PluginExecutive:
             order_id: The IB order ID
             plugin_name: Name of the plugin that owns the order
         """
-        with self._lock:
-            names = self._order_id_to_plugins.setdefault(order_id, [])
-            if plugin_name not in names:
-                names.append(plugin_name)
+        names = self._order_id_to_plugins.setdefault(order_id, [])
+        if plugin_name not in names:
+            names.append(plugin_name)
 
     def _handle_order_status_for_plugins(self, order_record) -> None:
         """
@@ -3189,13 +3138,12 @@ class PluginExecutive:
         fully filled.
         """
         order_id = order_record.order_id
-        with self._lock:
-            plugin_names = list(self._order_id_to_plugins.get(order_id, []))
-            plugins = []
-            for name in plugin_names:
-                _, config = self._resolve_plugin(name)
-                if config:
-                    plugins.append(config.plugin)
+        plugin_names = list(self._order_id_to_plugins.get(order_id, []))
+        plugins = []
+        for name in plugin_names:
+            _, config = self._resolve_plugin(name)
+            if config:
+                plugins.append(config.plugin)
 
         for plugin in plugins:
             try:
@@ -3227,12 +3175,11 @@ class PluginExecutive:
         plugins = []
 
         # Order-error routing
-        with self._lock:
-            order_names = list(self._order_id_to_plugins.get(req_id, []))
-            for name in order_names:
-                _, config = self._resolve_plugin(name)
-                if config:
-                    plugins.append(config.plugin)
+        order_names = list(self._order_id_to_plugins.get(req_id, []))
+        for name in order_names:
+            _, config = self._resolve_plugin(name)
+            if config:
+                plugins.append(config.plugin)
 
         # Stream-error routing (only if not already attributed to an order)
         if not plugins and self.portfolio:
@@ -3242,11 +3189,10 @@ class PluginExecutive:
             )
             if symbol:
                 stream_names = self.stream_manager.plugins_for_symbol(symbol)
-                with self._lock:
-                    for name in stream_names:
-                        _, config = self._resolve_plugin(name)
-                        if config:
-                            plugins.append(config.plugin)
+                for name in stream_names:
+                    _, config = self._resolve_plugin(name)
+                    if config:
+                        plugins.append(config.plugin)
 
         if not plugins:
             logger.debug(
@@ -3279,17 +3225,16 @@ class PluginExecutive:
             order_id: The IB order ID
             reconciled: The reconciled order details
         """
-        with self._lock:
-            self._pending_commissions[order_id] = {
-                "symbol": reconciled.symbol,
-                "action": reconciled.action,
-                "net_quantity": reconciled.net_quantity,
-                "contributing_signals": reconciled.contributing_signals,
-                "created_at": datetime.now(),
-            }
-            self._order_id_to_plugins[order_id] = [
-                ps.algorithm_name for ps in reconciled.contributing_signals
-            ]
+        self._pending_commissions[order_id] = {
+            "symbol": reconciled.symbol,
+            "action": reconciled.action,
+            "net_quantity": reconciled.net_quantity,
+            "contributing_signals": reconciled.contributing_signals,
+            "created_at": datetime.now(),
+        }
+        self._order_id_to_plugins[order_id] = [
+            ps.algorithm_name for ps in reconciled.contributing_signals
+        ]
 
     def _handle_commission_report(
         self,
@@ -3343,88 +3288,87 @@ class PluginExecutive:
             commission: Total commission
             realized_pnl: Total realized P&L
         """
-        with self._lock:
-            pending = self._pending_commissions.get(order_id)
-            if not pending:
-                logger.debug(f"No pending commission info for order {order_id}")
-                return
+        pending = self._pending_commissions.get(order_id)
+        if not pending:
+            logger.debug(f"No pending commission info for order {order_id}")
+            return
 
-            # Get allocation percentages from reconciler
-            allocation_pcts = self._reconciler.get_allocation_percentages(order_id)
-            is_combined = len(allocation_pcts) > 1
+        # Get allocation percentages from reconciler
+        allocation_pcts = self._reconciler.get_allocation_percentages(order_id)
+        is_combined = len(allocation_pcts) > 1
 
-            # Get order details
-            symbol = pending["symbol"]
-            action = pending["action"]
-            total_qty = pending["net_quantity"]
-            contributing_signals = pending["contributing_signals"]
+        # Get order details
+        symbol = pending["symbol"]
+        action = pending["action"]
+        total_qty = pending["net_quantity"]
+        contributing_signals = pending["contributing_signals"]
 
-            # Get fill price from portfolio if available
-            fill_price = 0.0
-            if self.portfolio and hasattr(self.portfolio, "_orders"):
-                order_record = self.portfolio._orders.get(order_id)
-                if order_record:
-                    fill_price = order_record.avg_fill_price
+        # Get fill price from portfolio if available
+        fill_price = 0.0
+        if self.portfolio and hasattr(self.portfolio, "_orders"):
+            order_record = self.portfolio._orders.get(order_id)
+            if order_record:
+                fill_price = order_record.avg_fill_price
 
-            # Create execution log for each contributing plugin
-            for ps in contributing_signals:
-                plugin_name = ps.algorithm_name
-                alloc_pct = allocation_pcts.get(plugin_name, 0.0)
+        # Create execution log for each contributing plugin
+        for ps in contributing_signals:
+            plugin_name = ps.algorithm_name
+            alloc_pct = allocation_pcts.get(plugin_name, 0.0)
 
-                # If no allocation percentages, fall back to even split
-                if alloc_pct == 0.0 and len(contributing_signals) > 0:
-                    alloc_pct = 1.0 / len(contributing_signals)
+            # If no allocation percentages, fall back to even split
+            if alloc_pct == 0.0 and len(contributing_signals) > 0:
+                alloc_pct = 1.0 / len(contributing_signals)
 
-                # Apportion commission and P&L
-                plugin_commission = commission * alloc_pct
-                plugin_pnl = realized_pnl * alloc_pct
-                plugin_qty = int(total_qty * alloc_pct)
+            # Apportion commission and P&L
+            plugin_commission = commission * alloc_pct
+            plugin_pnl = realized_pnl * alloc_pct
+            plugin_qty = int(total_qty * alloc_pct)
 
-                # Get plugin's position info if available
-                pos_before = 0
-                pos_after = 0
-                avg_cost_before = 0.0
-                avg_cost_after = 0.0
+            # Get plugin's position info if available
+            pos_before = 0
+            pos_after = 0
+            avg_cost_before = 0.0
+            avg_cost_after = 0.0
 
-                _, plugin_config = self._resolve_plugin(plugin_name)
-                if plugin_config and plugin_config.plugin.holdings:
-                    holdings = plugin_config.plugin.holdings
-                    position = holdings.get_position(symbol)
-                    if position:
-                        # These would be the values after the trade
-                        pos_after = position.quantity
-                        avg_cost_after = position.cost_basis / position.quantity if position.quantity else 0.0
+            _, plugin_config = self._resolve_plugin(plugin_name)
+            if plugin_config and plugin_config.plugin.holdings:
+                holdings = plugin_config.plugin.holdings
+                position = holdings.get_position(symbol)
+                if position:
+                    # These would be the values after the trade
+                    pos_after = position.quantity
+                    avg_cost_after = position.cost_basis / position.quantity if position.quantity else 0.0
 
-                # Create and write log entry
-                log_entry = PluginExecutionLog(
-                    timestamp=datetime.now(),
-                    plugin_name=plugin_name,
-                    order_id=order_id,
-                    exec_id=exec_id,
-                    symbol=symbol,
-                    action=action,
-                    quantity=plugin_qty,
-                    fill_price=fill_price,
-                    commission=plugin_commission,
-                    fees=0.0,  # IB includes fees in commission
-                    realized_pnl=plugin_pnl,
-                    is_combined_order=is_combined,
-                    allocation_pct=alloc_pct,
-                    total_order_quantity=total_qty,
-                    position_before=pos_before,
-                    position_after=pos_after,
-                    avg_cost_before=avg_cost_before,
-                    avg_cost_after=avg_cost_after,
+            # Create and write log entry
+            log_entry = PluginExecutionLog(
+                timestamp=datetime.now(),
+                plugin_name=plugin_name,
+                order_id=order_id,
+                exec_id=exec_id,
+                symbol=symbol,
+                action=action,
+                quantity=plugin_qty,
+                fill_price=fill_price,
+                commission=plugin_commission,
+                fees=0.0,  # IB includes fees in commission
+                realized_pnl=plugin_pnl,
+                is_combined_order=is_combined,
+                allocation_pct=alloc_pct,
+                total_order_quantity=total_qty,
+                position_before=pos_before,
+                position_after=pos_after,
+                avg_cost_before=avg_cost_before,
+                avg_cost_after=avg_cost_after,
+            )
+
+            # Write to log file
+            if self._execution_log_writer.write(log_entry):
+                logger.debug(
+                    f"Logged execution for {plugin_name}: {action} {plugin_qty} {symbol} "
+                    f"@ ${fill_price:.2f}, commission=${plugin_commission:.4f}"
                 )
-
-                # Write to log file
-                if self._execution_log_writer.write(log_entry):
-                    logger.debug(
-                        f"Logged execution for {plugin_name}: {action} {plugin_qty} {symbol} "
-                        f"@ ${fill_price:.2f}, commission=${plugin_commission:.4f}"
-                    )
-                else:
-                    logger.error(f"Failed to write execution log for {plugin_name}")
+            else:
+                logger.error(f"Failed to write execution log for {plugin_name}")
 
     def register_execution_for_commission(
         self,
@@ -3441,8 +3385,35 @@ class PluginExecutive:
             order_id: The IB order ID
             exec_id: The execution ID from IB
         """
-        with self._lock:
-            self._exec_id_to_order[exec_id] = order_id
+        self._exec_id_to_order[exec_id] = order_id
+
+    def _handle_exec_details_for_commission(self, req_id, contract, execution) -> None:
+        """
+        Intercept execDetails callbacks to populate _exec_id_to_order.
+
+        Registered as portfolio._callbacks["execDetails"] so that commission
+        reports arriving later can be linked to the correct order.
+        """
+        self.register_execution_for_commission(execution.orderId, execution.execId)
+
+    def _dispatch_pnl(self, pnl_data: PnLData) -> None:
+        """
+        Broadcast a P&L update to all started plugins.
+
+        Registered as portfolio._on_pnl. Calls plugin.on_pnl(pnl_data) for
+        every plugin in the STARTED state, mirroring the guard pattern used
+        by other plugin dispatch methods.
+        """
+        configs = list(self._plugins.values())
+
+        for config in configs:
+            plugin = config.plugin
+            if plugin.state != PluginState.STARTED:
+                continue
+            try:
+                plugin.on_pnl(pnl_data)
+            except Exception as e:
+                logger.error(f"[{plugin.name}] on_pnl error: {e}")
 
     def get_execution_logs(
         self,
@@ -3504,11 +3475,10 @@ class PluginExecutive:
             return False, None, f"Invalid action: {action}. Must be BUY or SELL."
 
         # Validate plugin exists
-        with self._lock:
-            iid, config = self._resolve_plugin(plugin_name)
-            if not config:
-                available = [c.plugin.name for c in self._plugins.values()]
-                return False, None, f"Plugin '{plugin_name}' not found. Available: {available}"
+        iid, config = self._resolve_plugin(plugin_name)
+        if not config:
+            available = [c.plugin.name for c in self._plugins.values()]
+            return False, None, f"Plugin '{plugin_name}' not found. Available: {available}"
 
         # Validate quantity
         if quantity <= 0:

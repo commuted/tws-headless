@@ -6,6 +6,7 @@ Compatible with the official Interactive Brokers API.
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Optional, Dict, Any, List
 from decimal import Decimal
@@ -888,6 +889,25 @@ class WshEventData:
 
     def __str__(self) -> str:
         return f"ConId: {self.conId}, Filter: {self.filter}"
+
+
+@dataclass
+class PnLData:
+    """
+    Live P&L data from IB's reqPnL / reqPnLSingle subscriptions.
+
+    For account-level updates (reqPnL), symbol is None.
+    For per-position updates (reqPnLSingle), symbol identifies the contract.
+    """
+    account: str
+    daily_pnl: float
+    unrealized_pnl: float
+    realized_pnl: float
+    # Only set for reqPnLSingle:
+    symbol: Optional[str] = None
+    position: int = 0
+    value: float = 0.0
+    timestamp: datetime = field(default_factory=datetime.now)
 
 
 # Type aliases from official API

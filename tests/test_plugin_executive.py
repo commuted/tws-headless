@@ -2,6 +2,7 @@
 Tests for plugin_executive.py - Plugin lifecycle manager
 """
 
+import asyncio
 import pytest
 from datetime import datetime
 from unittest.mock import Mock
@@ -469,7 +470,7 @@ class TestPluginDescriptor:
 class TestPluginRequestUnload:
     """Tests for plugin self-unload via instance_id"""
 
-    def test_request_unload_uses_instance_id(self):
+    async def test_request_unload_uses_instance_id(self):
         """Test that request_unload passes instance_id, not name"""
         executive = PluginExecutive(None, None)
         plugin = MockPlugin("test")
@@ -484,6 +485,8 @@ class TestPluginRequestUnload:
         executive.deferred_unload_plugin = capture
 
         plugin.request_unload()
+        # Allow the deferred task to run
+        await asyncio.sleep(0)
 
         assert len(called_with) == 1
         assert called_with[0] == plugin.instance_id
@@ -635,3 +638,96 @@ class TestPluginDepartures:
         key = list(departures.keys())[0]
         assert departures[key]["plugin_name"] == "self_unload"
         assert departures[key]["message"] == "Goodbye from self_unload!"
+
+
+class TestCommissionAndPnL:
+    """Tests for execDetails wiring and P&L dispatch"""
+
+    def test_exec_details_wires_commission(self):
+        """_handle_exec_details_for_commission populates _exec_id_to_order."""
+        executive = PluginExecutive(None, None)
+
+        mock_contract = Mock()
+        mock_execution = Mock()
+        mock_execution.orderId = 101
+        mock_execution.execId = "exec_abc"
+
+        executive._handle_exec_details_for_commission(0, mock_contract, mock_execution)
+
+        assert executive._exec_id_to_order.get("exec_abc") == 101
+
+    def test_exec_details_callback_registered_on_portfolio(self):
+        """portfolio._callbacks['execDetails'] is set to the handler at init."""
+        portfolio = Mock()
+        portfolio._callbacks = {}
+        portfolio._on_commission = None
+        portfolio._on_pnl = None
+
+        ex = PluginExecutive(portfolio=portfolio, data_feed=None)
+
+        assert "execDetails" in portfolio._callbacks
+        assert portfolio._callbacks["execDetails"] == ex._handle_exec_details_for_commission
+
+    def test_pnl_dispatch_to_started_plugins(self):
+        """_dispatch_pnl calls on_pnl on every started plugin."""
+        from ib.models import PnLData
+
+        executive = PluginExecutive(None, None)
+
+        received = []
+
+        class PnLPlugin(MockPlugin):
+            def on_pnl(self, pnl_data):
+                received.append(pnl_data)
+
+        plugin = PnLPlugin("pnl_plugin")
+        executive.register_plugin(plugin)
+        executive.start_plugin("pnl_plugin")
+
+        pnl_data = PnLData(
+            account="DU123456",
+            daily_pnl=50.0,
+            unrealized_pnl=200.0,
+            realized_pnl=10.0,
+        )
+        executive._dispatch_pnl(pnl_data)
+
+        assert len(received) == 1
+        assert received[0].daily_pnl == 50.0
+
+    def test_pnl_dispatch_skips_non_started_plugins(self):
+        """_dispatch_pnl does not call on_pnl on stopped or frozen plugins."""
+        from ib.models import PnLData
+
+        executive = PluginExecutive(None, None)
+
+        received = []
+
+        class PnLPlugin(MockPlugin):
+            def on_pnl(self, pnl_data):
+                received.append(pnl_data)
+
+        plugin = PnLPlugin("pnl_plugin2")
+        executive.register_plugin(plugin)
+        # Plugin is in LOADED state, not STARTED
+
+        pnl_data = PnLData(
+            account="DU123456",
+            daily_pnl=10.0,
+            unrealized_pnl=0.0,
+            realized_pnl=0.0,
+        )
+        executive._dispatch_pnl(pnl_data)
+
+        assert received == []
+
+    def test_on_pnl_registered_on_portfolio(self):
+        """portfolio._on_pnl is set to _dispatch_pnl at init."""
+        portfolio = Mock()
+        portfolio._callbacks = {}
+        portfolio._on_commission = None
+        portfolio._on_pnl = None
+
+        ex = PluginExecutive(portfolio=portfolio, data_feed=None)
+
+        assert portfolio._on_pnl == ex._dispatch_pnl

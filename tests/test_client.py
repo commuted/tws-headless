@@ -5,8 +5,9 @@ Tests IBClient connection management, callbacks, and state handling.
 Uses mocks to avoid actual IB connections.
 """
 
+import asyncio
 import pytest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, AsyncMock, patch, PropertyMock
 from threading import Event
 
 
@@ -297,27 +298,27 @@ class TestIBClientConnection:
             client = IBClient.__new__(IBClient)
             client._connected = Event()
             client._next_order_id = None
-            client._thread = None
+            client._transport = None
+            client._run_task = None
             client.host = "127.0.0.1"
             client.port = 7497
             client.client_id = 1
             client.timeout = 1.0  # Short timeout for tests
             return client
 
-    def test_disconnect_clears_connected(self, client):
+    async def test_disconnect_clears_connected(self, client):
         """Test disconnect clears connected state"""
         client._connected.set()
 
-        with patch('client.EClient.disconnect'):
-            client.disconnect()
+        await client.disconnect()
 
         assert not client._connected.is_set()
 
-    def test_reconnect_calls_both(self, client):
+    async def test_reconnect_calls_both(self, client):
         """Test reconnect calls disconnect then connect"""
-        with patch.object(client, 'disconnect') as mock_disconnect, \
-             patch.object(client, 'connect', return_value=True) as mock_connect:
-            result = client.reconnect()
+        with patch.object(client, 'disconnect', new_callable=AsyncMock) as mock_disconnect, \
+             patch.object(client, 'connect', new_callable=AsyncMock, return_value=True) as mock_connect:
+            result = await client.reconnect()
 
             mock_disconnect.assert_called_once()
             mock_connect.assert_called_once()
@@ -337,26 +338,26 @@ class TestIBClientContextManager:
             client._connected = Event()
             return client
 
-    def test_enter_calls_connect(self, client):
-        """Test __enter__ calls connect"""
-        with patch.object(client, 'connect') as mock_connect:
-            result = client.__enter__()
+    async def test_enter_calls_connect(self, client):
+        """Test __aenter__ calls connect"""
+        with patch.object(client, 'connect', new_callable=AsyncMock) as mock_connect:
+            result = await client.__aenter__()
 
             mock_connect.assert_called_once()
             assert result is client
 
-    def test_exit_calls_disconnect(self, client):
-        """Test __exit__ calls disconnect"""
-        with patch.object(client, 'disconnect') as mock_disconnect:
-            result = client.__exit__(None, None, None)
+    async def test_exit_calls_disconnect(self, client):
+        """Test __aexit__ calls disconnect"""
+        with patch.object(client, 'disconnect', new_callable=AsyncMock) as mock_disconnect:
+            result = await client.__aexit__(None, None, None)
 
             mock_disconnect.assert_called_once()
             assert result is False  # Don't suppress exceptions
 
-    def test_exit_with_exception(self, client):
-        """Test __exit__ returns False (doesn't suppress exception)"""
-        with patch.object(client, 'disconnect'):
-            result = client.__exit__(ValueError, ValueError("test"), None)
+    async def test_exit_with_exception(self, client):
+        """Test __aexit__ returns False (doesn't suppress exception)"""
+        with patch.object(client, 'disconnect', new_callable=AsyncMock):
+            result = await client.__aexit__(ValueError, ValueError("test"), None)
 
             assert result is False
 
@@ -375,9 +376,10 @@ class TestIBClientConnectExtended:
 
         with patch.object(IBClient, '__init__', lambda self, **kwargs: None):
             client = IBClient.__new__(IBClient)
-            client._connected = Event()
+            client._connected = asyncio.Event()
             client._next_order_id = None
-            client._thread = None
+            client._transport = None
+            client._run_task = None
             client._host = "127.0.0.1"
             client._port = 7497
             client.host = "127.0.0.1"
@@ -386,45 +388,55 @@ class TestIBClientConnectExtended:
             client.timeout = 0.1  # Very short timeout for tests
             return client
 
-    def test_connect_creates_thread(self, client):
-        """Test connect creates and starts a thread"""
-        with patch('client.EClient.connect'), \
-             patch.object(client, 'run'):
-            # Simulate connection success by setting the event
-            def set_connected(*args, **kwargs):
+    async def test_connect_creates_task(self, client):
+        """Test connect creates and starts a task"""
+        with patch('client.AsyncIBTransport') as MockTransport:
+            instance = MockTransport.return_value
+            instance.connect = AsyncMock()
+
+            async def mock_run():
                 client._connected.set()
-                return True
 
-            client._connected.wait = MagicMock(side_effect=set_connected)
+            instance.run = mock_run
 
-            result = client.connect()
+            result = await client.connect()
 
-            assert client._thread is not None
+            assert client._run_task is not None
+            assert result is True
 
-    def test_connect_timeout_returns_false(self, client):
+    async def test_connect_timeout_returns_false(self, client):
         """Test connect returns False on timeout"""
-        with patch('client.EClient.connect'), \
-             patch.object(client, 'run'):
-            # Don't set _connected, so wait will timeout
-            result = client.connect()
+        with patch('client.AsyncIBTransport') as MockTransport:
+            instance = MockTransport.return_value
+            instance.connect = AsyncMock()
+            instance.run = AsyncMock()  # Never sets _connected
+
+            result = await client.connect()
 
             assert result is False
 
-    def test_connect_exception_returns_false(self, client):
+    async def test_connect_exception_returns_false(self, client):
         """Test connect returns False on exception"""
-        with patch('client.EClient.connect', side_effect=Exception("Connection error")):
-            result = client.connect()
+        with patch('client.AsyncIBTransport') as MockTransport:
+            instance = MockTransport.return_value
+            instance.connect = AsyncMock(side_effect=Exception("Connection error"))
+
+            result = await client.connect()
 
             assert result is False
 
-    def test_connect_success_returns_true(self, client):
+    async def test_connect_success_returns_true(self, client):
         """Test connect returns True on success"""
-        with patch('client.EClient.connect'), \
-             patch.object(client, 'run'):
-            # Simulate successful connection
-            client._connected.set()
+        with patch('client.AsyncIBTransport') as MockTransport:
+            instance = MockTransport.return_value
+            instance.connect = AsyncMock()
 
-            result = client.connect()
+            async def mock_run():
+                client._connected.set()
+
+            instance.run = mock_run
+
+            result = await client.connect()
 
             assert result is True
 
@@ -439,18 +451,23 @@ class TestIBClientDisconnectExtended:
 
         with patch.object(IBClient, '__init__', lambda self, **kwargs: None):
             client = IBClient.__new__(IBClient)
-            client._connected = Event()
+            client._connected = asyncio.Event()
             client._connected.set()
+            client._transport = None
+            client._run_task = None
             return client
 
-    def test_disconnect_handles_exception(self, client):
+    async def test_disconnect_handles_exception(self, client):
         """Test disconnect handles exceptions gracefully"""
-        with patch('client.EClient.disconnect', side_effect=Exception("Disconnect error")):
-            # Should not raise
-            client.disconnect()
+        mock_transport = MagicMock()
+        mock_transport.disconnect.side_effect = Exception("Disconnect error")
+        client._transport = mock_transport
 
-            # Connected should still be cleared
-            assert not client._connected.is_set()
+        # Should not raise
+        await client.disconnect()
+
+        # Connected should still be cleared
+        assert not client._connected.is_set()
 
 
 class TestIBClientErrorExtended:

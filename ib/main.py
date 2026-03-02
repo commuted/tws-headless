@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import asyncio
 import atexit
 import logging
 import signal
@@ -170,7 +171,7 @@ class ShutdownManager:
         """
         return self._shutdown_event.wait(timeout=timeout)
 
-    def wait_interruptible(self, duration: float = 0, poll_interval: float = 0.1):
+    async def wait_interruptible(self, duration: float = 0, poll_interval: float = 0.1):
         """
         Wait for specified duration or until shutdown.
 
@@ -185,10 +186,10 @@ class ShutdownManager:
                 if elapsed >= duration:
                     break
                 remaining = min(poll_interval, duration - elapsed)
-                time.sleep(remaining)
+                await asyncio.sleep(remaining)
         else:
             while not self.should_shutdown:
-                time.sleep(poll_interval)
+                await asyncio.sleep(poll_interval)
 
 
 # Global shutdown manager instance
@@ -1762,7 +1763,7 @@ def show_targets(targets: List[TargetAllocation]) -> None:
     print("=" * 50)
 
 
-def stream_prices(portfolio: Portfolio, duration: int = 0) -> None:
+async def stream_prices(portfolio: Portfolio, duration: int = 0) -> None:
     """
     Stream live prices for all portfolio positions.
 
@@ -1794,7 +1795,7 @@ def stream_prices(portfolio: Portfolio, duration: int = 0) -> None:
 
     try:
         # Use global shutdown manager for interruptible wait
-        shutdown_manager.wait_interruptible(duration=duration)
+        await shutdown_manager.wait_interruptible(duration=duration)
     finally:
         portfolio.stop_streaming()
 
@@ -1807,7 +1808,7 @@ def stream_prices(portfolio: Portfolio, duration: int = 0) -> None:
         print("=" * 70)
 
 
-def stream_bars(portfolio: Portfolio, duration: int = 0) -> None:
+async def stream_bars(portfolio: Portfolio, duration: int = 0) -> None:
     """
     Stream 5-second OHLCV bars for all portfolio positions.
 
@@ -1849,7 +1850,7 @@ def stream_bars(portfolio: Portfolio, duration: int = 0) -> None:
 
     try:
         # Use global shutdown manager for interruptible wait
-        shutdown_manager.wait_interruptible(duration=duration)
+        await shutdown_manager.wait_interruptible(duration=duration)
     finally:
         portfolio.stop_bar_streaming()
 
@@ -2051,61 +2052,65 @@ def main():
     # Register portfolio with shutdown manager for cleanup
     shutdown_manager.register_portfolio(portfolio)
 
-    if not portfolio.connect():
-        logger.error("Failed to connect to IB")
-        sys.exit(1)
+    async def _run():
+        command_server = None
+        if not await portfolio.connect():
+            logger.error("Failed to connect to IB")
+            sys.exit(1)
 
-    try:
-        # Check for early shutdown
-        if shutdown_manager.should_shutdown:
-            return
+        try:
+            # Check for early shutdown
+            if shutdown_manager.should_shutdown:
+                return
 
-        # Load portfolio data
-        logger.info("Loading portfolio data...")
-        portfolio.load(fetch_prices=True, fetch_account=True)
+            # Load portfolio data
+            logger.info("Loading portfolio data...")
+            await portfolio.load(fetch_prices=True, fetch_account=True)
 
-        # Check for early shutdown
-        if shutdown_manager.should_shutdown:
-            return
+            # Check for early shutdown
+            if shutdown_manager.should_shutdown:
+                return
 
-        # Start command server (unless disabled)
-        if not args.no_server:
-            command_server = CommandServer(socket_path=args.socket)
-            command_handler = CommandHandler(portfolio, shutdown_manager)
-            command_handler.register_commands(command_server)
-            if command_server.start():
-                logger.info(f"Command server listening on {args.socket}")
-            else:
-                logger.warning("Failed to start command server")
+            # Start command server (unless disabled)
+            if not args.no_server:
+                command_server = CommandServer(socket_path=args.socket)
+                command_handler = CommandHandler(portfolio, shutdown_manager)
+                command_handler.register_commands(command_server)
+                if command_server.start():
+                    logger.info(f"Command server listening on {args.socket}")
+                else:
+                    logger.warning("Failed to start command server")
 
-        # Show portfolio
-        show_portfolio(portfolio)
+            # Show portfolio
+            show_portfolio(portfolio)
 
-        # Streaming modes
-        if args.stream:
-            stream_prices(portfolio, duration=args.duration)
+            # Streaming modes
+            if args.stream:
+                await stream_prices(portfolio, duration=args.duration)
 
-        elif args.bars:
-            stream_bars(portfolio, duration=args.duration)
+            elif args.bars:
+                await stream_bars(portfolio, duration=args.duration)
 
-        # Rebalance actions
-        elif args.rebalance:
-            show_targets(DEFAULT_TARGETS)
+            # Rebalance actions
+            elif args.rebalance:
+                show_targets(DEFAULT_TARGETS)
 
-            if args.execute:
-                execute_rebalance(portfolio, DEFAULT_TARGETS, config)
-            else:
-                calculate_rebalance(portfolio, DEFAULT_TARGETS, config)
+                if args.execute:
+                    execute_rebalance(portfolio, DEFAULT_TARGETS, config)
+                else:
+                    calculate_rebalance(portfolio, DEFAULT_TARGETS, config)
 
-    except KeyboardInterrupt:
-        # This may happen if signal handler hasn't fully processed
-        logger.info("Interrupted")
-    finally:
-        # Stop command server
-        if command_server:
-            command_server.stop()
-        portfolio.disconnect()
-        shutdown_manager.restore_handlers()
+        except KeyboardInterrupt:
+            # This may happen if signal handler hasn't fully processed
+            logger.info("Interrupted")
+        finally:
+            # Stop command server
+            if command_server:
+                command_server.stop()
+            await portfolio.disconnect()
+            shutdown_manager.restore_handlers()
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

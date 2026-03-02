@@ -8,9 +8,9 @@ Provides persistent, fault-tolerant connection to IB TWS/Gateway with:
 - Connection health monitoring
 """
 
+import asyncio
 import logging
 import time
-from threading import Thread, Event, Lock
 from typing import Optional, Callable, Dict, List, Set, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -80,12 +80,12 @@ class ConnectionManager:
         manager.on_disconnected = lambda: print("Disconnected!")
 
         # Start managed connection
-        manager.start()
+        await manager.start()
 
         # ... use portfolio normally ...
 
         # When done
-        manager.stop()
+        await manager.stop()
     """
 
     def __init__(
@@ -105,19 +105,18 @@ class ConnectionManager:
 
         # State
         self._state = ConnectionState.DISCONNECTED
-        self._state_lock = Lock()
-        self._shutdown_event = Event()
+        self._shutdown_event = asyncio.Event()
 
-        # Threads
-        self._keepalive_thread: Optional[Thread] = None
-        self._health_thread: Optional[Thread] = None
-        self._reconnect_thread: Optional[Thread] = None
+        # Tasks (replaces Threads)
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._health_task: Optional[asyncio.Task] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
 
         # Reconnection tracking
         self._reconnect_attempts = 0
         self._last_connect_time: Optional[datetime] = None
         self._last_keepalive_time: Optional[datetime] = None
-        self._keepalive_response_received = Event()
+        self._keepalive_response_received = asyncio.Event()
 
         # Stream preservation
         self._saved_tick_streams: Dict[str, StreamSubscription] = {}
@@ -135,8 +134,7 @@ class ConnectionManager:
     @property
     def state(self) -> ConnectionState:
         """Get current connection state"""
-        with self._state_lock:
-            return self._state
+        return self._state
 
     @property
     def is_connected(self) -> bool:
@@ -149,11 +147,10 @@ class ConnectionManager:
         return self._reconnect_attempts
 
     def _set_state(self, new_state: ConnectionState):
-        """Set connection state (thread-safe)"""
-        with self._state_lock:
-            old_state = self._state
-            self._state = new_state
-            logger.info(f"Connection state: {old_state.value} -> {new_state.value}")
+        """Set connection state"""
+        old_state = self._state
+        self._state = new_state
+        logger.info(f"Connection state: {old_state.value} -> {new_state.value}")
 
     def _setup_portfolio_callbacks(self):
         """Set up callbacks on the portfolio for connection events"""
@@ -181,11 +178,11 @@ class ConnectionManager:
 
         self.portfolio.currentTime = current_time_wrapper
 
-    def start(self) -> bool:
+    async def start(self) -> bool:
         """
         Start managed connection.
 
-        Connects to IB and starts keepalive/health monitoring threads.
+        Connects to IB and starts keepalive/health monitoring tasks.
 
         Returns:
             True if initial connection successful
@@ -198,10 +195,10 @@ class ConnectionManager:
         self._set_state(ConnectionState.CONNECTING)
 
         # Initial connection
-        if not self._connect():
+        if not await self._connect():
             if self.config.auto_reconnect:
                 # Start reconnection in background
-                self._start_reconnect_thread()
+                self._start_reconnect_task()
                 return True  # Return True since we're handling it
             else:
                 self._set_state(ConnectionState.DISCONNECTED)
@@ -209,42 +206,41 @@ class ConnectionManager:
 
         return True
 
-    def stop(self):
+    async def stop(self):
         """
-        Stop managed connection and all threads.
+        Stop managed connection and all tasks.
 
         Gracefully shuts down connection, stops all streams,
-        and terminates management threads.
+        and terminates management tasks.
         """
         logger.info("Connection manager stopping...")
         self._set_state(ConnectionState.SHUTTING_DOWN)
         self._shutdown_event.set()
 
-        # Wait for threads to finish
-        threads = [
-            self._keepalive_thread,
-            self._health_thread,
-            self._reconnect_thread,
+        # Cancel all tasks
+        tasks = [
+            t for t in [self._keepalive_task, self._health_task, self._reconnect_task]
+            if t and not t.done()
         ]
-
-        for thread in threads:
-            if thread and thread.is_alive():
-                thread.join(timeout=5.0)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         # Disconnect portfolio
         if self.portfolio.connected:
             self.portfolio.shutdown()
-            self.portfolio.disconnect()
+            await self.portfolio.disconnect()
 
         self._set_state(ConnectionState.DISCONNECTED)
         logger.info("Connection manager stopped")
 
-    def _connect(self) -> bool:
+    async def _connect(self) -> bool:
         """Attempt to connect to IB"""
         try:
             logger.info(f"Connecting to IB at {self.portfolio._host}:{self.portfolio._port}...")
 
-            if self.portfolio.connect():
+            if await self.portfolio.connect():
                 self._on_connected()
                 return True
             else:
@@ -263,9 +259,9 @@ class ConnectionManager:
         self._reconnect_attempts = 0
         self._last_connect_time = datetime.now()
 
-        # Start management threads
-        self._start_keepalive_thread()
-        self._start_health_thread()
+        # Start management tasks
+        self._start_keepalive_task()
+        self._start_health_task()
 
         # Recover streams if we have saved subscriptions
         self._recover_streams()
@@ -298,7 +294,7 @@ class ConnectionManager:
 
         # Start reconnection if enabled
         if self.config.auto_reconnect:
-            self._start_reconnect_thread()
+            self._start_reconnect_task()
 
     def _save_stream_state(self):
         """Save current stream subscriptions for recovery"""
@@ -373,20 +369,15 @@ class ConnectionManager:
 
         logger.info("Stream recovery complete")
 
-    def _start_reconnect_thread(self):
-        """Start reconnection thread"""
-        if self._reconnect_thread and self._reconnect_thread.is_alive():
+    def _start_reconnect_task(self):
+        """Start reconnection task"""
+        if self._reconnect_task and not self._reconnect_task.done():
             return  # Already reconnecting
 
-        self._reconnect_thread = Thread(
-            target=self._reconnect_loop,
-            daemon=True,
-            name="ConnectionManager-Reconnect"
-        )
-        self._reconnect_thread.start()
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
-    def _reconnect_loop(self):
-        """Background reconnection loop with exponential backoff"""
+    async def _reconnect_loop(self):
+        """Background reconnection coroutine with exponential backoff"""
         self._set_state(ConnectionState.RECONNECTING)
         delay = self.config.reconnect_delay_initial
 
@@ -414,17 +405,20 @@ class ConnectionManager:
                 except Exception as e:
                     logger.error(f"Error in on_reconnecting callback: {e}")
 
-            # Wait before attempting
-            if self._shutdown_event.wait(delay):
+            # Wait before attempting (interruptible by shutdown)
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=delay)
                 return  # Shutdown requested
+            except asyncio.TimeoutError:
+                pass
 
             # Attempt connection
             try:
                 # Ensure clean state
                 if self.portfolio.connected:
-                    self.portfolio.disconnect()
+                    await self.portfolio.disconnect()
 
-                if self._connect():
+                if await self._connect():
                     logger.info("Reconnection successful")
                     return  # Success!
 
@@ -435,29 +429,30 @@ class ConnectionManager:
             delay = min(delay * self.config.reconnect_delay_multiplier,
                        self.config.reconnect_delay_max)
 
-    def _start_keepalive_thread(self):
-        """Start keepalive thread"""
+    def _start_keepalive_task(self):
+        """Start keepalive task"""
         if not self.config.keepalive_enabled:
             return
 
-        if self._keepalive_thread and self._keepalive_thread.is_alive():
+        if self._keepalive_task and not self._keepalive_task.done():
             return
 
-        self._keepalive_thread = Thread(
-            target=self._keepalive_loop,
-            daemon=True,
-            name="ConnectionManager-Keepalive"
-        )
-        self._keepalive_thread.start()
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
-    def _keepalive_loop(self):
-        """Background keepalive loop"""
-        logger.debug("Keepalive thread started")
+    async def _keepalive_loop(self):
+        """Background keepalive coroutine"""
+        logger.debug("Keepalive task started")
 
         while not self._shutdown_event.is_set():
-            # Wait for interval
-            if self._shutdown_event.wait(self.config.keepalive_interval):
+            # Wait for interval (interruptible by shutdown)
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=self.config.keepalive_interval,
+                )
                 break  # Shutdown requested
+            except asyncio.TimeoutError:
+                pass
 
             if self.state != ConnectionState.CONNECTED:
                 continue
@@ -468,37 +463,41 @@ class ConnectionManager:
                 self.portfolio.reqCurrentTime()
 
                 # Wait for response
-                if not self._keepalive_response_received.wait(
-                    self.config.keepalive_timeout
-                ):
+                try:
+                    await asyncio.wait_for(
+                        self._keepalive_response_received.wait(),
+                        timeout=self.config.keepalive_timeout,
+                    )
+                except asyncio.TimeoutError:
                     logger.warning("Keepalive timeout - connection may be stale")
                     # Don't immediately trigger reconnect; let health check handle it
 
             except Exception as e:
                 logger.error(f"Error sending keepalive: {e}")
 
-        logger.debug("Keepalive thread stopped")
+        logger.debug("Keepalive task stopped")
 
-    def _start_health_thread(self):
-        """Start health monitoring thread"""
-        if self._health_thread and self._health_thread.is_alive():
+    def _start_health_task(self):
+        """Start health monitoring task"""
+        if self._health_task and not self._health_task.done():
             return
 
-        self._health_thread = Thread(
-            target=self._health_loop,
-            daemon=True,
-            name="ConnectionManager-Health"
-        )
-        self._health_thread.start()
+        self._health_task = asyncio.create_task(self._health_loop())
 
-    def _health_loop(self):
-        """Background health monitoring loop"""
-        logger.debug("Health monitor thread started")
+    async def _health_loop(self):
+        """Background health monitoring coroutine"""
+        logger.debug("Health monitor task started")
 
         while not self._shutdown_event.is_set():
-            # Wait for interval
-            if self._shutdown_event.wait(self.config.health_check_interval):
+            # Wait for interval (interruptible by shutdown)
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=self.config.health_check_interval,
+                )
                 break  # Shutdown requested
+            except asyncio.TimeoutError:
+                pass
 
             if self.state != ConnectionState.CONNECTED:
                 continue
@@ -508,7 +507,7 @@ class ConnectionManager:
                 logger.warning("Health check: portfolio reports disconnected")
                 self._handle_disconnection()
 
-        logger.debug("Health monitor thread stopped")
+        logger.debug("Health monitor task stopped")
 
     def get_status(self) -> Dict[str, Any]:
         """

@@ -5,9 +5,10 @@ Tests Portfolio class properties, position management, streaming,
 and order handling. Uses mocks to avoid actual IB connections.
 """
 
+import asyncio
 import pytest
-from unittest.mock import MagicMock, patch, PropertyMock
-from threading import Event, Lock
+from unittest.mock import MagicMock, patch, PropertyMock, AsyncMock
+from threading import Lock
 from datetime import datetime
 
 
@@ -87,9 +88,9 @@ def portfolio_instance(mock_ibapi):
         # Initialize required attributes
         portfolio._positions = {}
         portfolio._positions_lock = Lock()
-        portfolio._positions_done = Event()
+        portfolio._positions_done = asyncio.Event()
         portfolio._market_data_requests = {}
-        portfolio._market_data_done = Event()
+        portfolio._market_data_done = asyncio.Event()
         portfolio._market_data_pending = 0
         portfolio._market_data_received = 0
         portfolio._streaming = False
@@ -105,12 +106,12 @@ def portfolio_instance(mock_ibapi):
         portfolio._on_bar = None
         portfolio._last_bars = {}
         portfolio._account_summary = {}
-        portfolio._account_summary_done = Event()
+        portfolio._account_summary_done = asyncio.Event()
         portfolio._orders = {}
         portfolio._orders_lock = Lock()
         portfolio._pending_orders = {}
         portfolio._on_order_status = None
-        portfolio._connected = Event()
+        portfolio._connected = asyncio.Event()
         portfolio._callbacks = {}
         portfolio.managed_accounts = ["DU123456"]
         portfolio._shutting_down = False
@@ -120,8 +121,8 @@ def portfolio_instance(mock_ibapi):
         portfolio._forex_rates = {}
         portfolio._forex_positions = {}
         portfolio._forex_cost_basis = {}
-        portfolio._account_updates_done = Event()
-        portfolio._executions_done = Event()
+        portfolio._account_updates_done = asyncio.Event()
+        portfolio._executions_done = asyncio.Event()
         portfolio._execution_db = None
 
         # Tick-by-tick and market depth
@@ -132,6 +133,12 @@ def portfolio_instance(mock_ibapi):
         portfolio._depth_req_ids = {}
         portfolio._depth_books = {}
         portfolio._on_depth = None
+
+        # P&L subscriptions
+        portfolio._pnl_req_id = None
+        portfolio._pnl_single_req_ids = {}
+        portfolio._pnl_single_symbols = {}
+        portfolio._on_pnl = None
 
         return portfolio
 
@@ -698,26 +705,28 @@ class TestEWrapperCallbacks:
 class TestQuickLoad:
     """Tests for quick_load convenience function"""
 
-    def test_quick_load_returns_empty_on_connect_fail(self, mock_ibapi):
+    async def test_quick_load_returns_empty_on_connect_fail(self, mock_ibapi):
         """Test quick_load returns empty list on connection failure"""
         with patch('portfolio.Portfolio') as MockPortfolio:
             instance = MockPortfolio.return_value
-            instance.connect.return_value = False
+            instance.connect = AsyncMock(return_value=False)
 
             from portfolio import quick_load
-            result = quick_load()
+            result = await quick_load()
 
             assert result == []
 
-    def test_quick_load_disconnects_after(self, mock_ibapi):
+    async def test_quick_load_disconnects_after(self, mock_ibapi):
         """Test quick_load disconnects after loading"""
         with patch('portfolio.Portfolio') as MockPortfolio:
             instance = MockPortfolio.return_value
-            instance.connect.return_value = True
+            instance.connect = AsyncMock(return_value=True)
+            instance.load = AsyncMock()
+            instance.disconnect = AsyncMock()
             instance.positions = []
 
             from portfolio import quick_load
-            quick_load()
+            await quick_load()
 
             instance.disconnect.assert_called_once()
 
@@ -729,15 +738,15 @@ class TestQuickLoad:
 class TestPortfolioLoad:
     """Tests for Portfolio.load() method"""
 
-    def test_load_not_connected(self, portfolio_instance):
+    async def test_load_not_connected(self, portfolio_instance):
         """Test load returns False when not connected"""
         portfolio_instance._connected.clear()
 
-        result = portfolio_instance.load()
+        result = await portfolio_instance.load()
 
         assert result is False
 
-    def test_load_clears_positions(self, portfolio_instance, mock_position):
+    async def test_load_clears_positions(self, portfolio_instance, mock_position):
         """Test load clears previous positions"""
         portfolio_instance._connected.set()
         portfolio_instance._positions = {"SPY": mock_position}
@@ -747,15 +756,15 @@ class TestPortfolioLoad:
         with patch.object(portfolio_instance, 'reqPositions'), \
              patch.object(portfolio_instance, 'reqAccountUpdates'), \
              patch.object(portfolio_instance, '_apply_forex_rates'), \
-             patch.object(portfolio_instance, '_fetch_market_data'), \
+             patch.object(portfolio_instance, '_fetch_market_data', new_callable=AsyncMock), \
              patch.object(portfolio_instance, '_calculate_allocations'), \
-             patch.object(portfolio_instance, '_fetch_account_summary'), \
-             patch.object(portfolio_instance, 'request_executions'):
-            portfolio_instance.load()
+             patch.object(portfolio_instance, '_fetch_account_summary', new_callable=AsyncMock), \
+             patch.object(portfolio_instance, 'request_executions', new_callable=AsyncMock):
+            await portfolio_instance.load()
 
         assert portfolio_instance._positions == {}
 
-    def test_load_requests_positions(self, portfolio_instance):
+    async def test_load_requests_positions(self, portfolio_instance):
         """Test load calls reqPositions"""
         portfolio_instance._connected.set()
         portfolio_instance._positions_done.set()
@@ -764,15 +773,15 @@ class TestPortfolioLoad:
         with patch.object(portfolio_instance, 'reqPositions') as mock_req, \
              patch.object(portfolio_instance, 'reqAccountUpdates'), \
              patch.object(portfolio_instance, '_apply_forex_rates'), \
-             patch.object(portfolio_instance, '_fetch_market_data'), \
+             patch.object(portfolio_instance, '_fetch_market_data', new_callable=AsyncMock), \
              patch.object(portfolio_instance, '_calculate_allocations'), \
-             patch.object(portfolio_instance, '_fetch_account_summary'), \
-             patch.object(portfolio_instance, 'request_executions'):
-            portfolio_instance.load()
+             patch.object(portfolio_instance, '_fetch_account_summary', new_callable=AsyncMock), \
+             patch.object(portfolio_instance, 'request_executions', new_callable=AsyncMock):
+            await portfolio_instance.load()
 
         mock_req.assert_called_once()
 
-    def test_load_fetches_prices_when_enabled(self, portfolio_instance, mock_position):
+    async def test_load_fetches_prices_when_enabled(self, portfolio_instance, mock_position):
         """Test load fetches prices when fetch_prices=True"""
         portfolio_instance._connected.set()
         portfolio_instance._account_updates_done.set()
@@ -785,15 +794,15 @@ class TestPortfolioLoad:
         with patch.object(portfolio_instance, 'reqPositions', side_effect=fake_req_positions), \
              patch.object(portfolio_instance, 'reqAccountUpdates'), \
              patch.object(portfolio_instance, '_apply_forex_rates'), \
-             patch.object(portfolio_instance, '_fetch_market_data') as mock_fetch, \
+             patch.object(portfolio_instance, '_fetch_market_data', new_callable=AsyncMock) as mock_fetch, \
              patch.object(portfolio_instance, '_calculate_allocations'), \
-             patch.object(portfolio_instance, '_fetch_account_summary'), \
-             patch.object(portfolio_instance, 'request_executions'):
-            portfolio_instance.load(fetch_prices=True)
+             patch.object(portfolio_instance, '_fetch_account_summary', new_callable=AsyncMock), \
+             patch.object(portfolio_instance, 'request_executions', new_callable=AsyncMock):
+            await portfolio_instance.load(fetch_prices=True)
 
         mock_fetch.assert_called_once()
 
-    def test_load_skips_prices_when_disabled(self, portfolio_instance):
+    async def test_load_skips_prices_when_disabled(self, portfolio_instance):
         """Test load skips price fetch when fetch_prices=False"""
         portfolio_instance._connected.set()
         portfolio_instance._positions_done.set()
@@ -802,15 +811,15 @@ class TestPortfolioLoad:
         with patch.object(portfolio_instance, 'reqPositions'), \
              patch.object(portfolio_instance, 'reqAccountUpdates'), \
              patch.object(portfolio_instance, '_apply_forex_rates'), \
-             patch.object(portfolio_instance, '_fetch_market_data') as mock_fetch, \
+             patch.object(portfolio_instance, '_fetch_market_data', new_callable=AsyncMock) as mock_fetch, \
              patch.object(portfolio_instance, '_calculate_allocations'), \
-             patch.object(portfolio_instance, '_fetch_account_summary'), \
-             patch.object(portfolio_instance, 'request_executions'):
-            portfolio_instance.load(fetch_prices=False)
+             patch.object(portfolio_instance, '_fetch_account_summary', new_callable=AsyncMock), \
+             patch.object(portfolio_instance, 'request_executions', new_callable=AsyncMock):
+            await portfolio_instance.load(fetch_prices=False)
 
         mock_fetch.assert_not_called()
 
-    def test_load_fetches_account_when_enabled(self, portfolio_instance):
+    async def test_load_fetches_account_when_enabled(self, portfolio_instance):
         """Test load fetches account when fetch_account=True"""
         portfolio_instance._connected.set()
         portfolio_instance._positions_done.set()
@@ -820,9 +829,9 @@ class TestPortfolioLoad:
              patch.object(portfolio_instance, 'reqAccountUpdates'), \
              patch.object(portfolio_instance, '_apply_forex_rates'), \
              patch.object(portfolio_instance, '_calculate_allocations'), \
-             patch.object(portfolio_instance, '_fetch_account_summary') as mock_fetch, \
-             patch.object(portfolio_instance, 'request_executions'):
-            portfolio_instance.load(fetch_prices=False, fetch_account=True)
+             patch.object(portfolio_instance, '_fetch_account_summary', new_callable=AsyncMock) as mock_fetch, \
+             patch.object(portfolio_instance, 'request_executions', new_callable=AsyncMock):
+            await portfolio_instance.load(fetch_prices=False, fetch_account=True)
 
         mock_fetch.assert_called_once()
 
@@ -1166,7 +1175,7 @@ class TestOrderCancellation:
 class TestWaitForOrder:
     """Tests for order wait methods"""
 
-    def test_wait_for_order_no_event(self, portfolio_instance):
+    async def test_wait_for_order_no_event(self, portfolio_instance):
         """Test wait_for_order returns order when no event"""
         from models import OrderRecord, OrderStatus
 
@@ -1174,39 +1183,34 @@ class TestWaitForOrder:
         portfolio_instance._orders = {100: order}
         portfolio_instance._pending_orders = {}
 
-        result = portfolio_instance.wait_for_order(100)
+        result = await portfolio_instance.wait_for_order(100)
 
         assert result is order
 
-    def test_wait_for_order_with_event(self, portfolio_instance):
+    async def test_wait_for_order_with_event(self, portfolio_instance):
         """Test wait_for_order waits for event"""
         from models import OrderRecord, OrderStatus
-        import threading
 
         order = OrderRecord(order_id=100, symbol="SPY", action="BUY", quantity=100)
-        event = Event()
+        event = asyncio.Event()
         portfolio_instance._orders = {100: order}
         portfolio_instance._pending_orders = {100: event}
 
-        # Set event after short delay
-        def set_event():
-            import time
-            time.sleep(0.05)
+        # Set event after short delay via a task
+        async def set_after_delay():
+            await asyncio.sleep(0.05)
             event.set()
 
-        thread = threading.Thread(target=set_event)
-        thread.start()
-
-        result = portfolio_instance.wait_for_order(100, timeout=1.0)
-        thread.join()
+        asyncio.create_task(set_after_delay())
+        result = await portfolio_instance.wait_for_order(100, timeout=1.0)
 
         assert result is order
 
-    def test_wait_for_all_orders_empty(self, portfolio_instance):
+    async def test_wait_for_all_orders_empty(self, portfolio_instance):
         """Test wait_for_all_orders returns True when no pending"""
         portfolio_instance._orders = {}
 
-        result = portfolio_instance.wait_for_all_orders(timeout=0.1)
+        result = await portfolio_instance.wait_for_all_orders(timeout=0.1)
 
         assert result is True
 
@@ -1464,7 +1468,7 @@ class TestOrderStatusCallback:
 
         order = OrderRecord(order_id=100, symbol="SPY", action="BUY", quantity=100)
         portfolio_instance._orders = {100: order}
-        portfolio_instance._pending_orders = {100: Event()}
+        portfolio_instance._pending_orders = {100: asyncio.Event()}
 
         portfolio_instance.orderStatus(100, "Filled", 100, 0, 450.0, 0, 0, 450.0, 1, "", 0.0)
 
@@ -1477,7 +1481,7 @@ class TestOrderStatusCallback:
         from models import OrderRecord, OrderStatus
 
         order = OrderRecord(order_id=100, symbol="SPY", action="BUY", quantity=100)
-        event = Event()
+        event = asyncio.Event()
         portfolio_instance._orders = {100: order}
         portfolio_instance._pending_orders = {100: event}
 
@@ -1575,3 +1579,82 @@ class TestToDataframe:
             # This test is tricky because pandas may be installed
             # Just verify the method exists and is callable
             assert hasattr(portfolio_instance, 'to_dataframe')
+
+
+# =============================================================================
+# P&L Callback Tests
+# =============================================================================
+
+class TestPnLCallbacks:
+    """Tests for real-time P&L EWrapper callbacks and subscription methods"""
+
+    def test_pnl_callback_fires(self, portfolio_instance):
+        """pnl() EWrapper callback builds PnLData and fires _on_pnl."""
+        from ib.models import PnLData
+
+        received = []
+        portfolio_instance._on_pnl = received.append
+        portfolio_instance.managed_accounts = ["DU123456"]
+
+        portfolio_instance.pnl(reqId=1, dailyPnL=100.0, unrealizedPnL=200.0, realizedPnL=50.0)
+
+        assert len(received) == 1
+        data = received[0]
+        assert isinstance(data, PnLData)
+        assert data.account == "DU123456"
+        assert data.daily_pnl == 100.0
+        assert data.unrealized_pnl == 200.0
+        assert data.realized_pnl == 50.0
+        assert data.symbol is None
+
+    def test_pnl_single_callback_fires(self, portfolio_instance):
+        """pnlSingle() EWrapper callback includes symbol from reqId mapping."""
+        from ib.models import PnLData
+
+        received = []
+        portfolio_instance._on_pnl = received.append
+        portfolio_instance.managed_accounts = ["DU123456"]
+        portfolio_instance._pnl_single_req_ids = {42: "SPY"}
+
+        portfolio_instance.pnlSingle(
+            reqId=42,
+            pos=100,
+            dailyPnL=10.0,
+            unrealizedPnL=500.0,
+            realizedPnL=0.0,
+            value=45000.0,
+        )
+
+        assert len(received) == 1
+        data = received[0]
+        assert isinstance(data, PnLData)
+        assert data.symbol == "SPY"
+        assert data.position == 100
+        assert data.value == 45000.0
+        assert data.daily_pnl == 10.0
+
+    def test_request_pnl_calls_api(self, portfolio_instance):
+        """request_pnl() stores reqId and calls self.reqPnL."""
+        portfolio_instance.reqPnL = MagicMock()
+        portfolio_instance.get_next_req_id = MagicMock(return_value=7)
+
+        req_id = portfolio_instance.request_pnl("DU123456")
+
+        assert req_id == 7
+        assert portfolio_instance._pnl_req_id == 7
+        portfolio_instance.reqPnL.assert_called_once_with(7, "DU123456", "")
+
+    def test_cancel_pnl(self, portfolio_instance):
+        """cancel_pnl() calls cancelPnL and clears _pnl_req_id."""
+        portfolio_instance.cancelPnL = MagicMock()
+        portfolio_instance._pnl_req_id = 7
+
+        portfolio_instance.cancel_pnl()
+
+        portfolio_instance.cancelPnL.assert_called_once_with(7)
+        assert portfolio_instance._pnl_req_id is None
+
+    def test_pnl_no_callback_no_error(self, portfolio_instance):
+        """pnl() with no _on_pnl set should not raise."""
+        portfolio_instance._on_pnl = None
+        portfolio_instance.pnl(reqId=1, dailyPnL=0.0, unrealizedPnL=0.0, realizedPnL=0.0)

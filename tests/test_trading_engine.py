@@ -2,11 +2,11 @@
 Tests for trading_engine.py - Unified trading engine
 """
 
+import asyncio
 import pytest
 import time
-import threading
 from datetime import datetime
-from unittest.mock import Mock, MagicMock, patch, PropertyMock
+from unittest.mock import Mock, MagicMock, patch, PropertyMock, AsyncMock
 
 from ibapi.contract import Contract
 
@@ -168,40 +168,40 @@ class TestSubscription:
 class TestStartStop:
     """Tests for starting and stopping the engine"""
 
-    def test_start_when_stopped(self, engine):
+    async def test_start_when_stopped(self, engine):
         """Test starting engine when stopped"""
-        engine._connection_manager.start = Mock(return_value=True)
+        engine._connection_manager.start = AsyncMock(return_value=True)
 
-        result = engine.start()
+        result = await engine.start()
 
         assert result is True
         assert engine.state == EngineState.RUNNING
 
-    def test_start_when_not_stopped(self, engine):
+    async def test_start_when_not_stopped(self, engine):
         """Test start fails when not in stopped state"""
         engine._state = EngineState.RUNNING
 
-        result = engine.start()
+        result = await engine.start()
 
         assert result is False
 
-    def test_start_connection_fails_no_auto_reconnect(self):
+    async def test_start_connection_fails_no_auto_reconnect(self):
         """Test start when connection fails and no auto-reconnect"""
         with patch('trading_engine.Portfolio'):
             config = EngineConfig(auto_reconnect=False)
             engine = TradingEngine(config)
-            engine._connection_manager.start = Mock(return_value=False)
+            engine._connection_manager.start = AsyncMock(return_value=False)
 
-            result = engine.start()
+            result = await engine.start()
 
             assert result is False
             assert engine.state == EngineState.ERROR
 
-    def test_start_registers_pending_plugins(self):
+    async def test_start_registers_pending_plugins(self):
         """Test that pending plugins are registered on start"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
-            engine._connection_manager.start = Mock(return_value=True)
+            engine._connection_manager.start = AsyncMock(return_value=True)
             engine._plugin_executive = Mock()
             engine._data_feed = Mock()
 
@@ -212,54 +212,60 @@ class TestStartStop:
             engine._message_bus = None
             engine.add_plugin(plugin)
 
-            engine.start()
+            await engine.start()
 
             # Pending plugins should be cleared
             assert len(engine._pending_plugins) == 0
             # Plugin should be registered with plugin executive
             engine._plugin_executive.register_plugin.assert_called_once()
 
-    def test_start_callback_invoked(self, engine):
+    async def test_start_callback_invoked(self, engine):
         """Test on_started callback is invoked"""
-        engine._connection_manager.start = Mock(return_value=True)
+        engine._connection_manager.start = AsyncMock(return_value=True)
 
         started = []
         engine.on_started = lambda: started.append(True)
 
-        engine.start()
+        await engine.start()
 
         assert len(started) == 1
 
-    def test_stop(self):
+    async def test_stop(self):
         """Test stopping the engine"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
             engine._state = EngineState.RUNNING
             engine._plugin_executive = Mock()
+            engine._plugin_executive.stop = AsyncMock()
             engine._data_feed = Mock()
             engine._connection_manager = Mock()
+            engine._connection_manager.stop = AsyncMock()
 
-            engine.stop()
+            await engine.stop()
 
             assert engine.state == EngineState.STOPPED
             engine._plugin_executive.stop.assert_called_once()
             engine._data_feed.stop.assert_called_once()
             engine._connection_manager.stop.assert_called_once()
 
-    def test_stop_when_already_stopped(self, engine):
+    async def test_stop_when_already_stopped(self, engine):
         """Test stop when already stopped does nothing"""
         engine._state = EngineState.STOPPED
 
-        engine.stop()  # Should not raise
+        await engine.stop()  # Should not raise
 
-    def test_stop_callback_invoked(self, engine):
+    async def test_stop_callback_invoked(self, engine):
         """Test on_stopped callback is invoked"""
         engine._state = EngineState.RUNNING
+        engine._plugin_executive = Mock()
+        engine._plugin_executive.stop = AsyncMock()
+        engine._connection_manager.stop = AsyncMock()
+        engine._data_feed = Mock()
 
         stopped = []
         engine.on_stopped = lambda: stopped.append(True)
 
-        engine.stop()
+        await engine.stop()
 
         assert len(stopped) == 1
 
@@ -429,7 +435,7 @@ class TestDataAccess:
 class TestOnConnected:
     """Tests for connection handling"""
 
-    def test_on_connected_loads_portfolio(self):
+    async def test_on_connected_loads_portfolio(self):
         """Test portfolio is loaded on connection"""
         with patch('trading_engine.Portfolio'):
             config = EngineConfig(
@@ -437,15 +443,17 @@ class TestOnConnected:
                 fetch_prices_on_start=True,
             )
             engine = TradingEngine(config)
+            engine._portfolio.load = AsyncMock()
 
             engine._on_connected()
+            await asyncio.sleep(0)  # let the task run
 
             engine._portfolio.load.assert_called_with(
                 fetch_prices=True,
                 fetch_account=True,
             )
 
-    def test_on_connected_starts_data_feed(self):
+    async def test_on_connected_starts_data_feed(self):
         """Test data feed is started on connection"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
@@ -453,12 +461,15 @@ class TestOnConnected:
             engine._data_feed.is_running = False
             engine._plugin_executive = Mock()
             engine._plugin_executive.is_running = False
+            engine._plugin_executive.start = AsyncMock()
+            engine._portfolio.load = AsyncMock()
 
             engine._on_connected()
+            await asyncio.sleep(0)  # let the task run
 
             engine._data_feed.start.assert_called_once()
 
-    def test_on_connected_starts_plugin_executive(self):
+    async def test_on_connected_starts_plugin_executive(self):
         """Test plugin executive is started on connection"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
@@ -466,8 +477,11 @@ class TestOnConnected:
             engine._data_feed.is_running = False
             engine._plugin_executive = Mock()
             engine._plugin_executive.is_running = False
+            engine._plugin_executive.start = AsyncMock()
+            engine._portfolio.load = AsyncMock()
 
             engine._on_connected()
+            await asyncio.sleep(0)  # let the task run
 
             engine._plugin_executive.start.assert_called_once()
 
@@ -516,41 +530,33 @@ class TestCreateEngine:
 class TestRunForever:
     """Tests for run_forever functionality"""
 
-    def test_run_forever_blocks_until_shutdown(self):
+    async def test_run_forever_blocks_until_shutdown(self):
         """Test run_forever blocks until shutdown event"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
 
-            # Start a thread to stop the engine
-            def stop_after_delay():
-                time.sleep(0.1)
+            async def stop_after_delay():
+                await asyncio.sleep(0.05)
                 engine._shutdown_event.set()
 
-            stop_thread = threading.Thread(target=stop_after_delay)
-            stop_thread.start()
+            asyncio.create_task(stop_after_delay())
 
             # This should return when shutdown event is set
-            engine.run_forever(handle_signals=False)
+            await engine.run_forever(handle_signals=False)
 
-            stop_thread.join()
-
-    def test_run_forever_signal_handler(self):
-        """Test signal handler requires multiple signals"""
+    async def test_run_forever_signal_handler(self):
+        """Test signal handler can be installed (signals patched)"""
         with patch('trading_engine.Portfolio'):
             with patch('signal.signal'):
                 engine = TradingEngine()
 
-                # Set up the signal handler
-                def stop_engine():
-                    time.sleep(0.1)
+                async def stop_after_delay():
+                    await asyncio.sleep(0.05)
                     engine._shutdown_event.set()
 
-                stop_thread = threading.Thread(target=stop_engine)
-                stop_thread.start()
+                asyncio.create_task(stop_after_delay())
 
-                engine.run_forever(handle_signals=True, required_signals=3)
-
-                stop_thread.join()
+                await engine.run_forever(handle_signals=True, required_signals=3)
 
 
 class TestErrorHandling:

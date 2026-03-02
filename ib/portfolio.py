@@ -5,8 +5,8 @@ Handles downloading positions, market data, and account information
 from Interactive Brokers. Supports both snapshot and streaming market data.
 """
 
+import asyncio
 import logging
-from threading import Event, Lock
 from typing import Dict, List, Optional, Callable
 from datetime import datetime
 
@@ -26,6 +26,7 @@ from .models import (
     OrderRecord,
     OrderStatus,
     CommissionAndFeesReport,
+    PnLData,
 )
 from .execution_db import (
     ExecutionDatabase,
@@ -108,12 +109,11 @@ class Portfolio(IBClient):
 
         # Position storage
         self._positions: Dict[str, Position] = {}
-        self._positions_lock = Lock()
-        self._positions_done = Event()
+        self._positions_done = asyncio.Event()
 
         # Market data tracking (for snapshots)
         self._market_data_requests: Dict[int, str] = {}  # reqId -> symbol
-        self._market_data_done = Event()
+        self._market_data_done = asyncio.Event()
         self._market_data_pending = 0
         self._market_data_received = 0
 
@@ -139,7 +139,7 @@ class Portfolio(IBClient):
 
         # Account data
         self._account_summary: Dict[str, AccountSummary] = {}
-        self._account_summary_done = Event()
+        self._account_summary_done = asyncio.Event()
 
         # Forex cash balances (for synthetic forex positions from short sales)
         # When you sell EUR.USD, you get negative EUR cash balance instead of a position
@@ -147,10 +147,10 @@ class Portfolio(IBClient):
         self._forex_rates: Dict[str, float] = {}  # currency -> exchange rate to USD
         self._forex_positions: Dict[str, Position] = {}  # symbol -> synthetic forex position
         self._forex_cost_basis: Dict[str, float] = {}  # currency -> original cost basis (persisted)
-        self._account_updates_done = Event()
+        self._account_updates_done = asyncio.Event()
 
         # Execution tracking
-        self._executions_done = Event()
+        self._executions_done = asyncio.Event()
         self._execution_db: Optional[ExecutionDatabase] = None
 
         # Load persisted forex cost basis
@@ -158,8 +158,7 @@ class Portfolio(IBClient):
 
         # Order tracking
         self._orders: Dict[int, OrderRecord] = {}  # orderId -> OrderRecord
-        self._orders_lock = Lock()
-        self._pending_orders: Dict[int, Event] = {}  # orderId -> completion event
+        self._pending_orders: Dict[int, asyncio.Event] = {}  # orderId -> completion event
         self._on_order_status: Optional[Callable[[OrderRecord], None]] = None
 
         # Commission tracking - maps exec_id to commission report
@@ -177,14 +176,19 @@ class Portfolio(IBClient):
         self._depth_books: Dict[str, dict] = {}          # symbol -> {"bids": {pos: level}, "asks": {pos: level}}
         self._on_depth: Optional[Callable] = None
 
+        # P&L subscriptions
+        self._pnl_req_id: Optional[int] = None                  # account-level reqId
+        self._pnl_single_req_ids: Dict[int, str] = {}           # reqId -> symbol
+        self._pnl_single_symbols: Dict[str, int] = {}           # symbol -> reqId
+        self._on_pnl: Optional[Callable] = None                 # fires for both account + single
+
     @property
     def positions(self) -> List[Position]:
         """Get list of all positions including synthetic forex positions"""
-        with self._positions_lock:
-            # Combine regular positions with synthetic forex positions
-            all_positions = list(self._positions.values())
-            all_positions.extend(self._forex_positions.values())
-            return all_positions
+        # Combine regular positions with synthetic forex positions
+        all_positions = list(self._positions.values())
+        all_positions.extend(self._forex_positions.values())
+        return all_positions
 
     @property
     def total_value(self) -> float:
@@ -218,13 +222,12 @@ class Portfolio(IBClient):
 
     def get_position(self, symbol: str) -> Optional[Position]:
         """Get a specific position by symbol (including synthetic forex positions)"""
-        with self._positions_lock:
-            # Check regular positions first
-            pos = self._positions.get(symbol)
-            if pos:
-                return pos
-            # Then check synthetic forex positions
-            return self._forex_positions.get(symbol)
+        # Check regular positions first
+        pos = self._positions.get(symbol)
+        if pos:
+            return pos
+        # Then check synthetic forex positions
+        return self._forex_positions.get(symbol)
 
     def get_last_price(self, symbol: str, tick_type: str = "LAST") -> Optional[float]:
         """
@@ -268,6 +271,126 @@ class Portfolio(IBClient):
         if account is None and self.managed_accounts:
             account = self.managed_accounts[0]
         return self._account_summary.get(account)
+
+    # =========================================================================
+    # P&L Subscriptions
+    # =========================================================================
+
+    def request_pnl(self, account: str, model_code: str = "") -> int:
+        """
+        Subscribe to account-level P&L updates via IB's reqPnL.
+
+        Args:
+            account: IB account ID
+            model_code: Model code for FA accounts (empty string for single account)
+
+        Returns:
+            Request ID used for this subscription
+        """
+        req_id = self.get_next_req_id()
+        self._pnl_req_id = req_id
+        self.reqPnL(req_id, account, model_code)
+        logger.debug(f"Requested P&L for account {account} (reqId={req_id})")
+        return req_id
+
+    def cancel_pnl(self) -> None:
+        """Cancel the account-level P&L subscription."""
+        if self._pnl_req_id is not None:
+            self.cancelPnL(self._pnl_req_id)
+            logger.debug(f"Cancelled P&L subscription (reqId={self._pnl_req_id})")
+            self._pnl_req_id = None
+
+    def request_pnl_single(
+        self, account: str, symbol: str, model_code: str = ""
+    ) -> int:
+        """
+        Subscribe to per-position P&L updates via IB's reqPnLSingle.
+
+        Looks up the contract's conId from current positions.
+
+        Args:
+            account: IB account ID
+            symbol: Symbol to subscribe to
+            model_code: Model code for FA accounts
+
+        Returns:
+            Request ID used for this subscription
+        """
+        con_id = 0
+        pos = self._positions.get(symbol)
+        if pos and pos.contract:
+            con_id = pos.contract.conId
+
+        req_id = self.get_next_req_id()
+        self._pnl_single_req_ids[req_id] = symbol
+        self._pnl_single_symbols[symbol] = req_id
+        self.reqPnLSingle(req_id, account, model_code, con_id)
+        logger.debug(
+            f"Requested single P&L for {symbol} conId={con_id} (reqId={req_id})"
+        )
+        return req_id
+
+    def cancel_pnl_single(self, symbol: str) -> None:
+        """
+        Cancel a per-position P&L subscription.
+
+        Args:
+            symbol: Symbol to cancel subscription for
+        """
+        req_id = self._pnl_single_symbols.get(symbol)
+        if req_id is not None:
+            self.cancelPnLSingle(req_id)
+            logger.debug(f"Cancelled single P&L for {symbol} (reqId={req_id})")
+            del self._pnl_single_req_ids[req_id]
+            del self._pnl_single_symbols[symbol]
+
+    # =========================================================================
+    # P&L EWrapper Callbacks
+    # =========================================================================
+
+    def pnl(self, reqId: int, dailyPnL: float, unrealizedPnL: float, realizedPnL: float):
+        """Called by IB for account-level P&L updates (reqPnL)."""
+        account = self.managed_accounts[0] if self.managed_accounts else ""
+        pnl_data = PnLData(
+            account=account,
+            daily_pnl=dailyPnL,
+            unrealized_pnl=unrealizedPnL,
+            realized_pnl=realizedPnL,
+        )
+        logger.debug(
+            f"Account P&L: daily={dailyPnL:.2f} unrealized={unrealizedPnL:.2f} "
+            f"realized={realizedPnL:.2f}"
+        )
+        if self._on_pnl:
+            self._on_pnl(pnl_data)
+
+    def pnlSingle(
+        self,
+        reqId: int,
+        pos: int,
+        dailyPnL: float,
+        unrealizedPnL: float,
+        realizedPnL: float,
+        value: float,
+    ):
+        """Called by IB for per-position P&L updates (reqPnLSingle)."""
+        symbol = self._pnl_single_req_ids.get(reqId, "")
+        account = self.managed_accounts[0] if self.managed_accounts else ""
+        pnl_data = PnLData(
+            account=account,
+            daily_pnl=dailyPnL,
+            unrealized_pnl=unrealizedPnL,
+            realized_pnl=realizedPnL,
+            symbol=symbol,
+            position=pos,
+            value=value,
+        )
+        logger.debug(
+            f"Single P&L {symbol}: pos={pos} daily={dailyPnL:.2f} "
+            f"unrealized={unrealizedPnL:.2f} value={value:.2f}"
+        )
+        if self._on_pnl:
+            self._on_pnl(pnl_data)
 
     def shutdown(self):
         """
@@ -324,6 +447,21 @@ class Portfolio(IBClient):
         self._market_data_requests.clear()
         self._market_data_done.set()
 
+        # Cancel P&L subscriptions
+        if self._pnl_req_id is not None:
+            try:
+                self.cancelPnL(self._pnl_req_id)
+            except Exception:
+                pass
+            self._pnl_req_id = None
+        for req_id in list(self._pnl_single_req_ids):
+            try:
+                self.cancelPnLSingle(req_id)
+            except Exception:
+                pass
+        self._pnl_single_req_ids.clear()
+        self._pnl_single_symbols.clear()
+
         # Signal any waiting operations to complete
         self._positions_done.set()
         self._account_summary_done.set()
@@ -334,7 +472,7 @@ class Portfolio(IBClient):
 
         logger.info("Portfolio shutdown complete")
 
-    def load(
+    async def load(
         self,
         fetch_prices: bool = True,
         fetch_account: bool = True,
@@ -358,11 +496,10 @@ class Portfolio(IBClient):
             return False
 
         # Clear previous data
-        with self._positions_lock:
-            self._positions.clear()
-            self._forex_positions.clear()
-            self._forex_cash.clear()
-            self._forex_rates.clear()
+        self._positions.clear()
+        self._forex_positions.clear()
+        self._forex_cash.clear()
+        self._forex_rates.clear()
         self._positions_done.clear()
         self._account_updates_done.clear()
 
@@ -371,7 +508,9 @@ class Portfolio(IBClient):
         self.reqPositions()
 
         # Wait for positions
-        if not self._positions_done.wait(timeout=timeout):
+        try:
+            await asyncio.wait_for(self._positions_done.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
             logger.warning("Timeout waiting for positions")
 
         logger.info(f"Loaded {len(self._positions)} positions from reqPositions")
@@ -382,7 +521,9 @@ class Portfolio(IBClient):
         self.reqAccountUpdates(True, "")  # Empty string for all accounts
 
         # Wait for account updates
-        if not self._account_updates_done.wait(timeout=timeout):
+        try:
+            await asyncio.wait_for(self._account_updates_done.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
             logger.warning("Timeout waiting for account updates")
 
         # Cancel subscription after initial load
@@ -397,7 +538,7 @@ class Portfolio(IBClient):
         # Fetch market prices
         if fetch_prices and self._positions:
             logger.info("Fetching market prices...")
-            self._fetch_market_data(timeout=timeout)
+            await self._fetch_market_data(timeout=timeout)
 
         # Calculate allocations
         self._calculate_allocations()
@@ -405,12 +546,12 @@ class Portfolio(IBClient):
         # Fetch account summary
         if fetch_account:
             logger.info("Fetching account summary...")
-            self._fetch_account_summary(timeout=timeout)
+            await self._fetch_account_summary(timeout=timeout)
 
         # Fetch today's executions to populate database
         if fetch_executions:
             logger.info("Fetching today's executions...")
-            self.request_executions(timeout=timeout)
+            await self.request_executions(timeout=timeout)
 
         return True
 
@@ -867,19 +1008,16 @@ class Portfolio(IBClient):
     @property
     def orders(self) -> List[OrderRecord]:
         """Get list of all tracked orders"""
-        with self._orders_lock:
-            return list(self._orders.values())
+        return list(self._orders.values())
 
     @property
     def pending_orders(self) -> List[OrderRecord]:
         """Get list of pending (non-complete) orders"""
-        with self._orders_lock:
-            return [o for o in self._orders.values() if not o.is_complete]
+        return [o for o in self._orders.values() if not o.is_complete]
 
     def get_order(self, order_id: int) -> Optional[OrderRecord]:
         """Get an order by ID"""
-        with self._orders_lock:
-            return self._orders.get(order_id)
+        return self._orders.get(order_id)
 
     def place_order(
         self,
@@ -915,9 +1053,8 @@ class Portfolio(IBClient):
             return None
 
         # Get next order ID
-        with self._lock:
-            order_id = self._next_order_id
-            self._next_order_id += 1
+        order_id = self._next_order_id
+        self._next_order_id += 1
 
         # Create order object
         order = Order()
@@ -942,11 +1079,10 @@ class Portfolio(IBClient):
         )
 
         # Set up completion event
-        completion_event = Event()
+        completion_event = asyncio.Event()
 
-        with self._orders_lock:
-            self._orders[order_id] = order_record
-            self._pending_orders[order_id] = completion_event
+        self._orders[order_id] = order_record
+        self._pending_orders[order_id] = completion_event
 
         # Submit order
         try:
@@ -955,10 +1091,9 @@ class Portfolio(IBClient):
             return order_id
         except Exception as e:
             logger.error(f"Error placing order: {e}")
-            with self._orders_lock:
-                order_record.status = OrderStatus.ERROR
-                order_record.error_message = str(e)
-                completion_event.set()
+            order_record.status = OrderStatus.ERROR
+            order_record.error_message = str(e)
+            completion_event.set()
             return None
 
     def place_market_order(
@@ -1018,9 +1153,8 @@ class Portfolio(IBClient):
         """
         if self._next_order_id is None:
             return []
-        with self._lock:
-            start_id = self._next_order_id
-            self._next_order_id += count
+        start_id = self._next_order_id
+        self._next_order_id += count
         return list(range(start_id, start_id + count))
 
     def place_order_raw(self, order_id: int, contract: Contract, order: Order) -> bool:
@@ -1050,10 +1184,9 @@ class Portfolio(IBClient):
             order_type=order.orderType,
             submitted_time=datetime.now().isoformat(),
         )
-        completion_event = Event()
-        with self._orders_lock:
-            self._orders[order_id] = record
-            self._pending_orders[order_id] = completion_event
+        completion_event = asyncio.Event()
+        self._orders[order_id] = record
+        self._pending_orders[order_id] = completion_event
 
         try:
             self.placeOrder(order_id, contract, order)
@@ -1064,10 +1197,9 @@ class Portfolio(IBClient):
             return True
         except Exception as e:
             logger.error(f"Error placing order {order_id}: {e}")
-            with self._orders_lock:
-                record.status = OrderStatus.ERROR
-                record.error_message = str(e)
-                completion_event.set()
+            record.status = OrderStatus.ERROR
+            record.error_message = str(e)
+            completion_event.set()
             return False
 
     def place_order_custom(self, contract: Contract, order: Order) -> Optional[int]:
@@ -1092,7 +1224,7 @@ class Portfolio(IBClient):
         order.orderId = order_id
         return order_id if self.place_order_raw(order_id, contract, order) else None
 
-    def wait_for_order(self, order_id: int, timeout: float = 30.0) -> Optional[OrderRecord]:
+    async def wait_for_order(self, order_id: int, timeout: float = 30.0) -> Optional[OrderRecord]:
         """
         Wait for an order to complete (fill, cancel, or error).
 
@@ -1107,13 +1239,13 @@ class Portfolio(IBClient):
         if not event:
             return self.get_order(order_id)
 
-        if event.wait(timeout=timeout):
-            return self.get_order(order_id)
-        else:
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
             logger.warning(f"Timeout waiting for order {order_id}")
-            return self.get_order(order_id)
+        return self.get_order(order_id)
 
-    def wait_for_all_orders(self, timeout: float = 60.0) -> bool:
+    async def wait_for_all_orders(self, timeout: float = 60.0) -> bool:
         """
         Wait for all pending orders to complete.
 
@@ -1134,11 +1266,9 @@ class Portfolio(IBClient):
                 logger.warning(f"Timeout waiting for {len(pending)} orders")
                 return False
 
-            # Wait a bit before checking again
-            import time
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
 
-    def request_executions(self, timeout: float = 10.0) -> bool:
+    async def request_executions(self, timeout: float = 10.0) -> bool:
         """
         Request today's executions from IB.
 
@@ -1167,7 +1297,9 @@ class Portfolio(IBClient):
         logger.info("Requesting today's executions...")
         self.reqExecutions(req_id, exec_filter)
 
-        if not self._executions_done.wait(timeout=timeout):
+        try:
+            await asyncio.wait_for(self._executions_done.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
             logger.warning("Timeout waiting for executions")
             return False
 
@@ -1175,7 +1307,7 @@ class Portfolio(IBClient):
         logger.info(f"Executions stored: {db.get_execution_count()} total in database")
         return True
 
-    def _fetch_market_data(self, timeout: float = 30.0):
+    async def _fetch_market_data(self, timeout: float = 30.0):
         """Fetch market data for all positions"""
         self._market_data_requests.clear()
         self._market_data_done.clear()
@@ -1190,16 +1322,22 @@ class Portfolio(IBClient):
                 self.reqMarketDataType(3)
                 self.reqMktData(req_id, pos.contract, "", True, False, [])
 
-        self._market_data_done.wait(timeout=timeout)
+        try:
+            await asyncio.wait_for(self._market_data_done.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Timeout waiting for market data")
 
-    def _fetch_account_summary(self, timeout: float = 10.0):
+    async def _fetch_account_summary(self, timeout: float = 10.0):
         """Fetch account summary"""
         self._account_summary_done.clear()
 
         req_id = self.get_next_req_id()
         self.reqAccountSummary(req_id, "All", AccountSummaryTags.AllTags)
 
-        self._account_summary_done.wait(timeout=timeout)
+        try:
+            await asyncio.wait_for(self._account_summary_done.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Timeout waiting for account summary")
         self.cancelAccountSummary(req_id)
 
     def _calculate_allocations(self):
@@ -1264,8 +1402,7 @@ class Portfolio(IBClient):
             account=account,
         )
 
-        with self._positions_lock:
-            self._positions[symbol] = position
+        self._positions[symbol] = position
 
         logger.debug(f"Position: {symbol} {pos} @ ${avgCost:.2f}")
 
@@ -1306,10 +1443,9 @@ class Portfolio(IBClient):
         if tickType in valid_types and price > 0:
             symbol = self._market_data_requests[reqId]
 
-            with self._positions_lock:
-                if symbol in self._positions:
-                    self._positions[symbol].update_market_data(price)
-                    logger.debug(f"Price update: {symbol} = ${price:.2f}")
+            if symbol in self._positions:
+                self._positions[symbol].update_market_data(price)
+                logger.debug(f"Price update: {symbol} = ${price:.2f}")
 
             # Cancel subscription after receiving price
             self.cancelMktData(reqId)
@@ -1342,10 +1478,9 @@ class Portfolio(IBClient):
 
         # Update position with LAST price
         if tickType in (TickTypeEnum.LAST, TickTypeEnum.DELAYED_LAST):
-            with self._positions_lock:
-                if symbol in self._positions:
-                    self._positions[symbol].update_market_data(price)
-                    self._calculate_allocations()
+            if symbol in self._positions:
+                self._positions[symbol].update_market_data(price)
+                self._calculate_allocations()
 
         # Call the callback if registered
         if self._on_tick:
@@ -1439,10 +1574,9 @@ class Portfolio(IBClient):
         self._last_bars[symbol] = bar
 
         # Update position with close price
-        with self._positions_lock:
-            if symbol in self._positions:
-                self._positions[symbol].update_market_data(close)
-                self._calculate_allocations()
+        if symbol in self._positions:
+            self._positions[symbol].update_market_data(close)
+            self._calculate_allocations()
 
         # Call the callback if registered
         if self._on_bar:
@@ -1690,15 +1824,14 @@ class Portfolio(IBClient):
         # Build the symbol pattern to look for (e.g., "GBP.USD" for currency "GBP")
         symbol = f"{currency}.USD"
 
-        with self._positions_lock:
-            # Check if we have a position with this symbol
-            if symbol in self._positions:
-                pos = self._positions[symbol]
-                if pos.asset_type == AssetType.FOREX:
-                    pos.current_price = rate
-                    pos.market_value = pos.quantity * rate
-                    pos.unrealized_pnl = pos.market_value - (pos.quantity * pos.avg_cost)
-                    logger.debug(f"Updated forex price: {symbol} rate={rate} value={pos.market_value}")
+        # Check if we have a position with this symbol
+        if symbol in self._positions:
+            pos = self._positions[symbol]
+            if pos.asset_type == AssetType.FOREX:
+                pos.current_price = rate
+                pos.market_value = pos.quantity * rate
+                pos.unrealized_pnl = pos.market_value - (pos.quantity * pos.avg_cost)
+                logger.debug(f"Updated forex price: {symbol} rate={rate} value={pos.market_value}")
 
     def _apply_forex_rates(self):
         """
@@ -1706,17 +1839,16 @@ class Portfolio(IBClient):
 
         Called after loading to ensure forex positions have correct prices.
         """
-        with self._positions_lock:
-            for symbol, pos in self._positions.items():
-                if pos.asset_type == AssetType.FOREX:
-                    # Extract currency from symbol (e.g., "GBP" from "GBP.USD")
-                    currency = symbol.split(".")[0] if "." in symbol else symbol
-                    rate = self._forex_rates.get(currency)
-                    if rate:
-                        pos.current_price = rate
-                        pos.market_value = pos.quantity * rate
-                        pos.unrealized_pnl = pos.market_value - (pos.quantity * pos.avg_cost)
-                        logger.info(f"Applied forex rate to {symbol}: rate={rate} value={pos.market_value}")
+        for symbol, pos in self._positions.items():
+            if pos.asset_type == AssetType.FOREX:
+                # Extract currency from symbol (e.g., "GBP" from "GBP.USD")
+                currency = symbol.split(".")[0] if "." in symbol else symbol
+                rate = self._forex_rates.get(currency)
+                if rate:
+                    pos.current_price = rate
+                    pos.market_value = pos.quantity * rate
+                    pos.unrealized_pnl = pos.market_value - (pos.quantity * pos.avg_cost)
+                    logger.info(f"Applied forex rate to {symbol}: rate={rate} value={pos.market_value}")
 
     def _load_forex_cost_basis(self):
         """Load persisted forex cost basis from file."""
@@ -1756,62 +1888,61 @@ class Portfolio(IBClient):
         Note: We skip currencies that already have positions from reqPositions()
         to avoid duplicates (e.g., buying GBP.USD creates both a position AND a cash balance).
         """
-        with self._positions_lock:
-            for currency, cash_balance in self._forex_cash.items():
-                # Skip USD - that's not a forex position
-                if currency == "USD":
-                    continue
+        for currency, cash_balance in self._forex_cash.items():
+            # Skip USD - that's not a forex position
+            if currency == "USD":
+                continue
 
-                # Skip zero balances - remove any existing synthetic position
-                if cash_balance == 0:
-                    symbol = f"{currency}.USD"
-                    self._forex_positions.pop(symbol, None)
-                    continue
-
-                # Construct symbol as CURRENCY.USD (e.g., EUR.USD)
+            # Skip zero balances - remove any existing synthetic position
+            if cash_balance == 0:
                 symbol = f"{currency}.USD"
+                self._forex_positions.pop(symbol, None)
+                continue
 
-                # Skip if we already have this position from reqPositions()
-                # This avoids duplicates when buying forex (creates both position and cash balance)
-                if symbol in self._positions:
-                    continue
+            # Construct symbol as CURRENCY.USD (e.g., EUR.USD)
+            symbol = f"{currency}.USD"
 
-                # Get exchange rate (default to 1 if not available)
-                rate = self._forex_rates.get(currency, 1.0)
+            # Skip if we already have this position from reqPositions()
+            # This avoids duplicates when buying forex (creates both position and cash balance)
+            if symbol in self._positions:
+                continue
 
-                # Get cost basis - use persisted value if available, else current rate
-                cost_basis = self._forex_cost_basis.get(currency, rate)
+            # Get exchange rate (default to 1 if not available)
+            rate = self._forex_rates.get(currency, 1.0)
 
-                # Check if we already have this synthetic position
-                existing = self._forex_positions.get(symbol)
-                if existing:
-                    # Update existing position with new rate, preserve cost basis
-                    existing.quantity = cash_balance
-                    existing.current_price = rate
-                    existing.market_value = cash_balance * rate
-                    # P&L: for short (negative qty), profit when rate drops
-                    existing.unrealized_pnl = (rate - existing.avg_cost) * cash_balance
-                    logger.debug(f"Updated synthetic forex: {symbol} qty={cash_balance} rate={rate} pnl={existing.unrealized_pnl:.2f}")
-                else:
-                    # Create new synthetic position
-                    # For a short EUR position (negative cash), quantity is negative
-                    position = Position(
-                        symbol=symbol,
-                        asset_type=AssetType.FOREX,
-                        quantity=cash_balance,
-                        avg_cost=cost_basis,  # Use persisted cost basis or current rate
-                        current_price=rate,
-                        market_value=cash_balance * rate,
-                        unrealized_pnl=(rate - cost_basis) * cash_balance,
-                    )
-                    self._forex_positions[symbol] = position
+            # Get cost basis - use persisted value if available, else current rate
+            cost_basis = self._forex_cost_basis.get(currency, rate)
 
-                    # Persist cost basis if this is a new position
-                    if currency not in self._forex_cost_basis:
-                        self._forex_cost_basis[currency] = rate
-                        self._save_forex_cost_basis()
+            # Check if we already have this synthetic position
+            existing = self._forex_positions.get(symbol)
+            if existing:
+                # Update existing position with new rate, preserve cost basis
+                existing.quantity = cash_balance
+                existing.current_price = rate
+                existing.market_value = cash_balance * rate
+                # P&L: for short (negative qty), profit when rate drops
+                existing.unrealized_pnl = (rate - existing.avg_cost) * cash_balance
+                logger.debug(f"Updated synthetic forex: {symbol} qty={cash_balance} rate={rate} pnl={existing.unrealized_pnl:.2f}")
+            else:
+                # Create new synthetic position
+                # For a short EUR position (negative cash), quantity is negative
+                position = Position(
+                    symbol=symbol,
+                    asset_type=AssetType.FOREX,
+                    quantity=cash_balance,
+                    avg_cost=cost_basis,  # Use persisted cost basis or current rate
+                    current_price=rate,
+                    market_value=cash_balance * rate,
+                    unrealized_pnl=(rate - cost_basis) * cash_balance,
+                )
+                self._forex_positions[symbol] = position
 
-                    logger.debug(f"New synthetic forex: {symbol} qty={cash_balance} cost={cost_basis} rate={rate}")
+                # Persist cost basis if this is a new position
+                if currency not in self._forex_cost_basis:
+                    self._forex_cost_basis[currency] = rate
+                    self._save_forex_cost_basis()
+
+                logger.debug(f"New synthetic forex: {symbol} qty={cash_balance} cost={cost_basis} rate={rate}")
 
     # =========================================================================
     # EWrapper Callbacks for Orders
@@ -1832,28 +1963,27 @@ class Portfolio(IBClient):
         mktCapPrice: float = 0.0,
     ):
         """Handle order status updates"""
-        with self._orders_lock:
-            order_record = self._orders.get(orderId)
-            if not order_record:
-                return
+        order_record = self._orders.get(orderId)
+        if not order_record:
+            return
 
-            # Update order record
-            order_record.status = OrderStatus.from_ib_status(status)
-            order_record.filled_quantity = filled
-            order_record.remaining = remaining
-            order_record.avg_fill_price = avgFillPrice
-            order_record.last_fill_price = lastFillPrice
-            if whyHeld:
-                order_record.why_held = whyHeld
+        # Update order record
+        order_record.status = OrderStatus.from_ib_status(status)
+        order_record.filled_quantity = filled
+        order_record.remaining = remaining
+        order_record.avg_fill_price = avgFillPrice
+        order_record.last_fill_price = lastFillPrice
+        if whyHeld:
+            order_record.why_held = whyHeld
 
-            # Mark completion time if terminal state
-            if order_record.is_complete:
-                order_record.filled_time = datetime.now().isoformat()
+        # Mark completion time if terminal state
+        if order_record.is_complete:
+            order_record.filled_time = datetime.now().isoformat()
 
-                # Signal completion event
-                event = self._pending_orders.get(orderId)
-                if event:
-                    event.set()
+            # Signal completion event
+            event = self._pending_orders.get(orderId)
+            if event:
+                event.set()
 
         logger.info(
             f"Order {orderId} status: {status}, "
@@ -2035,7 +2165,7 @@ class Portfolio(IBClient):
         return self._commission_reports.copy()
 
 
-def quick_load(
+async def quick_load(
     host: str = "127.0.0.1",
     port: int = 7497,
     client_id: int = 1,
@@ -2055,11 +2185,11 @@ def quick_load(
     """
     portfolio = Portfolio(host=host, port=port, client_id=client_id)
 
-    if not portfolio.connect():
+    if not await portfolio.connect():
         return []
 
     try:
-        portfolio.load(fetch_prices=fetch_prices)
+        await portfolio.load(fetch_prices=fetch_prices)
         return portfolio.positions
     finally:
-        portfolio.disconnect()
+        await portfolio.disconnect()

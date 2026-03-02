@@ -13,10 +13,10 @@ Provides:
 - MessageBus integration for plugin communication
 """
 
+import asyncio
 import logging
 import signal
 import sys
-from threading import Event
 from typing import Optional, Callable, Dict, List, Any, Set
 from datetime import datetime
 from dataclasses import dataclass
@@ -117,7 +117,7 @@ class TradingEngine:
         """
         self.config = config or EngineConfig()
         self._state = EngineState.STOPPED
-        self._shutdown_event = Event()
+        self._shutdown_event = asyncio.Event()
 
         # Create components
         self._portfolio = Portfolio(
@@ -234,11 +234,14 @@ class TradingEngine:
     def _on_connected(self):
         """Handle connection established"""
         logger.info("Trading engine: Connected to IB")
+        asyncio.create_task(self._async_on_connected())
 
+    async def _async_on_connected(self):
+        """Async handler for connection-established work"""
         # Load portfolio if configured
         if self.config.load_portfolio_on_start:
             try:
-                self._portfolio.load(
+                await self._portfolio.load(
                     fetch_prices=self.config.fetch_prices_on_start,
                     fetch_account=True,
                 )
@@ -251,7 +254,7 @@ class TradingEngine:
 
         # Start plugin executive if not already running
         if self._plugin_executive and not self._plugin_executive.is_running:
-            self._plugin_executive.start()
+            await self._plugin_executive.start()
 
         # Resubscribe to instruments
         self._resubscribe_instruments()
@@ -526,7 +529,7 @@ class TradingEngine:
         self._data_feed.unsubscribe(symbol)
         self._subscribed_symbols.discard(symbol)
 
-    def start(self) -> bool:
+    async def start(self) -> bool:
         """
         Start the trading engine.
 
@@ -546,7 +549,7 @@ class TradingEngine:
 
         try:
             # Start connection manager
-            if not self._connection_manager.start():
+            if not await self._connection_manager.start():
                 # Will retry in background if auto_reconnect enabled
                 if not self.config.auto_reconnect:
                     self._state = EngineState.ERROR
@@ -585,7 +588,7 @@ class TradingEngine:
                 self.on_error(e)
             return False
 
-    def stop(self):
+    async def stop(self):
         """Stop the trading engine gracefully"""
         if self._state in (EngineState.STOPPED, EngineState.STOPPING):
             return
@@ -598,9 +601,9 @@ class TradingEngine:
         try:
             # Stop in reverse order
             if self._plugin_executive:
-                self._plugin_executive.stop()
+                await self._plugin_executive.stop()
             self._data_feed.stop()
-            self._connection_manager.stop()
+            await self._connection_manager.stop()
 
             self._state = EngineState.STOPPED
             logger.info("Trading engine stopped")
@@ -631,7 +634,7 @@ class TradingEngine:
             self._state = EngineState.RUNNING
             logger.info("Trading engine resumed")
 
-    def run_forever(self, handle_signals: bool = True, required_signals: int = 3):
+    async def run_forever(self, handle_signals: bool = True, required_signals: int = 3):
         """
         Run the engine until interrupted.
 
@@ -669,7 +672,7 @@ class TradingEngine:
                     )
                 else:
                     logger.info("Shutdown confirmed, stopping engine...")
-                    self.stop()
+                    asyncio.create_task(self.stop())
 
             signal.signal(signal.SIGINT, signal_handler)
             signal.signal(signal.SIGTERM, signal_handler)
@@ -677,10 +680,13 @@ class TradingEngine:
         try:
             # Block until shutdown
             while not self._shutdown_event.is_set():
-                self._shutdown_event.wait(timeout=1.0)
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
 
-        except KeyboardInterrupt:
-            pass  # Handled by signal handler
+        except asyncio.CancelledError:
+            pass  # Task was cancelled
 
     def get_status(self) -> Dict[str, Any]:
         """

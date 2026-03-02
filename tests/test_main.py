@@ -4,10 +4,11 @@ Unit tests for main.py
 Tests ShutdownManager, CommandHandler, and main functions.
 """
 
+import asyncio
 import signal
 import time
 import pytest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 from threading import Event
 
 
@@ -299,7 +300,7 @@ class TestShutdownManagerWait:
 
         assert result is False
 
-    def test_wait_interruptible_exits_on_shutdown(self, manager):
+    async def test_wait_interruptible_exits_on_shutdown(self, manager):
         """Test wait_interruptible exits when shutdown is set"""
         import threading
 
@@ -312,7 +313,7 @@ class TestShutdownManagerWait:
         thread.start()
 
         start = time.time()
-        manager.wait_interruptible(duration=0, poll_interval=0.01)
+        await manager.wait_interruptible(duration=0, poll_interval=0.01)
         elapsed = time.time() - start
 
         thread.join()
@@ -320,10 +321,10 @@ class TestShutdownManagerWait:
         # Should have exited shortly after shutdown was set
         assert elapsed < 0.5
 
-    def test_wait_interruptible_duration(self, manager):
+    async def test_wait_interruptible_duration(self, manager):
         """Test wait_interruptible with duration"""
         start = time.time()
-        manager.wait_interruptible(duration=0.1, poll_interval=0.01)
+        await manager.wait_interruptible(duration=0.1, poll_interval=0.01)
         elapsed = time.time() - start
 
         # Should have waited approximately the duration
@@ -945,7 +946,7 @@ class TestParseArgs:
 class TestStreamPrices:
     """Tests for stream_prices function"""
 
-    def test_stream_prices_starts_streaming(self, mock_ibapi):
+    async def test_stream_prices_starts_streaming(self, mock_ibapi):
         """Test stream_prices starts streaming"""
         from main import stream_prices, shutdown_manager
 
@@ -954,13 +955,13 @@ class TestStreamPrices:
         # Ensure shutdown manager is in clean state
         shutdown_manager._shutdown_event.clear()
 
-        with patch.object(shutdown_manager, 'wait_interruptible', return_value=None):
-            stream_prices(mock_portfolio, duration=0)
+        with patch.object(shutdown_manager, 'wait_interruptible', new_callable=AsyncMock):
+            await stream_prices(mock_portfolio, duration=0)
 
         mock_portfolio.start_streaming.assert_called_once()
         mock_portfolio.stop_streaming.assert_called_once()
 
-    def test_stream_prices_with_duration(self, mock_ibapi):
+    async def test_stream_prices_with_duration(self, mock_ibapi):
         """Test stream_prices with duration"""
         from main import stream_prices, shutdown_manager
 
@@ -969,9 +970,9 @@ class TestStreamPrices:
 
         shutdown_manager._shutdown_event.clear()
 
-        with patch.object(shutdown_manager, 'wait_interruptible') as mock_wait, \
+        with patch.object(shutdown_manager, 'wait_interruptible', new_callable=AsyncMock) as mock_wait, \
              patch('builtins.print'):
-            stream_prices(mock_portfolio, duration=10)
+            await stream_prices(mock_portfolio, duration=10)
 
         mock_wait.assert_called_once_with(duration=10)
 
@@ -983,7 +984,7 @@ class TestStreamPrices:
 class TestStreamBars:
     """Tests for stream_bars function"""
 
-    def test_stream_bars_starts_streaming(self, mock_ibapi):
+    async def test_stream_bars_starts_streaming(self, mock_ibapi):
         """Test stream_bars starts bar streaming"""
         from main import stream_bars, shutdown_manager
 
@@ -992,9 +993,9 @@ class TestStreamBars:
 
         shutdown_manager._shutdown_event.clear()
 
-        with patch.object(shutdown_manager, 'wait_interruptible', return_value=None), \
+        with patch.object(shutdown_manager, 'wait_interruptible', new_callable=AsyncMock), \
              patch('builtins.print'):
-            stream_bars(mock_portfolio, duration=0)
+            await stream_bars(mock_portfolio, duration=0)
 
         mock_portfolio.start_bar_streaming.assert_called_once()
         mock_portfolio.stop_bar_streaming.assert_called_once()
@@ -1131,7 +1132,9 @@ class TestMainFunction:
                 bars=False,
                 rebalance=False,
             )
-            MockPortfolio.return_value.connect.return_value = False
+            mock_portfolio = MockPortfolio.return_value
+            mock_portfolio.connect = AsyncMock(return_value=False)
+            mock_portfolio.disconnect = AsyncMock()
 
             from main import main
             main()
@@ -1146,6 +1149,7 @@ class TestMainFunction:
              patch('main.show_portfolio') as mock_show:
 
             mock_shutdown.should_shutdown = False
+            mock_shutdown.restore_handlers = MagicMock()
             mock_args.return_value = MagicMock(
                 host="127.0.0.1",
                 port=7497,
@@ -1161,7 +1165,9 @@ class TestMainFunction:
                 rebalance=False,
             )
             mock_portfolio = MockPortfolio.return_value
-            mock_portfolio.connect.return_value = True
+            mock_portfolio.connect = AsyncMock(return_value=True)
+            mock_portfolio.load = AsyncMock()
+            mock_portfolio.disconnect = AsyncMock()
 
             from main import main
             main()

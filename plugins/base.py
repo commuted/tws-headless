@@ -684,6 +684,36 @@ class PluginBase(ABC):
             order_record: ib.models.OrderRecord with current status
         """
 
+    def on_commission(
+        self,
+        exec_id: str,
+        commission: float,
+        realized_pnl: float,
+        currency: str,
+    ) -> None:
+        """
+        Called when a commission report arrives for an order placed by this plugin.
+
+        Override to track trading costs and realized P&L on a per-execution basis.
+
+        Args:
+            exec_id:      IB execution ID linking this report to an execDetails callback
+            commission:   Commission charged for this execution
+            realized_pnl: Realized P&L for closing trades (UNSET_DOUBLE if opening)
+            currency:     Currency of the commission (e.g., "USD")
+        """
+
+    def on_pnl(self, pnl_data) -> None:
+        """
+        Called with live P&L updates from IB's reqPnL / reqPnLSingle subscriptions.
+
+        Override to react to real-time P&L changes.
+
+        Args:
+            pnl_data: ib.models.PnLData; pnl_data.symbol is None for account-level
+                      updates and set to the position symbol for single-position updates.
+        """
+
     def on_ib_error(self, req_id: int, error_code: int, error_string: str) -> None:
         """
         Called when IB reports an error for a request attributed to this plugin.

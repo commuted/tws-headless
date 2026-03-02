@@ -60,7 +60,7 @@ full migration. If plugins are third-party or numerous, use the bridge approach 
 ## Architecture Decision: New Async Transport
 
 The ibapi decoder (`ibapi/decoder.py`) and wire encoding (`ibapi/comm.py`) are pure
-parsing logic — no threading, no I/O. They can be reused unchanged.
+parsing logic — no threading, no I/O. They can be reused as-is.
 
 The plan is to **replace only the transport layer** (connection, reader, run loop) with
 an asyncio equivalent, leaving the decoder and wrapper interfaces intact:
@@ -70,12 +70,21 @@ Before:                              After:
   EClient.connect()                    AsyncIBTransport.connect()  (asyncio socket)
   EReader Thread → queue.Queue         asyncio coroutine → asyncio.Queue
   EClient.run() blocking loop          AsyncIBTransport.run() coroutine
-  ibapi.decoder.Decoder (unchanged) ── ibapi.decoder.Decoder (reused as-is)
+  ibapi.decoder.Decoder (reused) ───── ibapi.decoder.Decoder (reused)
   EWrapper callbacks (unchanged) ───── EWrapper callbacks (unchanged)
 ```
 
-New file: `ib/async_transport.py` (~180 lines) replaces the thread+queue+run-loop.
+New file: `ib/async_transport.py` (~220 lines) replaces the thread+queue+run-loop.
 `IBClient` will stop inheriting from `EClient` and instead compose `AsyncIBTransport`.
+
+**⚠️ ibapi version note**: The installed ibapi is version 203
+(`MAX_CLIENT_VER = MIN_SERVER_VER_PROTOBUF_PLACE_ORDER = 203`). Starting with server
+version 201, the wire format changed: messages carry a 4-byte big-endian integer msgId
+prefix, and some outgoing requests (`placeOrder`, `cancelOrder`, `reqExecutions`,
+`reqGlobalCancel`) use Protobuf serialization. The transport's `run()` loop must handle
+both the legacy field-based format and the new Protobuf dispatch path. See Phase 1.1
+for the corrected implementation. `Decoder.interpret()` now takes two arguments:
+`interpret(fields, msgId)` — the old single-argument signature no longer exists.
 
 ---
 
@@ -86,10 +95,52 @@ New file: `ib/async_transport.py` (~180 lines) replaces the thread+queue+run-loo
 pip install aiosqlite          # async SQLite for execution_db.py
 pip install pytest-asyncio     # async test support
 
-# In pytest.ini or pyproject.toml:
+# In pyproject.toml:
 # [tool.pytest.ini_options]
 # asyncio_mode = "auto"
 ```
+
+---
+
+## Phase 0 — Bridge Approach (Minimal Viable Migration)
+
+If plugin count is large or plugins are not fully under your control, this phase
+delivers the async transport benefit without making every caller async.
+
+**Strategy**: Run `transport.run()` as a background `asyncio.Task`; keep all existing
+`threading.Event` / `threading.Thread` code above it unchanged; use
+`loop.call_soon_threadsafe()` to signal asyncio events from the existing threads.
+
+```python
+# In IBClient.connect() — start the event loop in a background thread
+import asyncio, threading
+
+def connect(self) -> bool:
+    self._loop = asyncio.new_event_loop()
+    self._loop_thread = threading.Thread(
+        target=self._loop.run_forever, daemon=True
+    )
+    self._loop_thread.start()
+    future = asyncio.run_coroutine_threadsafe(
+        self._async_connect(), self._loop
+    )
+    return future.result(timeout=self.timeout)
+
+async def _async_connect(self):
+    await self._transport.connect(self.host, self.port, self.client_id)
+    self._run_task = self._loop.create_task(self._transport.run())
+    # nextValidId will call loop.call_soon_threadsafe(threading_event.set)
+```
+
+Bridge rules:
+- EWrapper callbacks fire on the asyncio loop thread (safe for `asyncio.Event.set()`)
+- Any non-loop thread that needs to signal an asyncio `Event` must use
+  `loop.call_soon_threadsafe(event.set)` — never `event.set()` directly
+- Any non-loop thread that needs to enqueue to `asyncio.Queue` must use
+  `loop.call_soon_threadsafe(queue.put_nowait, item)`
+
+**Exit criteria for Phase 0**: all tests pass; `ibctl.py status` works; one production
+session completes without error. Then proceed to Phase 1.
 
 ---
 
@@ -113,12 +164,19 @@ import struct
 from typing import Optional
 
 from ibapi import comm
+from ibapi.common import PROTOBUF_MSG_ID
 from ibapi.decoder import Decoder
+from ibapi.server_versions import (
+    MAX_CLIENT_VER,
+    MIN_CLIENT_VER,
+    MIN_SERVER_VER_PROTOBUF,
+)
 from ibapi.wrapper import EWrapper
 
 logger = logging.getLogger(__name__)
 
 _MAX_MSG_LEN = 0xFFFFFF  # 16 MB safety cap
+_DRAIN_THRESHOLD = 65_536  # call drain() when write buffer exceeds 64 KB
 
 
 class AsyncIBTransport:
@@ -135,8 +193,6 @@ class AsyncIBTransport:
     """
 
     API_SIGN = b"API\0"
-    MIN_SERVER_VER = 100
-    MAX_SERVER_VER = 178  # match ibapi version
 
     def __init__(self, wrapper: EWrapper):
         self.wrapper = wrapper
@@ -153,9 +209,8 @@ class AsyncIBTransport:
     async def connect(self, host: str, port: int, client_id: int) -> None:
         """Open connection and perform TWS handshake."""
         self._reader, self._writer = await asyncio.open_connection(host, port)
-        # Send API signature + version range
-        v_min, v_max = self.MIN_SERVER_VER, self.MAX_SERVER_VER
-        prefix = self.API_SIGN + comm.make_field(f"v{v_min}..{v_max}")
+        # Send API signature + version range (import constants, don't hardcode)
+        prefix = self.API_SIGN + comm.make_field(f"v{MIN_CLIENT_VER}..{MAX_CLIENT_VER}")
         self._send_raw(prefix)
         # Receive server version + connection time
         msg = await self._recv_msg()
@@ -167,7 +222,8 @@ class AsyncIBTransport:
         flds += comm.make_field(client_id)
         flds += comm.make_field("")        # optional capabilities
         self._send_framed(flds)
-        self._decoder = Decoder(self.wrapper, self.serverVersion)
+        # Decoder expects a callable that returns the current server version
+        self._decoder = Decoder(self.wrapper, lambda: self.serverVersion)
         self._connected = True
 
     def disconnect(self) -> None:
@@ -187,8 +243,11 @@ class AsyncIBTransport:
         Main async message loop.
 
         Reads length-framed messages from the socket and dispatches each
-        to the Decoder (which calls EWrapper methods synchronously).
+        through the Decoder (which calls EWrapper methods synchronously).
         Run this as an asyncio Task: asyncio.create_task(transport.run())
+
+        Handles both the legacy field-based format (server < 201) and the
+        modern Protobuf-capable format (server >= 201, ibapi 203+).
         """
         try:
             while self._connected:
@@ -197,10 +256,31 @@ class AsyncIBTransport:
                 except asyncio.TimeoutError:
                     await self._msg_loop_timeout()
                     continue
-                if msg:
+                if not msg:
+                    continue
+
+                # Dispatch: modern ibapi (serverVersion >= 201) uses a
+                # 4-byte big-endian msgId prefix; older servers use the
+                # first null-delimited field as a decimal string msgId.
+                if self.serverVersion >= MIN_SERVER_VER_PROTOBUF:
+                    msg_id = int.from_bytes(msg[:4], "big")
+                    payload = msg[4:]
+                    if msg_id > PROTOBUF_MSG_ID:
+                        # Protobuf-encoded response (e.g. placeOrder reply)
+                        self._decoder.processProtoBuf(
+                            payload, msg_id - PROTOBUF_MSG_ID
+                        )
+                    else:
+                        fields = comm.read_fields(payload)
+                        if fields:
+                            self._decoder.interpret(fields, msg_id)
+                else:
+                    # Legacy: msgId is first null-delimited field
                     fields = comm.read_fields(msg)
                     if fields:
-                        self._decoder.interpret(fields)
+                        msg_id = int(fields[0])
+                        self._decoder.interpret(fields, msg_id)
+
         except (asyncio.IncompleteReadError, ConnectionResetError):
             logger.warning("IB connection closed by remote")
         finally:
@@ -212,14 +292,21 @@ class AsyncIBTransport:
         pass  # hook for keepalive logic if needed
 
     # ------------------------------------------------------------------
-    # Send helpers (synchronous — just write to buffer)
+    # Send helpers
     # ------------------------------------------------------------------
 
-    def send_msg(self, msg: bytes) -> None:
-        """Send a pre-encoded message (called by all req* methods)."""
+    async def send_msg(self, msg: bytes) -> None:
+        """
+        Send a pre-encoded message (called by all req* methods).
+
+        Awaits writer.drain() when the write buffer exceeds the threshold
+        to prevent unbounded memory growth under high request rates.
+        """
         if not self._writer:
             raise ConnectionError("Not connected")
         self._send_framed(msg)
+        if self._writer.transport.get_write_buffer_size() > _DRAIN_THRESHOLD:
+            await self._writer.drain()
 
     def _send_framed(self, data: bytes) -> None:
         size = struct.pack("!I", len(data))
@@ -227,7 +314,6 @@ class AsyncIBTransport:
 
     def _send_raw(self, data: bytes) -> None:
         self._writer.write(data)
-        # No await needed for small messages; asyncio buffers until drain
 
     # ------------------------------------------------------------------
     # Receive helpers
@@ -242,10 +328,20 @@ class AsyncIBTransport:
         return await self._reader.readexactly(size)
 ```
 
-**Note**: All `req*` methods from `EClient` (e.g. `reqPositions`, `reqMktData`) just
-build a byte string and call `sendMsg`. Create `ib/ib_request_mixin.py` that copies
-those methods verbatim from `ibapi/client.py`, replacing `self.conn.sendMsg(msg)` with
-`self._transport.send_msg(msg)`. There are ~80 request methods; copy them once.
+**Note on `send_msg` becoming async**: All callers in `IBRequestMixin` must now
+`await self.send_msg(msg)`. This means every `req*` method becomes `async def`. This is
+acceptable because all callers (IBClient → Portfolio → plugin code) are already being
+made async in later phases.
+
+**Note on `IBRequestMixin`**: Create `ib/ib_request_mixin.py` by copying the ~80 `req*`
+methods verbatim from `ibapi/client.py`, making these two replacements:
+1. `self.conn.sendMsg(msg)` → `await self.send_msg(msg)` (field-based requests)
+2. `self.conn.sendMsg(full_msg)` inside `sendMsgProtoBuf` → `await self.send_msg(full_msg)`
+
+Also copy `sendMsgProtoBuf` itself (used for Protobuf-capable requests: `placeOrder`,
+`cancelOrder`, `reqExecutions`, `reqGlobalCancel`), updating its `self.conn.sendMsg`
+call to `await self.send_msg`. Add `def serverVersion(self): return self._transport.serverVersion`
+so `useProtoBuf()` calls resolve correctly.
 
 ---
 
@@ -288,17 +384,24 @@ class IBClient(EWrapper, IBRequestMixin):
             except asyncio.CancelledError:
                 pass
 
-    # EWrapper callbacks (called from transport.run() — synchronous is fine)
+    def get_next_req_id(self) -> int:
+        # Keep synchronous; just increments a counter
+        self._next_req_id += 1
+        return self._next_req_id
+
+    # EWrapper callbacks (called from transport.run() — on the event loop thread)
     def nextValidId(self, orderId: int):
         self._next_order_id = orderId
-        self._connected_event.set()   # asyncio.Event.set() is synchronous
+        self._connected_event.set()   # safe: called from event loop thread
 
     def isConnected(self) -> bool:
         return self._transport.isConnected()
 ```
 
-**Key insight**: `asyncio.Event.set()` is synchronous — callbacks don't need to be
-`async` just to signal a waiter.
+**Key insight**: EWrapper callbacks are called synchronously from `transport.run()`,
+which runs on the event loop thread. Calling `asyncio.Event.set()` from there is safe.
+Calling it from any **other** thread (e.g. during Phase 0 bridge period) requires
+`loop.call_soon_threadsafe(event.set)` instead.
 
 ---
 
@@ -337,6 +440,17 @@ except asyncio.TimeoutError:
 | `_account_summary_done` | `accountSummaryEnd` |
 | `_executions_done`   | `execDetailsEnd` |
 | `_pending_orders[orderId]` | `orderStatus` (filled/error) |
+
+**No migration needed for callback fields**: `_on_pnl`, `_on_commission`, and the new P&L
+subscription state (`_pnl_req_id`, `_pnl_single_req_ids`, `_pnl_single_symbols`) that were
+added after this plan was written are plain callable references and integer/dict fields.
+They are called synchronously from EWrapper callbacks, which already fire on the event loop
+thread in the async model. No threading.Event conversion required.
+
+**P&L subscription methods** (`request_pnl`, `cancel_pnl`, `request_pnl_single`,
+`cancel_pnl_single`) use `get_next_req_id()` and call IB API request methods. Once the
+request methods are async (Phase 2), these should also become `async def` so callers can
+`await` them.
 
 **`load()` becomes async** — and parallel with `asyncio.gather()`:
 ```python
@@ -465,6 +579,13 @@ self._order_queue = queue.Queue()
 self._order_queue = asyncio.Queue()
 ```
 
+> **⚠️ Thread safety**: `asyncio.Queue` is **not** safe to call from outside the event
+> loop. If any non-loop thread (e.g. `ibctl.py` command handler) enqueues work, it must
+> use `loop.call_soon_threadsafe(queue.put_nowait, item)` — never `queue.put_nowait(item)`
+> directly. In the fully async model this should not arise because `command_server.py` will
+> also be async (see Phase 11). During the Phase 0 bridge period, audit every `queue.put`
+> call site for its thread of origin.
+
 ### 5.3  Plugin execution
 
 Plugins' `on_bar()` / `on_tick()` are called from the executor loop. Two options:
@@ -580,6 +701,22 @@ if __name__ == "__main__":
     asyncio.run(async_main())
 ```
 
+**Signal handling**: Replace `signal.signal(SIGINT/SIGTERM, handler)` with
+`loop.add_signal_handler()`, which is asyncio-safe and fires on the event loop thread:
+```python
+async def async_main():
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGINT,  lambda: engine_shutdown_event.set())
+    loop.add_signal_handler(signal.SIGTERM, lambda: engine_shutdown_event.set())
+    engine = TradingEngine(config)
+    await engine.start()
+    await engine_shutdown_event.wait()
+    await engine.stop()
+```
+The current `run_engine.py` uses `signal.signal()` with a threading.Event; after migration
+this becomes the pattern above. `signal.signal()` with a sync handler still works but can
+race with event loop I/O; `loop.add_signal_handler()` is the correct async alternative.
+
 ---
 
 ## Phase 8 — Refactor `ib/execution_db.py`
@@ -694,10 +831,145 @@ immediately, `async def on_bar(...)` works without any other changes.
 
 ---
 
+## Phase 11 — Refactor `ib/command_server.py`
+
+`command_server.py` currently opens a Unix domain socket with `socket.socket()` and spins
+a blocking `accept()` loop in a dedicated thread. Replace with `asyncio.start_unix_server`:
+
+```python
+# Before
+class CommandServer:
+    def start(self):
+        self._server_thread = Thread(target=self._serve_forever, daemon=True)
+        self._server_thread.start()
+
+    def _serve_forever(self):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.bind(self._socket_path)
+            sock.listen(5)
+            while not self._shutdown_event.is_set():
+                conn, _ = sock.accept()
+                Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+
+# After
+class CommandServer:
+    async def start(self):
+        self._server = await asyncio.start_unix_server(
+            self._handle_client, path=self._socket_path
+        )
+
+    async def _handle_client(self, reader: asyncio.StreamReader,
+                              writer: asyncio.StreamWriter):
+        try:
+            data = await reader.read(4096)
+            response = await self._dispatch_command(data)
+            writer.write(response)
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def stop(self):
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+```
+
+Each client connection gets its own coroutine (no Thread per connection). The command
+dispatch (`_dispatch_command`) becomes async and can `await` engine/portfolio methods
+directly instead of posting to a queue.
+
+---
+
+## Phase 12 — Remove Locks in `ib/data_feed.py`
+
+`data_feed.py` uses `threading.RLock` to protect its circular buffers from concurrent
+access by the EReader thread (writes) and algorithm/plugin threads (reads). In the async
+single-loop model, all access happens on the event loop thread — the lock is no longer
+needed and can be **deleted entirely** (not replaced with asyncio equivalent).
+
+```python
+# Before
+class DataFeed:
+    def __init__(self):
+        self._lock = threading.RLock()
+        ...
+
+    def _add_bar(self, symbol, bar):
+        with self._lock:
+            self._bars[symbol].append(bar)
+
+    def get_bars(self, symbol, n):
+        with self._lock:
+            return list(self._bars[symbol][-n:])
+
+# After
+class DataFeed:
+    def __init__(self):
+        # No lock needed — single event loop thread
+        ...
+
+    def _add_bar(self, symbol, bar):
+        self._bars[symbol].append(bar)
+
+    def get_bars(self, symbol, n):
+        return list(self._bars[symbol][-n:])
+```
+
+**Prerequisite**: Confirm that no off-loop thread calls `DataFeed` methods after Phase 1-4
+are complete. During the Phase 0 bridge period, keep the lock.
+
+---
+
+## Phase 13 — Remove Lock in `ib/message_bus.py`
+
+`message_bus.py` uses a `threading.Lock` (or `threading.RLock`) to protect subscriber
+registration and message dispatch. Same reasoning as Phase 12: in the single-loop model,
+the lock is unnecessary — delete it.
+
+```python
+# Before
+class MessageBus:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._subscribers: Dict[str, List[Callable]] = {}
+
+    def subscribe(self, channel, callback):
+        with self._lock:
+            self._subscribers.setdefault(channel, []).append(callback)
+
+    def publish(self, channel, message):
+        with self._lock:
+            cbs = list(self._subscribers.get(channel, []))
+        for cb in cbs:
+            cb(message)
+
+# After
+class MessageBus:
+    def __init__(self):
+        self._subscribers: Dict[str, List[Callable]] = {}
+
+    def subscribe(self, channel, callback):
+        self._subscribers.setdefault(channel, []).append(callback)
+
+    async def publish(self, channel, message):
+        for cb in list(self._subscribers.get(channel, [])):
+            if asyncio.iscoroutinefunction(cb):
+                await cb(message)
+            else:
+                cb(message)
+```
+
+`publish` becomes async if any subscriber is a coroutine (likely after Phase 10). If all
+subscribers stay synchronous, it can remain a plain `def`.
+
+---
+
 ## Execution Order
 
 | Phase | File(s) | Effort | Dependency |
 |-------|---------|--------|------------|
+| 0 | Bridge: `ib/client.py` + background event loop | S | None (optional) |
 | 1 | Create `ib/async_transport.py` + `ib/ib_request_mixin.py` | M | None |
 | 2 | `ib/client.py` | M | Phase 1 |
 | 3 | `ib/portfolio.py` | L | Phase 2 |
@@ -708,6 +980,9 @@ immediately, `async def on_bar(...)` works without any other changes.
 | 8 | `ib/execution_db.py` | S | None (parallel) |
 | 9 | `tests/conftest.py` + all test files | L | All above |
 | 10 | `plugins/base.py` + each plugin | M | Phase 5 |
+| 11 | `ib/command_server.py` | S | Phase 6 |
+| 12 | `ib/data_feed.py` — delete RLock | S | Phases 1-5 complete |
+| 13 | `ib/message_bus.py` — delete Lock | S | Phase 5 complete |
 
 S = small (<2h), M = medium (2-4h), L = large (4-8h)
 
@@ -720,13 +995,16 @@ S = small (<2h), M = medium (2-4h), L = large (4-8h)
 | `ib/async_transport.py` | **Create** — asyncio socket reader replacing EReader+EClient.run |
 | `ib/ib_request_mixin.py` | **Create** — copy ~80 req* methods from ibapi/client.py |
 | `ib/client.py` | **Rewrite** — drop EClient inheritance, compose AsyncIBTransport |
-| `ib/portfolio.py` | **Refactor** — threading.Event → asyncio.Event, methods become async |
+| `ib/portfolio.py` | **Refactor** — threading.Event → asyncio.Event, methods become async; P&L subscription methods become async |
 | `ib/connection_manager.py` | **Refactor** — Thread → Task, Event patterns |
 | `ib/plugin_executive.py` | **Refactor** — Thread → Task, Queue → asyncio.Queue |
 | `ib/trading_engine.py` | **Refactor** — methods become async |
-| `ib/run_engine.py` | **Refactor** — asyncio.run() entry point |
+| `ib/run_engine.py` | **Refactor** — asyncio.run() entry point; signal.signal → loop.add_signal_handler |
 | `ib/main.py` | **Refactor** — asyncio.run() entry point |
 | `ib/execution_db.py` | **Refactor** — sqlite3 → aiosqlite |
+| `ib/command_server.py` | **Refactor** — Thread+socket.accept loop → asyncio.start_unix_server |
+| `ib/data_feed.py` | **Refactor** — delete threading.RLock (no replacement needed in single-loop model) |
+| `ib/message_bus.py` | **Refactor** — delete threading.Lock; publish becomes async if plugins go Option B |
 | `plugins/base.py` | **Refactor** — on_bar/on_tick become async (Option B) |
 | `plugins/*/plugin.py` | **Refactor** — add async keyword to callbacks |
 | `tests/conftest.py` | **Refactor** — add pytest-asyncio, AsyncMock |
@@ -745,7 +1023,7 @@ python3 -c "from ib.client import IBClient; print('client OK')"
 python3 -c "from ib.portfolio import Portfolio; print('portfolio OK')"
 python3 -c "from ib.trading_engine import TradingEngine; print('engine OK')"
 
-# Full test suite (target: all 1509 pass)
+# Full test suite (target: all 1620 pass)
 python3 -m pytest tests/ -v
 
 # Dry-run smoke test (paper account on port 7497)

@@ -24,7 +24,12 @@ Complete reference for writing plugins for the IB trading engine.
 11. [Request Handling](#11-request-handling)
 12. [Trade Signals](#12-trade-signals)
 13. [Order Callbacks and Error Routing](#13-order-callbacks-and-error-routing)
+    - 13.1 [on_order_fill / on_order_status](#on_order_fillself-order_record---none)
+    - 13.2 [on_commission — execution cost reports](#on_commissionself-exec_id-commission-realized_pnl-currency---none)
+    - 13.3 [on_pnl — live P&L updates](#on_pnlself-pnl_data---none)
+    - 13.4 [on_ib_error](#on_ib_errorself-req_id-int-error_code-int-error_string-str---none)
 14. [Portfolio Access](#14-portfolio-access)
+    - 14.1 [Real-time P&L subscriptions](#141-real-time-pl-subscriptions)
 15. [Contract Builder](#15-contract-builder)
 16. [Self-Unload](#16-self-unload)
 17. [Engine Commands](#17-engine-commands)
@@ -876,6 +881,89 @@ def on_order_status(self, order_record) -> None:
 | `INACTIVE` | Submitted but not actively working (e.g. outside hours) |
 | `ERROR` | Rejected or other error |
 
+### `on_commission(self, exec_id: str, commission: float, realized_pnl: float, currency: str) -> None`
+
+Called when IB delivers a commission report for an execution linked to an
+order attributed to this plugin. The `exec_id` ties this report to the
+corresponding `execDetails` event.
+
+```python
+def on_commission(
+    self,
+    exec_id: str,
+    commission: float,
+    realized_pnl: float,
+    currency: str,
+) -> None:
+    logger.info(
+        f"Commission exec={exec_id}: {commission:.4f} {currency}  "
+        f"realized_pnl={realized_pnl:.2f}"
+    )
+    self._total_commission += commission
+```
+
+`realized_pnl` equals IB's `UNSET_DOUBLE` (a large sentinel ≈ 1.7 × 10⁳⁰⁸)
+for opening trades where no P&L has been realized yet.  Always guard:
+
+```python
+UNSET = 1.7976931348623157e+308
+if realized_pnl < UNSET:
+    self._realized += realized_pnl
+```
+
+No extra registration is required. The executive wires `execDetails` →
+`commissionReport` automatically for all orders that flow through
+`calculate_signals`. For orders placed via `place_order_custom`, call
+`register_order(order_id)` first (see above).
+
+---
+
+### `on_pnl(self, pnl_data) -> None`
+
+Called with live P&L updates from IB's streaming P&L API. The engine
+delivers these after `portfolio.request_pnl()` or
+`portfolio.request_pnl_single()` has been called (typically in `start()`
+— see [Section 14.1](#141-real-time-pl-subscriptions)).
+
+```python
+from ib.models import PnLData
+
+def on_pnl(self, pnl_data: PnLData) -> None:
+    if pnl_data.symbol is None:
+        # Account-level update (from request_pnl)
+        logger.info(
+            f"Account P&L: daily={pnl_data.daily_pnl:.2f}  "
+            f"unrealized={pnl_data.unrealized_pnl:.2f}  "
+            f"realized={pnl_data.realized_pnl:.2f}"
+        )
+    else:
+        # Per-position update (from request_pnl_single)
+        logger.info(
+            f"{pnl_data.symbol}: pos={pnl_data.position}  "
+            f"unrealized={pnl_data.unrealized_pnl:.2f}  "
+            f"value={pnl_data.value:.2f}"
+        )
+```
+
+**`PnLData` attributes:**
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `account` | `str` | IB account ID |
+| `daily_pnl` | `float` | P&L since the start of the trading day |
+| `unrealized_pnl` | `float` | Open-position P&L at current market prices |
+| `realized_pnl` | `float` | Closed-position P&L (today) |
+| `symbol` | `str \| None` | Symbol for position-level updates; `None` for account-level |
+| `position` | `int` | Current net position size (position-level only) |
+| `value` | `float` | Current market value of the position (position-level only) |
+| `timestamp` | `datetime` | Wall-clock time the callback was processed |
+
+`on_pnl` is called for **all** started plugins whenever a P&L update
+arrives. If only certain plugins need live P&L, check
+`pnl_data.symbol` and filter in the override.
+
+---
+
 ### `on_ib_error(self, req_id: int, error_code: int, error_string: str) -> None`
 
 Called when IB reports an error for a request owned by this plugin.
@@ -984,6 +1072,54 @@ self.portfolio.reqMarketDataType(1)
 Use `self.get_historical_data()` (Section 9) instead of calling
 `self.portfolio.request_historical_data()` directly. The PluginBase
 wrapper handles threading and timeout automatically.
+
+### 14.1 Real-time P&L subscriptions
+
+IB streams live unrealized/realized P&L at two granularities:
+
+| Method | IB call | Callback delivers |
+|--------|---------|-------------------|
+| `request_pnl(account)` | `reqPnL` | Account-totals update (`pnl_data.symbol is None`) |
+| `request_pnl_single(account, symbol)` | `reqPnLSingle` | Per-position update (`pnl_data.symbol == symbol`) |
+
+Both deliver data via `on_pnl()` on **every** started plugin
+(Section 13.3). Subscribe in `start()`, cancel in `stop()`.
+
+```python
+def start(self) -> bool:
+    if self.portfolio:
+        account = self.portfolio.managed_accounts[0]
+        # Account-level: unrealized + realized across all positions
+        self.portfolio.request_pnl(account)
+        # Per-position: SPY must already be in self.portfolio.positions
+        # so the engine can resolve its conId
+        self.portfolio.request_pnl_single(account, "SPY")
+    return True
+
+def stop(self) -> bool:
+    if self.portfolio:
+        self.portfolio.cancel_pnl()
+        self.portfolio.cancel_pnl_single("SPY")
+    return True
+```
+
+**API reference:**
+
+| Call | Returns | Description |
+|------|---------|-------------|
+| `request_pnl(account, model_code="")` | `int` req_id | Subscribe to account-level P&L |
+| `cancel_pnl()` | `None` | Cancel the account-level subscription |
+| `request_pnl_single(account, symbol, model_code="")` | `int` req_id | Subscribe to per-position P&L; looks up `conId` from current positions |
+| `cancel_pnl_single(symbol)` | `None` | Cancel the per-position subscription for `symbol` |
+
+P&L subscriptions are cancelled automatically on engine shutdown. Cancel
+manually in `stop()` if you want to stop receiving updates while the
+plugin remains running.
+
+`request_pnl_single` resolves the contract `conId` from
+`portfolio.positions` at the time of the call. The symbol must already
+have a position loaded; if the position is not yet present the subscription
+is opened with `conId=0` and IB will return an error.
 
 ---
 
@@ -1143,6 +1279,14 @@ is a non-abstract subclass of `PluginBase`, instantiates it (passing
 - **`on_ib_error`** is called on the IB reader thread (the thread that
   receives `error()` callbacks from TWS). The same fast-return rule
   applies.
+
+- **`on_commission`** is called on the IB reader thread (the thread that
+  receives `commissionReport` callbacks from TWS). Keep it fast. Accumulate
+  totals in a simple counter; do not do file I/O or lock contention here.
+
+- **`on_pnl`** is called on the IB reader thread. IB sends P&L updates
+  frequently during market hours. Keep the override minimal; post any
+  heavy computation to a background queue.
 
 - If a callback needs to do heavy work, post to a queue and process on a
   dedicated thread started in `start()` and stopped in `stop()`.

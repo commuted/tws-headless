@@ -555,3 +555,32 @@ class TestPluginWithHoldings:
 
         missing = plugin.holdings.get_position("QQQ")
         assert missing is None
+
+
+class TestNewCallbacks:
+    """Tests for on_commission and on_pnl callback signatures"""
+
+    def test_on_commission_exists_and_callable(self):
+        """on_commission exists as a callable no-op on PluginBase."""
+        plugin = ConcreteTestPlugin()
+        assert hasattr(plugin, "on_commission")
+        assert callable(plugin.on_commission)
+
+    def test_on_commission_signature(self):
+        """on_commission accepts (exec_id, commission, realized_pnl, currency)."""
+        plugin = ConcreteTestPlugin()
+        # Should not raise
+        plugin.on_commission("exec_abc", 1.23, 0.0, "USD")
+
+    def test_on_pnl_exists_and_callable(self):
+        """on_pnl exists as a callable no-op on PluginBase."""
+        plugin = ConcreteTestPlugin()
+        assert hasattr(plugin, "on_pnl")
+        assert callable(plugin.on_pnl)
+
+    def test_on_pnl_signature(self):
+        """on_pnl accepts a pnl_data argument."""
+        from unittest.mock import Mock
+        plugin = ConcreteTestPlugin()
+        # Should not raise
+        plugin.on_pnl(Mock())

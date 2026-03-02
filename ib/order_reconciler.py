@@ -14,7 +14,6 @@ Example:
 
 import logging
 from decimal import Decimal
-from threading import Lock
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -121,7 +120,6 @@ class OrderReconciler:
         self.mode = mode
         self.batch_window_ms = batch_window_ms
 
-        self._lock = Lock()
         self._pending: Dict[str, List[PendingSignal]] = defaultdict(list)  # symbol -> signals
         self._reconciled: List[ReconciledOrder] = []
         self._execution_allocations: Dict[int, ExecutionAllocation] = {}  # order_id -> allocation
@@ -158,20 +156,19 @@ class OrderReconciler:
         if not signal.is_actionable:
             return False
 
-        with self._lock:
-            pending = PendingSignal(
-                algorithm_name=algorithm_name,
-                signal=signal,
-                contract=contract,
-            )
-            self._pending[signal.symbol].append(pending)
-            self._stats["signals_received"] += 1
+        pending = PendingSignal(
+            algorithm_name=algorithm_name,
+            signal=signal,
+            contract=contract,
+        )
+        self._pending[signal.symbol].append(pending)
+        self._stats["signals_received"] += 1
 
-            logger.debug(
-                f"Added signal: {algorithm_name} {signal.action} "
-                f"{signal.quantity} {signal.symbol}"
-            )
-            return True
+        logger.debug(
+            f"Added signal: {algorithm_name} {signal.action} "
+            f"{signal.quantity} {signal.symbol}"
+        )
+        return True
 
     def reconcile(self, symbol: Optional[str] = None) -> List[ReconciledOrder]:
         """
@@ -183,13 +180,12 @@ class OrderReconciler:
         Returns:
             List of ReconciledOrder objects ready for execution
         """
-        with self._lock:
-            if self.mode == ReconciliationMode.NET:
-                return self._reconcile_net(symbol)
-            elif self.mode == ReconciliationMode.FIFO:
-                return self._reconcile_fifo(symbol)
-            else:  # IMMEDIATE
-                return self._reconcile_immediate(symbol)
+        if self.mode == ReconciliationMode.NET:
+            return self._reconcile_net(symbol)
+        elif self.mode == ReconciliationMode.FIFO:
+            return self._reconcile_fifo(symbol)
+        else:  # IMMEDIATE
+            return self._reconcile_immediate(symbol)
 
     def _reconcile_net(self, symbol: Optional[str] = None) -> List[ReconciledOrder]:
         """Net all orders for the same symbol"""
@@ -270,23 +266,20 @@ class OrderReconciler:
 
     def get_pending_count(self, symbol: Optional[str] = None) -> int:
         """Get count of pending signals"""
-        with self._lock:
-            if symbol:
-                return len(self._pending.get(symbol, []))
-            return sum(len(signals) for signals in self._pending.values())
+        if symbol:
+            return len(self._pending.get(symbol, []))
+        return sum(len(signals) for signals in self._pending.values())
 
     def get_pending_symbols(self) -> List[str]:
         """Get list of symbols with pending signals"""
-        with self._lock:
-            return [sym for sym, signals in self._pending.items() if signals]
+        return [sym for sym, signals in self._pending.items() if signals]
 
     def clear_pending(self, symbol: Optional[str] = None):
         """Clear pending signals without reconciling"""
-        with self._lock:
-            if symbol:
-                self._pending[symbol].clear()
-            else:
-                self._pending.clear()
+        if symbol:
+            self._pending[symbol].clear()
+        else:
+            self._pending.clear()
 
     def register_execution(
         self,
@@ -302,27 +295,26 @@ class OrderReconciler:
             order_id: The IB order ID
             reconciled_order: The reconciled order being executed
         """
-        with self._lock:
-            allocation = ExecutionAllocation(
-                symbol=reconciled_order.symbol,
-                order_id=order_id,
-                total_filled=0,
-                avg_price=0.0,
-            )
+        allocation = ExecutionAllocation(
+            symbol=reconciled_order.symbol,
+            order_id=order_id,
+            total_filled=0,
+            avg_price=0.0,
+        )
 
-            # Pre-calculate proportional allocations
-            total_qty = sum(
-                ps.signal.quantity for ps in reconciled_order.contributing_signals
-            )
+        # Pre-calculate proportional allocations
+        total_qty = sum(
+            ps.signal.quantity for ps in reconciled_order.contributing_signals
+        )
 
-            for ps in reconciled_order.contributing_signals:
-                # Proportional allocation based on signal quantity
-                proportion = ps.signal.quantity / total_qty if total_qty > 0 else 0
-                allocated = int(reconciled_order.net_quantity * proportion)
-                allocation.allocations[ps.algorithm_name] = allocated
-                allocation.allocation_pcts[ps.algorithm_name] = proportion
+        for ps in reconciled_order.contributing_signals:
+            # Proportional allocation based on signal quantity
+            proportion = ps.signal.quantity / total_qty if total_qty > 0 else 0
+            allocated = int(reconciled_order.net_quantity * proportion)
+            allocation.allocations[ps.algorithm_name] = allocated
+            allocation.allocation_pcts[ps.algorithm_name] = proportion
 
-            self._execution_allocations[order_id] = allocation
+        self._execution_allocations[order_id] = allocation
 
     def allocate_fill(
         self,
@@ -341,38 +333,36 @@ class OrderReconciler:
         Returns:
             Dict mapping algorithm_name -> (shares_allocated, avg_price)
         """
-        with self._lock:
-            allocation = self._execution_allocations.get(order_id)
-            if not allocation:
-                logger.warning(f"No allocation found for order {order_id}")
-                return {}
+        allocation = self._execution_allocations.get(order_id)
+        if not allocation:
+            logger.warning(f"No allocation found for order {order_id}")
+            return {}
 
-            allocation.total_filled = filled_quantity
-            allocation.avg_price = avg_price
+        allocation.total_filled = filled_quantity
+        allocation.avg_price = avg_price
 
-            # Calculate actual allocations based on fill
-            total_allocated = sum(allocation.allocations.values())
-            result = {}
+        # Calculate actual allocations based on fill
+        total_allocated = sum(allocation.allocations.values())
+        result = {}
 
-            for algo_name, target_qty in allocation.allocations.items():
-                if total_allocated > 0:
-                    # Proportional fill
-                    actual = int(filled_quantity * (target_qty / total_allocated))
-                else:
-                    actual = 0
-                result[algo_name] = (actual, avg_price)
+        for algo_name, target_qty in allocation.allocations.items():
+            if total_allocated > 0:
+                # Proportional fill
+                actual = int(filled_quantity * (target_qty / total_allocated))
+            else:
+                actual = 0
+            result[algo_name] = (actual, avg_price)
 
-            logger.info(
-                f"Allocated fill for order {order_id}: "
-                f"{filled_quantity} shares @ ${avg_price:.2f} -> {result}"
-            )
+        logger.info(
+            f"Allocated fill for order {order_id}: "
+            f"{filled_quantity} shares @ ${avg_price:.2f} -> {result}"
+        )
 
-            return result
+        return result
 
     def get_allocation(self, order_id: int) -> Optional[ExecutionAllocation]:
         """Get allocation details for an order"""
-        with self._lock:
-            return self._execution_allocations.get(order_id)
+        return self._execution_allocations.get(order_id)
 
     def get_allocation_percentages(self, order_id: int) -> Dict[str, float]:
         """
@@ -387,11 +377,10 @@ class OrderReconciler:
             Dict mapping algorithm_name -> allocation percentage (0.0-1.0)
             Returns empty dict if order not found.
         """
-        with self._lock:
-            allocation = self._execution_allocations.get(order_id)
-            if allocation:
-                return allocation.allocation_pcts.copy()
-            return {}
+        allocation = self._execution_allocations.get(order_id)
+        if allocation:
+            return allocation.allocation_pcts.copy()
+        return {}
 
     def is_combined_order(self, order_id: int) -> bool:
         """
@@ -403,9 +392,8 @@ class OrderReconciler:
         Returns:
             True if order has multiple contributing plugins
         """
-        with self._lock:
-            allocation = self._execution_allocations.get(order_id)
-            return allocation.is_combined_order() if allocation else False
+        allocation = self._execution_allocations.get(order_id)
+        return allocation.is_combined_order() if allocation else False
 
     def create_ib_order(self, reconciled: ReconciledOrder) -> Order:
         """

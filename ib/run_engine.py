@@ -21,6 +21,7 @@ Command line options:
 """
 
 import argparse
+import asyncio
 import logging
 import sys
 import os
@@ -258,14 +259,17 @@ def main():
 
     # Start engine
     logger.info("Connecting to IB...")
-    if engine.start():
-        engine.run_forever()
-    else:
-        logger.error("Failed to start engine")
-        return 1
 
-    logger.info("Engine stopped.")
-    return 0
+    async def _run():
+        if await engine.start():
+            await engine.run_forever()
+            logger.info("Engine stopped.")
+            return 0
+        else:
+            logger.error("Failed to start engine")
+            return 1
+
+    return asyncio.run(_run())
 
 
 class EngineCommandHandler:
