@@ -12,6 +12,7 @@ Usage:
     ./run_paper_tests.py --historical         # historical data tests only
     ./run_paper_tests.py --all                # feeds + historical + all order plugins
     ./run_paper_tests.py --only 1 3 5         # specific order plugins
+    ./run_paper_tests.py --interface          # interface validation tests only
     ./run_paper_tests.py --socket /tmp/x.sock # custom socket
     ./run_paper_tests.py --timeout 3600       # per-plugin timeout (seconds)
     ./run_paper_tests.py --dry-run            # show plan, don't execute
@@ -33,6 +34,13 @@ from ibctl import DEFAULT_SOCKET_PATH, CommandStatus, send_command  # noqa: E402
 # ---------------------------------------------------------------------------
 # Plugin registry
 # ---------------------------------------------------------------------------
+
+INTERFACE_PLUGIN = {
+    "name": "paper_test_interface",
+    "module": "plugins.paper_tests.paper_test_interface",
+    "label": "Interface Tests",
+    "timeout": 120.0,
+}
 
 FEED_PLUGIN = {
     "name": "paper_test_feeds",
@@ -137,6 +145,25 @@ def _poll_status(plugin_name: str, socket_path: str, stop_event: threading.Event
 # ---------------------------------------------------------------------------
 # Result formatting
 # ---------------------------------------------------------------------------
+
+def _fmt_interface_results(results: List[Dict]) -> str:
+    lines = []
+    col = "{:<40} {:<16} {:<6} {}"
+    lines.append(col.format("Test", "Category", "Pass?", "Detail / Error"))
+    lines.append("-" * 90)
+    for r in results:
+        passed = "PASS" if r.get("passed") else "FAIL"
+        detail = r.get("detail") or r.get("error_message", "")
+        lines.append(
+            col.format(
+                r.get("test_name", "?")[:40],
+                r.get("category", "?")[:16],
+                passed,
+                detail[:45],
+            )
+        )
+    return "\n".join(lines)
+
 
 def _fmt_order_results(results: List[Dict]) -> str:
     lines = []
@@ -389,6 +416,8 @@ def run_plugin(plugin_info: Dict, socket_path: str, timeout: float, dry_run: boo
             print(_fmt_order_results(results))
         elif "bar_size" in first:
             print(_fmt_historical_results(results))
+        elif "category" in first:
+            print(_fmt_interface_results(results))
         else:
             print(_fmt_feed_results(results))
         print()
@@ -437,6 +466,11 @@ def main():
         help="Run the paper_test_historical plugin",
     )
     parser.add_argument(
+        "--interface",
+        action="store_true",
+        help="Run the paper_test_interface plugin (PluginBase interface validation)",
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
         dest="run_all",
@@ -474,7 +508,9 @@ def main():
         sys.exit(0 if success else 1)
 
     if args.run_all:
-        plugins_to_run = [FEED_PLUGIN, HISTORICAL_PLUGIN] + ORDER_PLUGINS
+        plugins_to_run = [INTERFACE_PLUGIN, FEED_PLUGIN, HISTORICAL_PLUGIN] + ORDER_PLUGINS
+    elif args.interface:
+        plugins_to_run = [INTERFACE_PLUGIN]
     elif args.feeds:
         plugins_to_run = [FEED_PLUGIN]
     elif args.historical:
