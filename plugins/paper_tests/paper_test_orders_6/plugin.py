@@ -158,6 +158,8 @@ class PaperTestOrders6Plugin(PluginBase):
         self._fill_events: Dict[int, threading.Event] = {}
         # order_id → list of IB advisory/warning strings (error code 399)
         self._order_warnings: Dict[int, List[str]] = {}
+        # stream req_ids where IB reported subscription unavailable (10089/10091)
+        self._stream_sub_errors: set = set()
 
     @property
     def description(self) -> str:
@@ -228,7 +230,16 @@ class PaperTestOrders6Plugin(PluginBase):
         # Capture IB repricing / advisory warnings (code 399) per order ID
         if error_code == 399 and req_id > 0:
             self._order_warnings.setdefault(req_id, []).append(error_string)
-        # Wake any thread waiting on this order_id
+        # Top-of-book subscription not available (10089/10091): record the
+        # condition and wake any price-fetch event waiting on this stream so
+        # _fetch_price can fall back immediately rather than waiting 8 seconds.
+        if error_code in (10089, 10091) and req_id > 0:
+            self._stream_sub_errors.add(req_id)
+            logger.info(
+                f"  [{self.name}] reqId={req_id}: top-of-book subscription "
+                f"unavailable — _fetch_price will fall back to TRADES data"
+            )
+        # Wake any thread waiting on this req_id (order or stream)
         ev = self._fill_events.get(req_id)
         if ev:
             ev.set()
@@ -296,6 +307,7 @@ class PaperTestOrders6Plugin(PluginBase):
         self._running = True
         self._results = []
         self._order_warnings = {}
+        self._stream_sub_errors = set()
 
         try:
             err = self._verify_paper_connection()
@@ -427,14 +439,16 @@ class PaperTestOrders6Plugin(PluginBase):
 
     def _fetch_price(self, symbol: str, timeout: float = 15.0) -> Optional[float]:
         """
-        Fetch current market price.
+        Fetch current market price — three-tier fallback:
 
-        During market hours: tick stream gives a near-instant live price.
-        After hours / no ticks within timeout: falls back to the close of the
-        most recent daily bar (works any time IB has historical data).
+        1. Live tick stream (instant if subscribed to TOP/BID_ASK).
+        2. Recent 5-second TRADES bars (last 2 min) — used when IB reports
+           10089/10091 (top-of-book subscription unavailable).  Wakes early
+           instead of waiting the full 8s.
+        3. Last daily close bar — works any time IB has historical data.
         """
         from ib.data_feed import DataType, TickData
-        contract = make_stk_contract(symbol)
+        contract = self._make_contract(symbol)
         captured: Dict[str, float] = {}
         ev = threading.Event()
 
@@ -449,17 +463,49 @@ class PaperTestOrders6Plugin(PluginBase):
             data_types={DataType.TICK},
             on_tick=_on_tick,
         )
-        # Use a shorter tick wait so after-hours fallback kicks in quickly.
+
+        # Register ev by stream req_id so on_ib_error(10089/10091) can wake it early.
+        stream_req_id = (
+            self.portfolio._stream_req_ids.get(symbol) if self.portfolio else None
+        )
+        if stream_req_id is not None:
+            self._fill_events[stream_req_id] = ev
+
         tick_timeout = min(timeout, 8.0)
         ev.wait(timeout=tick_timeout)
         self.cancel_stream(symbol)
 
+        if stream_req_id is not None:
+            self._fill_events.pop(stream_req_id, None)
+
         if captured.get("price"):
             return captured["price"]
 
-        # Fallback: last close from 1-day historical bar (use primaryExch contract).
-        # use_rth=False so IB returns data even when queried outside market hours.
-        logger.info(f"  [{self.name}] no live tick for {symbol}; trying historical close")
+        # Tier 2: top-of-book subscription unavailable — try recent TRADES bars.
+        if stream_req_id is not None and stream_req_id in self._stream_sub_errors:
+            self._stream_sub_errors.discard(stream_req_id)
+            logger.warning(
+                f"  [{self.name}] {symbol}: top-of-book subscription unavailable "
+                f"(10089/10091); retrying with recent TRADES bars"
+            )
+            bars = self.get_historical_data(
+                contract=self._make_contract(symbol),
+                duration_str="1800 S",
+                bar_size_setting="1 min",
+                what_to_show="TRADES",
+                use_rth=False,
+                timeout=15.0,
+            )
+            if bars:
+                close = bars[-1].close
+                if close and close > 0:
+                    logger.info(
+                        f"  [{self.name}] {symbol} price from recent 1-min TRADES bar: {close}"
+                    )
+                    return float(close)
+
+        # Tier 3: last daily close bar.
+        logger.info(f"  [{self.name}] {symbol}: falling back to daily historical close")
         bars = self.get_historical_data(
             contract=self._make_contract(symbol),
             duration_str="2 D",
