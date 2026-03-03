@@ -1353,8 +1353,7 @@ class Portfolio(IBClient):
             if pos.contract:
                 req_id = self.get_next_req_id()
                 self._market_data_requests[req_id] = symbol
-                # Use delayed data (free, no subscription required)
-                self.reqMarketDataType(3)
+                # Market data type already set by the engine before load() is called
                 self.reqMktData(req_id, pos.contract, "", True, False, [])
 
         try:

@@ -44,8 +44,9 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Environment variables (override defaults):
-  PORT    IB Gateway/TWS port (default: 7497)
-  MODE    Order mode: dry_run, immediate, queued (default: dry_run)
+  PORT              IB Gateway/TWS port (default: 7497)
+  MODE              Order mode: dry_run, immediate, queued (default: dry_run)
+  MARKET_DATA_TYPE  IB market data type: 1=live, 3=delayed (default: auto)
 
 Examples:
   python3 -m ib.run_engine
@@ -79,6 +80,14 @@ Examples:
         "--plugin-dir",
         default=None,
         help="Plugin directory path (default: from IB_PLUGIN_DIR env or ./plugins)",
+    )
+
+    # Market data type
+    parser.add_argument(
+        "--market-data-type", type=int, choices=[1, 2, 3, 4], default=None,
+        help="IB market data type: 1=live, 2=frozen, 3=delayed, 4=delayed-frozen "
+             "(default: auto-detect from account — paper→3, live→1). "
+             "Use 1 if your paper account has live data shared from a live account."
     )
 
     # Command server options
@@ -122,12 +131,15 @@ def main():
     # Get config from environment, then override with command line
     port = args.port or int(os.environ.get("PORT", "7497"))
     mode = args.mode or os.environ.get("MODE", "dry_run")
+    mdt_env = os.environ.get("MARKET_DATA_TYPE")
+    market_data_type = args.market_data_type or (int(mdt_env) if mdt_env else None)
 
     logger.info("=" * 60)
     logger.info("IB Trading Engine")
     logger.info("=" * 60)
     logger.info(f"Port: {port}")
     logger.info(f"Order Mode: {mode}")
+    logger.info(f"Market Data Type: {market_data_type if market_data_type else 'auto'}")
     logger.info(f"Socket: {args.socket if not args.no_server else 'disabled'}")
     logger.info("Engine Mode: Plugin Executive")
     logger.info("=" * 60)
@@ -152,6 +164,7 @@ def main():
         client_id=args.client_id,
         order_mode=mode_map.get(mode, OrderExecutionMode.DRY_RUN),
         enable_message_bus=True,
+        market_data_type=market_data_type,
     )
 
     # Create engine

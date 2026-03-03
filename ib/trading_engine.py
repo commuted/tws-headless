@@ -257,6 +257,19 @@ class TradingEngine:
 
     async def _async_on_connected(self):
         """Async handler for connection-established work"""
+        # Set market data type first — before portfolio.load() so that
+        # position snapshot prices also use the correct type.
+        # managed_accounts is populated by the IB handshake before this
+        # coroutine runs, so account-based detection is reliable here.
+        mdt = self._resolve_market_data_type()
+        self._portfolio.reqMarketDataType(mdt)
+        self._data_feed.use_delayed_data = (mdt == 3)
+        logger.info(
+            f"Market data type: {mdt} "
+            f"({'delayed' if mdt == 3 else 'live' if mdt == 1 else str(mdt)}) "
+            f"[accounts: {self._portfolio.managed_accounts}]"
+        )
+
         # Load portfolio if configured
         if self.config.load_portfolio_on_start:
             try:
@@ -266,18 +279,6 @@ class TradingEngine:
                 )
             except Exception as e:
                 logger.error(f"Failed to load portfolio: {e}")
-
-        # Set market data type AFTER portfolio.load() — load() calls
-        # reqMarketDataType(3) for snapshot prices internally, which would
-        # otherwise persist and cause live accounts to receive delayed data.
-        mdt = self._resolve_market_data_type()
-        self._portfolio.reqMarketDataType(mdt)
-        self._data_feed.use_delayed_data = (mdt == 3)
-        logger.info(
-            f"Market data type: {mdt} "
-            f"({'delayed' if mdt == 3 else 'live' if mdt == 1 else str(mdt)}) "
-            f"[accounts: {self._portfolio.managed_accounts}]"
-        )
 
         # Start data feed if not already running
         if not self._data_feed.is_running:
