@@ -1,3 +1,3 @@
 """
-Unit tests for IB Portfolio Rebalancer
+Unit tests for TWS Headless
 """

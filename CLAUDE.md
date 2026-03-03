@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-IB Portfolio is an Interactive Brokers trading system with portfolio management, algorithmic trading, and a plugin architecture. It connects to IB TWS/Gateway via the ibapi Python library.
+TWS Headless is an Interactive Brokers trading system with portfolio management, algorithmic trading, and a plugin architecture. It connects to IB TWS/Gateway via the ibapi Python library.
 
 ## Commands
 

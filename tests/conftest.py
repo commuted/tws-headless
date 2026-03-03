@@ -1,5 +1,5 @@
 """
-Pytest configuration for IB Portfolio tests.
+Pytest configuration for TWS Headless tests.
 
 This file ensures the package can be imported correctly during tests.
 """

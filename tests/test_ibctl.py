@@ -1,7 +1,7 @@
 """
 Unit tests for ibctl.py
 
-Tests the command-line client for IB Portfolio Rebalancer.
+Tests the command-line client for TWS Headless.
 """
 
 import json

@@ -40,7 +40,7 @@ logger = logging.getLogger("trading")
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="IB Trading Engine - Continuous algorithmic trading",
+        description="TWS Headless - Continuous algorithmic trading engine",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Environment variables (override defaults):
@@ -83,8 +83,8 @@ Examples:
 
     # Command server options
     parser.add_argument(
-        "--socket", default="/tmp/ib_portfolio.sock",
-        help="Unix socket path for commands (default: /tmp/ib_portfolio.sock)"
+        "--socket", default="/tmp/tws_headless.sock",
+        help="Unix socket path for commands (default: /tmp/tws_headless.sock)"
     )
     parser.add_argument(
         "--no-server", action="store_true",

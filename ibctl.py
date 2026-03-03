@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ibctl.py - Command-line client for IB Portfolio Rebalancer
+ibctl.py - Command-line client for TWS Headless
 
 Send commands to a running main.py or run_engine.py instance via Unix socket.
 
@@ -58,7 +58,7 @@ from typing import Dict, Any, Optional
 
 
 # Default socket path - must match command_server.py
-DEFAULT_SOCKET_PATH = "/tmp/ib_portfolio.sock"
+DEFAULT_SOCKET_PATH = "/tmp/tws_headless.sock"
 
 
 class CommandStatus(Enum):
@@ -235,7 +235,7 @@ def format_result(result: CommandResult, verbose: bool = False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Command-line client for IB Portfolio Rebalancer",
+        description="Command-line client for TWS Headless",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
