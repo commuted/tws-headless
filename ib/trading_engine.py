@@ -58,6 +58,9 @@ class EngineConfig:
 
     # Data feed settings
     use_delayed_data: bool = True
+    # Market data type: None = auto-detect from account (paper→3, live→1),
+    # 1 = real-time, 2 = frozen, 3 = delayed, 4 = delayed-frozen
+    market_data_type: Optional[int] = None
 
     # Plugin execution settings
     order_mode: OrderExecutionMode = OrderExecutionMode.DRY_RUN
@@ -231,6 +234,22 @@ class TradingEngine:
             self._plugin_executive.on_error = self._on_runner_error
             self._plugin_executive.on_plugin_state_change = self._on_plugin_state_change
 
+    def _resolve_market_data_type(self) -> int:
+        """
+        Return the IB market data type to use for streaming subscriptions.
+
+        Priority:
+          1. config.market_data_type if explicitly set
+          2. 3 (delayed) if all managed accounts start with 'D' (paper accounts)
+          3. 1 (live) otherwise
+        """
+        if self.config.market_data_type is not None:
+            return self.config.market_data_type
+        accounts = self._portfolio.managed_accounts
+        if accounts and all(a.startswith("D") for a in accounts):
+            return 3
+        return 1
+
     def _on_connected(self):
         """Handle connection established"""
         logger.info("Trading engine: Connected to IB")
@@ -247,6 +266,18 @@ class TradingEngine:
                 )
             except Exception as e:
                 logger.error(f"Failed to load portfolio: {e}")
+
+        # Set market data type AFTER portfolio.load() — load() calls
+        # reqMarketDataType(3) for snapshot prices internally, which would
+        # otherwise persist and cause live accounts to receive delayed data.
+        mdt = self._resolve_market_data_type()
+        self._portfolio.reqMarketDataType(mdt)
+        self._data_feed.use_delayed_data = (mdt == 3)
+        logger.info(
+            f"Market data type: {mdt} "
+            f"({'delayed' if mdt == 3 else 'live' if mdt == 1 else str(mdt)}) "
+            f"[accounts: {self._portfolio.managed_accounts}]"
+        )
 
         # Start data feed if not already running
         if not self._data_feed.is_running:
