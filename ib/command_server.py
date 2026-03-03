@@ -313,7 +313,11 @@ class CommandServer:
                 await writer.drain()
                 return
 
-            result = self._execute_command(remaining)
+            # Run in a thread pool so that long-running plugin commands
+            # (e.g. "plugin request run_tests") do not block the event loop.
+            # The thread-safe send_msg in async_transport uses call_soon_threadsafe
+            # so IB requests made from the thread are still safe.
+            result = await asyncio.to_thread(self._execute_command, remaining)
             result.request_token = request_token
 
             writer.write((result.to_json() + "\n").encode("utf-8"))

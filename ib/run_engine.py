@@ -1533,6 +1533,12 @@ class EngineCommandHandler:
 
             try:
                 import importlib as _il
+                # Always evict the module (and any submodules) from sys.modules
+                # so that each "plugin load" picks up the latest code on disk.
+                _prefix = module_name + "."
+                _stale = [k for k in sys.modules if k == module_name or k.startswith(_prefix)]
+                for _k in _stale:
+                    del sys.modules[_k]
                 module = _il.import_module(module_name)
 
                 from plugins.base import PluginBase

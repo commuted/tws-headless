@@ -618,6 +618,7 @@ class PluginExecutive:
         self._running = False
         self._paused = False
         self._shutdown_event = asyncio.Event()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Registered plugins
         self._plugins: Dict[str, PluginConfig] = {}
@@ -1865,7 +1866,14 @@ class PluginExecutive:
             except Exception as e:
                 logger.error(f"Deferred unload of plugin '{name}' failed: {e}")
 
-        asyncio.create_task(_do_unload())
+        try:
+            # Normal case: called from within the event loop.
+            asyncio.get_running_loop().create_task(_do_unload())
+        except RuntimeError:
+            # Called from a thread (e.g. asyncio.to_thread plugin execution).
+            # run_coroutine_threadsafe schedules the coroutine on the loop safely.
+            loop = self._loop or asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(_do_unload(), loop)
         logger.info(f"Deferred unload scheduled for plugin '{name}'")
 
     def get_departures(self, clear: bool = False) -> Dict[str, Dict[str, Any]]:
@@ -2391,6 +2399,7 @@ class PluginExecutive:
         self._running = True
         self._paused = False
         self._shutdown_event.clear()
+        self._loop = asyncio.get_event_loop()
         self._executor_restart_count = 0
         self._last_auto_save = datetime.now()
         self._stats["started_at"] = datetime.now().isoformat()
@@ -2761,7 +2770,10 @@ class PluginExecutive:
                     plugin_name = item[1]
                     _, config = self._resolve_plugin(plugin_name)
                     if config:
-                        self._run_plugin(config)
+                        # Run in a thread so that blocking calls inside
+                        # plugin.run() (e.g. threading.Event.wait() in
+                        # get_historical_data) do not stall the event loop.
+                        await asyncio.to_thread(self._run_plugin, config)
 
                 elif item[0] == "RECONCILED":
                     reconciled = item[1]

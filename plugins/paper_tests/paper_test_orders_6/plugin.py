@@ -397,6 +397,20 @@ class PaperTestOrders6Plugin(PluginBase):
             self._fill_events.pop(oid, None)
         return None  # timeout
 
+    # Primary exchange for each symbol used in this plugin.
+    # Required so IB can route historical data requests without ambiguity.
+    _PRIMARY_EXCHANGE: Dict[str, str] = {
+        "TQQQ": "NASDAQ", "SQQQ": "NASDAQ",
+        "SPXU": "ARCA",   "SDS":  "ARCA",
+        "SDOW": "ARCA",   "DXD":  "ARCA",
+        "SPY":  "ARCA",
+    }
+
+    def _make_contract(self, symbol: str):
+        """Contract with primaryExch set — needed for historical data requests."""
+        from ib.contract_builder import ContractBuilder
+        return ContractBuilder.us_stock(symbol, self._PRIMARY_EXCHANGE.get(symbol, ""))
+
     def _fetch_price(self, symbol: str, timeout: float = 15.0) -> Optional[float]:
         """
         Fetch current market price.
@@ -429,14 +443,15 @@ class PaperTestOrders6Plugin(PluginBase):
         if captured.get("price"):
             return captured["price"]
 
-        # Fallback: last close from 1-day historical bar
+        # Fallback: last close from 1-day historical bar (use primaryExch contract).
+        # use_rth=False so IB returns data even when queried outside market hours.
         logger.info(f"  [{self.name}] no live tick for {symbol}; trying historical close")
         bars = self.get_historical_data(
-            contract=contract,
+            contract=self._make_contract(symbol),
             duration_str="2 D",
             bar_size_setting="1 day",
             what_to_show="TRADES",
-            use_rth=True,
+            use_rth=False,
             timeout=30.0,
         )
         if bars:
@@ -460,7 +475,7 @@ class PaperTestOrders6Plugin(PluginBase):
         segment from today.  Falls back to True on any parse failure so that
         missing contract data never silently blocks a test run.
         """
-        contract = make_stk_contract(symbol)
+        contract = self._make_contract(symbol)
         details_list = self.get_contract_details(contract, timeout=15.0)
         if not details_list:
             logger.warning(f"[{self.name}] _is_market_open: no contract details for {symbol}; assuming open")
