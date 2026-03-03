@@ -274,32 +274,28 @@ class TradingEngine:
             self._portfolio.reqMktData(probe_req_id, spy, "", True, False, [])
 
             try:
-                detected = await asyncio.wait_for(asyncio.shield(result), timeout=5.0)
+                # A marketDataType callback fires only when IB *downgrades*
+                # from the requested type. If we requested type 1 and the
+                # callback fires with type 3, live data is not available.
+                # If the timeout expires with no callback, IB delivered live
+                # data silently — type 1 is confirmed available.
+                downgraded_to = await asyncio.wait_for(asyncio.shield(result), timeout=5.0)
                 logger.info(
-                    f"Market data probe: type {detected} "
-                    f"({'live' if detected == 1 else 'delayed' if detected == 3 else str(detected)})"
+                    f"Market data probe: IB downgraded to type {downgraded_to} "
+                    f"({'delayed' if downgraded_to == 3 else str(downgraded_to)}) — no live subscription"
                 )
-                return detected
+                return downgraded_to
             except asyncio.TimeoutError:
-                fallback = self._account_name_market_data_type()
-                logger.warning(
-                    f"Market data probe timed out; falling back to "
-                    f"account-name heuristic: type {fallback}"
+                logger.info(
+                    "Market data probe: no downgrade received — live data confirmed (type 1)"
                 )
-                return fallback
+                return 1
         finally:
             self._portfolio._callbacks.pop("marketDataType", None)
             try:
                 self._portfolio.cancelMktData(probe_req_id)
             except Exception:
                 pass
-
-    def _account_name_market_data_type(self) -> int:
-        """Heuristic fallback: paper accounts (D*) → 3 (delayed), live → 1."""
-        accounts = self._portfolio.managed_accounts
-        if accounts and all(a.startswith("D") for a in accounts):
-            return 3
-        return 1
 
     def _on_connected(self):
         """Handle connection established"""
