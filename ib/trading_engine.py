@@ -234,17 +234,68 @@ class TradingEngine:
             self._plugin_executive.on_error = self._on_runner_error
             self._plugin_executive.on_plugin_state_change = self._on_plugin_state_change
 
-    def _resolve_market_data_type(self) -> int:
+    async def _detect_market_data_type(self) -> int:
         """
-        Return the IB market data type to use for streaming subscriptions.
+        Probe IB to discover whether live market data is available.
+
+        Sends reqMarketDataType(1) then a SPY snapshot.  IB responds with a
+        marketDataType(reqId, type) callback before the first tick — type 1
+        means live data is being delivered, type 3 means IB auto-downgraded
+        to delayed because no live subscription is active.
 
         Priority:
-          1. config.market_data_type if explicitly set
-          2. 3 (delayed) if all managed accounts start with 'D' (paper accounts)
-          3. 1 (live) otherwise
+          1. config.market_data_type if explicitly set — skip probe entirely
+          2. Probe result (1 or 3)
+          3. Account-name heuristic on probe timeout (D* → 3, else 1)
         """
         if self.config.market_data_type is not None:
             return self.config.market_data_type
+
+        loop = asyncio.get_event_loop()
+        result: asyncio.Future = loop.create_future()
+        probe_req_id = self._portfolio.get_next_req_id()
+
+        def _on_mdt(req_id: int, mdt: int):
+            if req_id == probe_req_id and not result.done():
+                result.set_result(mdt)
+
+        self._portfolio._callbacks["marketDataType"] = _on_mdt
+
+        try:
+            from ibapi.contract import Contract
+            spy = Contract()
+            spy.symbol = "SPY"
+            spy.secType = "STK"
+            spy.exchange = "SMART"
+            spy.currency = "USD"
+            spy.primaryExch = "ARCA"
+
+            self._portfolio.reqMarketDataType(1)
+            self._portfolio.reqMktData(probe_req_id, spy, "", True, False, [])
+
+            try:
+                detected = await asyncio.wait_for(asyncio.shield(result), timeout=5.0)
+                logger.info(
+                    f"Market data probe: type {detected} "
+                    f"({'live' if detected == 1 else 'delayed' if detected == 3 else str(detected)})"
+                )
+                return detected
+            except asyncio.TimeoutError:
+                fallback = self._account_name_market_data_type()
+                logger.warning(
+                    f"Market data probe timed out; falling back to "
+                    f"account-name heuristic: type {fallback}"
+                )
+                return fallback
+        finally:
+            self._portfolio._callbacks.pop("marketDataType", None)
+            try:
+                self._portfolio.cancelMktData(probe_req_id)
+            except Exception:
+                pass
+
+    def _account_name_market_data_type(self) -> int:
+        """Heuristic fallback: paper accounts (D*) → 3 (delayed), live → 1."""
         accounts = self._portfolio.managed_accounts
         if accounts and all(a.startswith("D") for a in accounts):
             return 3
@@ -257,15 +308,13 @@ class TradingEngine:
 
     async def _async_on_connected(self):
         """Async handler for connection-established work"""
-        # Set market data type first — before portfolio.load() so that
+        # Detect market data type before loading the portfolio so that
         # position snapshot prices also use the correct type.
-        # managed_accounts is populated by the IB handshake before this
-        # coroutine runs, so account-based detection is reliable here.
-        mdt = self._resolve_market_data_type()
+        mdt = await self._detect_market_data_type()
         self._portfolio.reqMarketDataType(mdt)
         self._data_feed.use_delayed_data = (mdt == 3)
         logger.info(
-            f"Market data type: {mdt} "
+            f"Market data type set to {mdt} "
             f"({'delayed' if mdt == 3 else 'live' if mdt == 1 else str(mdt)}) "
             f"[accounts: {self._portfolio.managed_accounts}]"
         )
