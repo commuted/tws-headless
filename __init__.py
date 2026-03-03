@@ -1,7 +1,7 @@
 """
-IB Portfolio Rebalancer
+TWS Headless
 
-A modular system for managing and rebalancing Interactive Brokers portfolios.
+Headless plugin-based trading engine for Interactive Brokers.
 
 Modules:
     - models: Data classes (Position, TargetAllocation, RebalanceTrade, etc.)
@@ -9,27 +9,6 @@ Modules:
     - portfolio: Portfolio loading and management
     - rebalancer: Rebalancing strategies and execution
     - command_server: Unix socket command interface
-
-Quick Start:
-    from ib import Portfolio, Rebalancer, TargetAllocation
-
-    # Load portfolio
-    portfolio = Portfolio()
-    portfolio.connect()
-    portfolio.load()
-
-    # Setup rebalancer
-    rebalancer = Rebalancer(portfolio)
-    rebalancer.set_targets([
-        TargetAllocation("SPY", 60.0),
-        TargetAllocation("BND", 40.0),
-    ])
-
-    # Calculate and preview
-    result = rebalancer.calculate()
-    print(rebalancer.preview(result))
-
-    portfolio.disconnect()
 """
 
 __version__ = "0.1.0"

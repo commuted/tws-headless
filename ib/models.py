@@ -1,5 +1,5 @@
 """
-models.py - Data models for the IB Portfolio system
+models.py - Data models for TWS Headless
 
 Contains all data classes used throughout the application.
 Compatible with the official Interactive Brokers API.

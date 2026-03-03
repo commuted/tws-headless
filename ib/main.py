@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py - Entry point for IB Portfolio Rebalancer
+main.py - Entry point for TWS Headless
 
 Usage:
     python main.py                    # Show portfolio
@@ -1919,7 +1919,7 @@ def execute_rebalance(
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="IB Portfolio Rebalancer",
+        description="TWS Headless",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

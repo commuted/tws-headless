@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 # Default socket path
-DEFAULT_SOCKET_PATH = "/tmp/ib_portfolio.sock"
+DEFAULT_SOCKET_PATH = "/tmp/tws_headless.sock"
 
 
 class CommandStatus(Enum):

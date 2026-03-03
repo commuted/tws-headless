@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ib-portfolio"
+name = "tws-headless"
 version = "0.1.0"
-description = "Interactive Brokers headless plugin based trading solution"
+description = "TWS Headless — headless plugin-based trading engine for Interactive Brokers"
 requires-python = ">=3.10"
 dependencies = [
     "ibapi",
