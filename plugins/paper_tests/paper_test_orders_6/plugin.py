@@ -10,7 +10,7 @@ Additional order features exercised
 ────────────────────────────────────
   TIF variants   IOC (immediate-or-cancel), GTC (good-till-cancelled), FOK
   IB algo        Adaptive (urgency=Urgent) — smart routing with controlled pace
-  Modifiers      displaySize / iceberg (shows 1 share at a time on book)
+  Modifiers      displaySize / iceberg (100 shares shown per tranche; lot-size-compliant)
 
 Round-trip tests (position opened AND closed on same symbol)
 ────────────────────────────────────────────────────────────
@@ -20,7 +20,7 @@ Round-trip tests (position opened AND closed on same symbol)
   mkt_trail         MKT buy SDS   → TRAIL 0.5%           (trailing exit; fallback MKT)
   mkt_stplmt        MKT buy SDOW  → STP LMT −1%/−1.5%  (protective exit; fallback MKT)
   adaptive          Adaptive BUY SPXU (Urgent) → MKT sell
-  iceberg           LMT buy TQQQ 3 shares displaySize=1 → MKT sell 3
+  iceberg           LMT buy TQQQ 200 shares displaySize=100 → MKT sell 200
 
 No-position tests (order placed, verified, then cancelled / killed)
 ────────────────────────────────────────────────────────────────────
@@ -1298,17 +1298,21 @@ class PaperTestOrders6Plugin(PluginBase):
 
     def _test_iceberg_roundtrip(self) -> RoundTripResult:
         """
-        Iceberg LMT buy TQQQ — 3 shares total, displaySize=1 (shows 1 at a time).
-        → MKT sell 3 shares when the iceberg fully fills.
+        Iceberg LMT buy TQQQ — 200 shares total, displaySize=100 (1 round lot shown).
+        → MKT sell 200 shares when the iceberg fully fills.
         Tests IB's reserve/iceberg order: only `displaySize` shares are shown
         on the order book at any time; refreshed automatically as each tranche fills.
         Uses 0.3% below market so the limit is aggressive enough to fill.
+
+        Note: IB requires displaySize to be a multiple of the exchange lot size
+        (100 shares for US stocks). displaySize=1 is rejected on paper accounts.
         """
         sym = "TQQQ"
-        qty = Decimal("3")
+        qty = Decimal("200")
+        display_size = 100   # 1 round lot; IB requires multiple of lot size (100)
         r = RoundTripResult(
             test_name="iceberg_roundtrip", order_type="ICE LMT→MKT",
-            symbol=sym, quantity=3.0,
+            symbol=sym, quantity=200.0,
         )
         start = time.time()
         try:
@@ -1320,7 +1324,7 @@ class PaperTestOrders6Plugin(PluginBase):
             lmt_px = round(price * _BELOW_003, 2)
             logger.info(
                 f"  [{sym}] price=${price:.4f}, iceberg lmt=${lmt_px:.4f} "
-                f"qty=3 displaySize=1"
+                f"qty=200 displaySize={display_size}"
             )
 
             eo = Order()
@@ -1328,7 +1332,7 @@ class PaperTestOrders6Plugin(PluginBase):
             eo.orderType = "LMT"
             eo.totalQuantity = qty
             eo.lmtPrice = lmt_px
-            eo.displaySize = 1   # show 1 share at a time on the book
+            eo.displaySize = display_size
             oid_e = self._place(make_stk_contract(sym), eo)
             if oid_e is None:
                 r.error_message = "Failed to place iceberg order"
@@ -1343,7 +1347,7 @@ class PaperTestOrders6Plugin(PluginBase):
                 self._cancel(oid_e)
                 return r
 
-            logger.info(f"  [{sym}] Iceberg placed, waiting up to 5min for full 3-share fill...")
+            logger.info(f"  [{sym}] Iceberg placed, waiting up to 5min for full 200-share fill...")
             ef = self._wait_fill(oid_e, timeout=300.0)
             if ef is None:
                 self._cancel(oid_e)
@@ -1353,23 +1357,23 @@ class PaperTestOrders6Plugin(PluginBase):
             r.entry_fill_price = ef
             logger.info(f"  [{sym}] Iceberg fully filled (avg) @ ${ef:.4f}")
 
-            # Exit: sell all 3 shares at market
+            # Exit: sell all 200 shares at market
             oid_x = self._market_exit(sym, "SELL", qty)
             if oid_x is None:
-                r.error_message = "Failed to place 3-share market exit"
+                r.error_message = "Failed to place 200-share market exit"
                 return r
             r.exit_order_id = oid_x
             r.exit_submitted = True
 
             xf = self._wait_fill(oid_x, timeout=30.0)
             if xf is None:
-                r.error_message = "3-share market exit did not fill in 30s"
+                r.error_message = "200-share market exit did not fill in 30s"
                 return r
             r.exit_fill_price = xf
             r.round_trip_complete = True
             r.net_pnl = (xf - ef) * float(qty)
             r.notes = (
-                f"3-share iceberg(display=1) lmt=${lmt_px:.4f} "
+                f"200-share iceberg(display={display_size}) lmt=${lmt_px:.4f} "
                 f"entry=${ef:.4f} → exit=${xf:.4f}"
             )
             logger.info(f"  [{sym}] Exit @ ${xf:.4f} | PnL=${r.net_pnl:.4f}")
