@@ -1,6 +1,6 @@
 # Plugin Manual
 
-Complete reference for writing plugins for the IB trading engine.
+Complete reference for writing plugins for TWS Headless.
 
 ---
 
