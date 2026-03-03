@@ -199,6 +199,21 @@ class IBClient(EWrapper, EClient):
         if "error" in self._callbacks:
             self._callbacks["error"](reqId, errorCode, errorString)
 
+    def marketDataType(self, reqId: int, marketDataType: int):
+        """
+        Called by IB to report what market data type is being delivered for
+        a subscription.  Fires once per reqMktData call, before the first tick.
+
+        marketDataType values:
+          1 = real-time (live subscription active)
+          2 = frozen   (last available after market close)
+          3 = delayed  (15-minute delay; free)
+          4 = delayed-frozen
+        """
+        logger.debug(f"Market data type reqId={reqId}: {marketDataType}")
+        if "marketDataType" in self._callbacks:
+            self._callbacks["marketDataType"](reqId, marketDataType)
+
     def connectionClosed(self):
         self._connected.clear()
         logger.warning("Connection to IB closed")
