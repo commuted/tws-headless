@@ -50,6 +50,7 @@ class AsyncIBTransport:
         self._writer: Optional[asyncio.StreamWriter] = None
         self._connected = False
         self._decoder: Optional[Decoder] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ------------------------------------------------------------------
     # Connection
@@ -57,6 +58,7 @@ class AsyncIBTransport:
 
     async def connect(self, host: str, port: int, client_id: int) -> None:
         """Open TCP connection and perform the TWS API handshake."""
+        self._loop = asyncio.get_event_loop()
         self._reader, self._writer = await asyncio.open_connection(host, port)
 
         # Send: b"API\0" + length-framed version range string
@@ -75,7 +77,7 @@ class AsyncIBTransport:
         use_raw = self.serverVersion >= MIN_SERVER_VER_PROTOBUF
         self._writer.write(comm.make_msg(OUT.START_API, use_raw, body))
 
-        self._decoder = Decoder(self.wrapper, lambda: self.serverVersion)
+        self._decoder = Decoder(self.wrapper, self.serverVersion)
         self._connected = True
 
     def disconnect(self) -> None:
@@ -145,12 +147,22 @@ class AsyncIBTransport:
 
         msg must already include the 4-byte length prefix (as produced
         by comm.make_msg or comm.make_msg_proto).
-        asyncio.StreamWriter.write() buffers synchronously; the event
-        loop drains the buffer when it next has I/O time.
+
+        Thread-safe: if called from a non-event-loop thread, the write
+        is scheduled on the event loop via call_soon_threadsafe so that
+        plugins running in asyncio.to_thread() can send requests safely.
         """
         if not self._writer:
             raise ConnectionError("Not connected")
-        self._writer.write(msg)
+        try:
+            asyncio.get_running_loop()
+            # Called from within the event loop — write directly.
+            self._writer.write(msg)
+        except RuntimeError:
+            # Called from a different thread — schedule on the event loop.
+            if self._loop is None:
+                raise ConnectionError("Transport not connected (no event loop)")
+            self._loop.call_soon_threadsafe(self._writer.write, msg)
 
     # ------------------------------------------------------------------
     # Receive helpers
