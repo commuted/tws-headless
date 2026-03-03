@@ -35,7 +35,7 @@ import datetime
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -90,6 +90,7 @@ class RoundTripResult:
     duration_seconds: float = 0.0
     error_message: str = ""
     notes: str = ""
+    warnings: List[str] = field(default_factory=list)  # IB repricing / advisory messages
 
     @property
     def passed(self) -> bool:
@@ -116,6 +117,7 @@ class RoundTripResult:
             "duration_seconds": round(self.duration_seconds, 2),
             "error_message": self.error_message,
             "notes": self.notes,
+            "warnings": self.warnings,
             "passed": self.passed,
         }
 
@@ -154,6 +156,8 @@ class PaperTestOrders6Plugin(PluginBase):
         self._running = False
         # order_id → Event: set by on_order_fill / on_order_status
         self._fill_events: Dict[int, threading.Event] = {}
+        # order_id → list of IB advisory/warning strings (error code 399)
+        self._order_warnings: Dict[int, List[str]] = {}
 
     @property
     def description(self) -> str:
@@ -221,6 +225,9 @@ class PaperTestOrders6Plugin(PluginBase):
         logger.warning(
             f"[{self.name}] IB error reqId={req_id} [{error_code}]: {error_string}"
         )
+        # Capture IB repricing / advisory warnings (code 399) per order ID
+        if error_code == 399 and req_id > 0:
+            self._order_warnings.setdefault(req_id, []).append(error_string)
         # Wake any thread waiting on this order_id
         ev = self._fill_events.get(req_id)
         if ev:
@@ -288,6 +295,7 @@ class PaperTestOrders6Plugin(PluginBase):
 
         self._running = True
         self._results = []
+        self._order_warnings = {}
 
         try:
             err = self._verify_paper_connection()
@@ -320,11 +328,17 @@ class PaperTestOrders6Plugin(PluginBase):
             for fn in test_fns:
                 logger.info(f"--- [{self.name}] {fn.__name__} ---")
                 r = fn()
+                # Attach any IB repricing warnings collected for this test's orders
+                for oid in (r.entry_order_id, r.exit_order_id):
+                    if oid is not None:
+                        r.warnings.extend(self._order_warnings.pop(oid, []))
                 self._results.append(r)
                 self._log_result(r)
 
-            # Final safety sweep: cancel anything still open
+            # Final safety sweep: cancel anything still open, then wait for
+            # IB to process the cancellations before unloading.
             self._cancel_all_open_orders()
+            self._wait_for_cancellations(timeout=5.0)
 
             summary = self._build_summary()
             logger.info(
@@ -572,6 +586,39 @@ class PaperTestOrders6Plugin(PluginBase):
                         f"({rec.symbol} {rec.status.value})"
                     )
                     self._cancel(oid)
+
+    def _wait_for_cancellations(self, timeout: float = 5.0):
+        """
+        Poll order records until all tracked orders are in a terminal state
+        (FILLED or CANCELLED) or until `timeout` seconds have elapsed.
+        """
+        if not self.portfolio:
+            return
+        from ib.models import OrderStatus
+        terminal = {OrderStatus.FILLED, OrderStatus.CANCELLED}
+        deadline = time.time() + timeout
+        oids = set()
+        for r in self._results:
+            for oid in (r.entry_order_id, r.exit_order_id):
+                if oid is not None:
+                    oids.add(oid)
+
+        while time.time() < deadline and oids:
+            still_open = set()
+            for oid in oids:
+                rec = self.portfolio.get_order(oid)
+                if rec is None or rec.status not in terminal:
+                    still_open.add(oid)
+            if not still_open:
+                break
+            oids = still_open
+            time.sleep(0.25)
+
+        if oids:
+            logger.warning(
+                f"[{self.name}] _wait_for_cancellations: "
+                f"{len(oids)} order(s) still non-terminal after {timeout}s: {oids}"
+            )
 
     # =========================================================================
     # Test methods — round-trip
@@ -1300,15 +1347,18 @@ class PaperTestOrders6Plugin(PluginBase):
             status = "PASS" if r.no_fill_confirmed else "FAIL"
             logger.info(f"  [{r.test_name}] {status}  no-fill confirmed={r.no_fill_confirmed}")
         elif r.round_trip_complete:
+            pnl_note = " (PnL possibly affected by repricing)" if r.warnings else ""
             logger.info(
                 f"  [{r.test_name}] COMPLETE  "
                 f"entry=${r.entry_fill_price:.4f} exit=${r.exit_fill_price:.4f} "
-                f"pnl=${r.net_pnl:.4f}"
+                f"pnl=${r.net_pnl:.4f}{pnl_note}"
             )
         else:
             logger.warning(
                 f"  [{r.test_name}] PARTIAL  submitted={r.entry_submitted}"
             )
+        for w in r.warnings:
+            logger.warning(f"  [{r.test_name}] REPRICING WARNING: {w}")
 
     def _build_summary(self) -> Dict[str, Any]:
         total = len(self._results)
