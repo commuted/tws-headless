@@ -24,12 +24,18 @@ else
     echo "Engine already running (PID: $(pgrep -f 'ib.run_engine' | head -1))"
 fi
 
-# ── 2. Verify engine is responsive ──────────────────────────────────────────
-if ! $IBCTL status > /dev/null 2>&1; then
-    echo "ERROR: engine not responding after startup — aborting"
+# ── 2. Verify engine is responsive AND connected to IB ──────────────────────
+STATUS=$($IBCTL status 2>&1) || true
+if ! echo "$STATUS" | grep -q "Engine: running"; then
+    echo "ERROR: engine not responding — aborting"
     exit 1
 fi
-echo "Engine responsive."
+if ! echo "$STATUS" | grep -q "Connected: True"; then
+    echo "ERROR: engine running but not connected to IB — aborting"
+    echo "       Check that TWS/Gateway is open and accepting connections."
+    exit 1
+fi
+echo "Engine responsive and connected to IB."
 
 # ── 3. Load & start plugin (idempotent — engine ignores duplicate loads) ─────
 $IBCTL plugin load plugins.paper_tests.paper_test_orders_6 2>&1 || true
