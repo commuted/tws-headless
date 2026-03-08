@@ -98,6 +98,50 @@ def stock_spec() -> FeedTestSpec:
     )
 
 
+def forex_spec_2() -> FeedTestSpec:
+    """GBP.USD forex pair — used by the second concurrent feed plugin.
+
+    Different from forex_spec() (EUR.USD) so that both concurrent plugins
+    subscribe to distinct IB request IDs and avoid IB repricing the same
+    contract from two independent subscriptions.
+    """
+    return FeedTestSpec(
+        feed_type=FeedType.FOREX,
+        symbol="GBP.USD",
+        contract=ContractBuilder.forex("GBP", "USD"),
+        what_to_show="MIDPOINT",
+        use_rth=False,
+        description="Forex GBP.USD",
+    )
+
+
+def stock_spec_2() -> FeedTestSpec:
+    """QQQ stock spec — used by the second concurrent feed plugin.
+
+    Different from stock_spec() (SPY) so both concurrent plugins subscribe
+    to distinct symbols and IB does not reprice the same contract from two
+    independent reqMarketData calls.  QQQ has a typical 5-min range of
+    0.15–0.25%, similar to SPY, so the feed validation criteria are
+    equally meaningful.
+    """
+    return FeedTestSpec(
+        feed_type=FeedType.STOCK,
+        symbol="QQQ",
+        contract=ContractBuilder.us_stock("QQQ", primary_exchange="NASDAQ"),
+        what_to_show="TRADES",
+        bar_what_to_show="MIDPOINT",
+        use_rth=True,
+        bar_market_hours_only=True,
+        description="Stock QQQ",
+    )
+
+
 DEFAULT_TEST_PAIRS: List[FeedTestPair] = [
     FeedTestPair("Forex + Stock", forex_spec(), stock_spec()),
+]
+
+# Used by the second concurrent plugin (paper_test_feeds_2) so both plugins
+# subscribe to distinct symbols and avoid IB repricing collisions.
+DEFAULT_TEST_PAIRS_2: List[FeedTestPair] = [
+    FeedTestPair("Forex + Stock (concurrent)", forex_spec_2(), stock_spec_2()),
 ]

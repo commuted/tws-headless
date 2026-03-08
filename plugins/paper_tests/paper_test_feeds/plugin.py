@@ -17,7 +17,7 @@ from typing import List, Dict, Optional, Any
 from ib.data_feed import DataType, TickData
 from plugins.base import PluginBase, TradeSignal
 
-from .feed_test_specs import DEFAULT_TEST_PAIRS, FeedTestSpec, FeedTestPair
+from .feed_test_specs import DEFAULT_TEST_PAIRS, DEFAULT_TEST_PAIRS_2, FeedTestSpec, FeedTestPair
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,11 @@ class PaperTestFeedsPlugin(PluginBase):
 
     VERSION = "1.0.0"
     IS_SYSTEM_PLUGIN = False
+
+    # Subclasses override this to use a different set of test pairs
+    # (e.g. different symbols) so that concurrent instances subscribe to
+    # distinct IB contracts and avoid repricing collisions.
+    TEST_PAIRS = DEFAULT_TEST_PAIRS
 
     def __init__(
         self,
@@ -155,7 +160,7 @@ class PaperTestFeedsPlugin(PluginBase):
                 "success": True,
                 "data": {
                     "running": self._running,
-                    "test_pairs": [p.name for p in DEFAULT_TEST_PAIRS],
+                    "test_pairs": [p.name for p in self.TEST_PAIRS],
                     "result_count": len(self._results),
                 },
             }
@@ -233,7 +238,7 @@ class PaperTestFeedsPlugin(PluginBase):
             # Note: do NOT force reqMarketDataType(3) here.  reqRealTimeBars
             # only works in live mode (1); forcing delayed (3) silently drops
             # all bar callbacks regardless of subscription status.
-            for pair in DEFAULT_TEST_PAIRS:
+            for pair in self.TEST_PAIRS:
                 logger.info(f"--- Testing pair: {pair.name} ---")
                 self._run_test_pair(pair)
 
