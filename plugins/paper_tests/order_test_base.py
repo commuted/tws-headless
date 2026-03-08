@@ -29,39 +29,49 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 # ETF pairs: (symbol_a, symbol_b)
 #
-# All ordinary (non-leveraged, non-inverse) ETFs.  Each pair is chosen so
-# that a market move in either direction is likely to hit at least one leg
-# within the 5-minute fill window:
+# All ordinary (non-leveraged, non-inverse) US equity ETFs.  Six distinct
+# tickers arranged so that each symbol appears on *one side only* — no
+# ticker ever crosses from BUY to SELL across the 7 test cases.  This
+# matches the original leveraged-ETF design discipline and prevents
+# position accumulation from competing fills.
 #
-#   SPY / QQQ  – large-cap equity / Nasdaq 100.  Both move with the market;
-#                BUY SPY fires when SPY dips, SELL QQQ fires when QQQ rises.
-#                Ideal for immediate-fill tests (market, MOC, MOO, MTL) where
-#                fills happen regardless of direction.
+# BUY-only symbols  (sym_a):  SPY, IWM, XLK
+# SELL-only symbols (sym_b):  QQQ, XLF, XLE
 #
-#   QQQ / IWM  – Nasdaq 100 / Russell 2000.  Correlated but independent
-#                underlyings.  Typical 5-min range ~0.15–0.25%; the 0.30%
-#                offset is hit on most active trading days.
+#   SPY / QQQ  – S&P 500 / Nasdaq 100.  Both move with the broad market;
+#                immediate-fill tests (market, MOC, MTL) always fill.
+#                Typical 5-min range: SPY ~0.10–0.18%, QQQ ~0.12–0.22%.
 #
-#   IWM / GLD  – Russell 2000 / Gold.  Typically negatively correlated on
-#                risk-off days; provides an independent second theme for
-#                stop and MOO tests.  GLD 5-min range ~0.08–0.15%.
+#   IWM / XLF  – Russell 2000 / Financials.  Small-caps vs. rate-sensitive
+#                sector; conditional tests (limit, stop-limit) benefit from
+#                independent underlying dynamics.
+#                Typical 5-min range: IWM ~0.15–0.25%, XLF ~0.10–0.20%.
+#
+#   XLK / XLE  – Technology / Energy.  Often move in opposite directions
+#                on macro events; provides a second independent theme for
+#                stop and MOO tests.
+#                Typical 5-min range: XLK ~0.12–0.22%, XLE ~0.15–0.30%.
+#
+# Offset calibration: 0.30% sits at ~1–2× the typical 5-min range for all
+# six ETFs, giving a reasonable chance to fill on active days while still
+# passing on "submitted" when limits are not hit in the window.
 #
 # Index → test use:
 #   0 SPY/QQQ   market / immediate
-#   1 QQQ/IWM   limit
-#   2 IWM/GLD   stop
-#   3 QQQ/IWM   stop-limit
+#   1 IWM/XLF   limit              (conditional A)
+#   2 XLK/XLE   stop               (conditional B)
+#   3 IWM/XLF   stop-limit         (conditional A)
 #   4 SPY/QQQ   MOC / immediate
-#   5 IWM/GLD   MOO / immediate
+#   5 XLK/XLE   MOO / immediate    (conditional B)
 #   6 SPY/QQQ   MTL / immediate
 # ===========================================================================
 ETF_PAIRS: List[Tuple[str, str]] = [
     ("SPY",  "QQQ"),    # 0 – S&P 500 / Nasdaq 100 (immediate)
-    ("QQQ",  "IWM"),    # 1 – Nasdaq 100 / Russell 2000 (limit)
-    ("IWM",  "GLD"),    # 2 – Russell 2000 / Gold (stop)
-    ("QQQ",  "IWM"),    # 3 – Nasdaq 100 / Russell 2000 (stop-limit)
+    ("IWM",  "XLF"),    # 1 – Russell 2000 / Financials (limit)
+    ("XLK",  "XLE"),    # 2 – Technology / Energy (stop)
+    ("IWM",  "XLF"),    # 3 – Russell 2000 / Financials (stop-limit)
     ("SPY",  "QQQ"),    # 4 – S&P 500 / Nasdaq 100 (MOC immediate)
-    ("IWM",  "GLD"),    # 5 – Russell 2000 / Gold (MOO immediate)
+    ("XLK",  "XLE"),    # 5 – Technology / Energy (MOO)
     ("SPY",  "QQQ"),    # 6 – S&P 500 / Nasdaq 100 (MTL immediate)
 ]
 
@@ -70,9 +80,9 @@ TEST_QTY = Decimal("1")
 
 # Fraction below/above current price for conditional order offsets.
 # Calibrated to the typical 5-minute move of the ETFs above:
-#   SPY/QQQ: avg 5-min range ~0.12–0.20%; 0.30% offset is ~1–2× that range.
-#   IWM:     avg 5-min range ~0.15–0.25%; 0.30% offset is within range on most days.
-#   GLD:     avg 5-min range ~0.08–0.15%; 0.30% offset hits on active sessions.
+#   SPY/QQQ: avg 5-min range ~0.10–0.22%; 0.30% offset is ~1–2× that range.
+#   IWM/XLF: avg 5-min range ~0.10–0.25%; 0.30% offset is within range on most days.
+#   XLK/XLE: avg 5-min range ~0.12–0.30%; 0.30% offset hits on active sessions.
 # Tests still PASS on "submitted" even when limits do not fill in window.
 OFFSET_BELOW = 0.997   # BUY limit/stop 0.30% below market
 OFFSET_ABOVE = 1.003   # SELL limit/stop 0.30% above market

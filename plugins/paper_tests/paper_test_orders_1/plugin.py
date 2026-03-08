@@ -5,8 +5,8 @@ Tests: Market, Limit, Stop, Stop-Limit, Market-on-Close,
        Market-on-Open, Market-to-Limit
 
 ETF pairs (one per order type):
-  0 TQQQ / SQQQ   1 SPXU / SDS   2 SDOW / DXD
-  3 SPXU / SDS    4 TQQQ / SQQQ  5 SDOW / DXD   6 TQQQ / SQQQ
+  0 SPY / QQQ    1 IWM / XLF    2 XLK / XLE
+  3 IWM / XLF    4 SPY / QQQ    5 XLK / XLE    6 SPY / QQQ
 """
 
 from decimal import Decimal
