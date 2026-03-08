@@ -71,12 +71,15 @@ Sends commands to a running engine over the Unix socket.
 # Plugin management
 ./ibctl.py plugin list
 ./ibctl.py plugin load  plugins.my_package.my_plugin
+./ibctl.py plugin load  plugins.my_package.my_plugin=spy_leg  # named slot
 ./ibctl.py plugin start my_plugin
 ./ibctl.py plugin stop  my_plugin
 ./ibctl.py plugin freeze   my_plugin
 ./ibctl.py plugin resume   my_plugin
 ./ibctl.py plugin dump     my_plugin    # positions + open orders
 ./ibctl.py plugin request  my_plugin get_status
+./ibctl.py plugin message  my_plugin '{"action": "reset"}'  # arbitrary message
+./ibctl.py plugin help     my_plugin   # show plugin CLI help
 ./ibctl.py plugin unload   my_plugin
 
 # Internal bookkeeping transfers (no IB orders placed)
@@ -112,6 +115,7 @@ from plugins.base import PluginBase, TradeSignal
 
 class MyStrategyPlugin(PluginBase):
     VERSION = "1.0.0"
+    INSTRUMENT_COMPLIANCE = False  # True → signals for unlisted symbols are blocked
 
     def __init__(self, base_path=None, portfolio=None,
                  shared_holdings=None, message_bus=None):
@@ -128,6 +132,8 @@ class MyStrategyPlugin(PluginBase):
     def calculate_signals(self): return []
     def handle_request(self, request_type, payload):
         return {"success": False, "message": f"Unknown: {request_type}"}
+    def cli_help(self) -> str:
+        return "my_strategy: no custom commands."
 ```
 
 ```bash
