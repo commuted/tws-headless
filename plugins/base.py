@@ -370,6 +370,11 @@ class PluginBase(ABC):
     # and cannot be unloaded/deleted by user commands
     IS_SYSTEM_PLUGIN = False
 
+    # When True, the executive enforces that signals only reference symbols
+    # present in this plugin's instrument set.  Set to True in your subclass
+    # to opt in to instrument-set compliance checking.
+    INSTRUMENT_COMPLIANCE = False
+
     def __init__(
         self,
         name: str,
@@ -389,6 +394,10 @@ class PluginBase(ABC):
             message_bus: Optional MessageBus instance for pub/sub communication
         """
         self.name = name
+        # slot: stable instance storage key, defaults to name.
+        # Overridden at load time when path=slot syntax is used, allowing
+        # multiple instances of the same plugin class with independent state.
+        self.slot = name
         self.instance_id = str(uuid.uuid4())
         self.descriptor = None  # Opaque data set at load time
         self.portfolio = portfolio
@@ -544,6 +553,28 @@ class PluginBase(ABC):
         """
         return f"Plugin '{self.name}' unloaded"
 
+    def cli_help(self) -> str:
+        """
+        Return CLI help text for this plugin's custom handle_request commands.
+
+        Override in subclasses to document the request types your plugin
+        accepts via ``ibctl plugin request <name> <type> [json]``.
+
+        Returns:
+            Multi-line help string describing available request types.
+
+        Example::
+
+            def cli_help(self) -> str:
+                return (
+                    "my_plugin custom commands:\\n"
+                    "  plugin request my_plugin get_metrics {}\\n"
+                    "  plugin request my_plugin set_threshold {\"value\": 0.5}\\n"
+                    "  plugin request my_plugin reset_state {}\\n"
+                )
+        """
+        return f"Plugin '{self.name}' defines no custom CLI commands."
+
     # =========================================================================
     # TRADING INTERFACE - Must be implemented
     # =========================================================================
@@ -571,7 +602,7 @@ class PluginBase(ABC):
     def _run_migration_if_needed(self) -> None:
         """Migrate legacy JSON files into SQLite once per instance."""
         if not self._migration_done:
-            self._store.migrate_from_json(self.name, self._base_path)
+            self._store.migrate_from_json(self.slot, self._base_path)
             self._migration_done = True
 
     def save_state(self, state: Dict[str, Any]) -> bool:
@@ -587,7 +618,7 @@ class PluginBase(ABC):
         Returns:
             True if saved successfully
         """
-        return self._store.save_state(self.name, self.VERSION, state)
+        return self._store.save_state(self.slot, self.VERSION, state)
 
     def load_state(self) -> Dict[str, Any]:
         """
@@ -600,7 +631,7 @@ class PluginBase(ABC):
             State dict, or empty dict if no state exists
         """
         self._run_migration_if_needed()
-        result = self._store.load_state(self.name)
+        result = self._store.load_state(self.slot)
         return result if result is not None else {}
 
     def clear_state(self) -> bool:
@@ -610,7 +641,7 @@ class PluginBase(ABC):
         Returns:
             True if cleared (or didn't exist)
         """
-        return self._store.clear_state(self.name)
+        return self._store.clear_state(self.slot)
 
     # =========================================================================
     # MessageBus Integration
@@ -1177,12 +1208,12 @@ class PluginBase(ABC):
     def _load_holdings(self):
         """Load holdings from SQLite, falling back to fresh Holdings if absent."""
         self._run_migration_if_needed()
-        loaded = self._store.load_holdings(self.name)
+        loaded = self._store.load_holdings(self.slot)
         if loaded is not None:
             self._holdings = loaded
         else:
             self._holdings = Holdings(
-                plugin_name=self.name,
+                plugin_name=self.slot,
                 created_at=datetime.now(),
             )
 
@@ -1193,7 +1224,7 @@ class PluginBase(ABC):
 
         self._holdings.last_updated = datetime.now()
         self._store.save_holdings(self._holdings)
-        logger.info(f"Saved holdings for '{self.name}'")
+        logger.info(f"Saved holdings for '{self.slot}'")
 
     def save_instruments(self):
         """Save instruments to file"""
@@ -1395,11 +1426,13 @@ class PluginBase(ABC):
         """
         return {
             "name": self.name,
+            "slot": self.slot,
             "instance_id": self.instance_id,
             "version": self.VERSION,
             "state": self._state.value,
             "loaded": self._loaded,
             "descriptor": self.descriptor,
+            "instrument_compliance": self.INSTRUMENT_COMPLIANCE,
             "instruments": len(self._instruments),
             "enabled_instruments": len(self.enabled_instruments),
             "subscribed_channels": self._subscriptions,
