@@ -3542,7 +3542,11 @@ class PluginExecutive:
         # Validate plugin exists
         iid, config = self._resolve_plugin(plugin_name)
         if not config:
-            available = [c.plugin.name for c in self._plugins.values()]
+            available = [
+                c.plugin.slot if c.plugin.slot != c.plugin.name
+                else c.plugin.name
+                for c in self._plugins.values()
+            ]
             return False, None, f"Plugin '{plugin_name}' not found. Available: {available}"
 
         # Validate quantity
