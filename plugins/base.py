@@ -5,7 +5,7 @@ Provides the foundation for implementing trading plugins with:
 - Standardized lifecycle commands (start, stop, freeze, resume)
 - Custom request handling
 - Pub/Sub MessageBus integration for indicator feeds
-- Automatic state persistence to JSON files
+- Automatic state persistence to SQLite (via ib.plugin_store)
 - Instrument management and market data subscriptions
 - Holdings tracking and order execution
 """
@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, List, Dict, Optional, Any, Set, Tuple, Callable
 
 from ibapi.contract import Contract
+
+from ib.plugin_store import get_plugin_store
 
 if TYPE_CHECKING:
     from ib.models import PnLData
@@ -392,6 +394,8 @@ class PluginBase(ABC):
         self.portfolio = portfolio
         self._shared_holdings = shared_holdings
         self._message_bus = message_bus
+        self._store = get_plugin_store()
+        self._migration_done = False
 
         # Set up paths
         if base_path:
@@ -564,9 +568,15 @@ class PluginBase(ABC):
     # State Persistence
     # =========================================================================
 
+    def _run_migration_if_needed(self) -> None:
+        """Migrate legacy JSON files into SQLite once per instance."""
+        if not self._migration_done:
+            self._store.migrate_from_json(self.name, self._base_path)
+            self._migration_done = True
+
     def save_state(self, state: Dict[str, Any]) -> bool:
         """
-        Save plugin state to JSON file.
+        Save plugin state to SQLite.
 
         Automatically called on freeze() and stop().
         Can also be called manually for periodic saves.
@@ -577,68 +587,30 @@ class PluginBase(ABC):
         Returns:
             True if saved successfully
         """
-        try:
-            # Ensure directory exists
-            self._base_path.mkdir(parents=True, exist_ok=True)
-
-            state_data = {
-                "plugin_name": self.name,
-                "plugin_version": self.VERSION,
-                "state": state,
-                "saved_at": datetime.now().isoformat(),
-            }
-
-            with open(self._state_file, "w") as f:
-                json.dump(state_data, f, indent=2, default=str)
-
-            logger.debug(f"Plugin '{self.name}' state saved to {self._state_file}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to save state for plugin '{self.name}': {e}")
-            return False
+        return self._store.save_state(self.name, self.VERSION, state)
 
     def load_state(self) -> Dict[str, Any]:
         """
-        Load plugin state from JSON file.
+        Load plugin state from SQLite.
 
         Should be called during start() to restore previous state.
+        Automatically migrates legacy state.json on first call.
 
         Returns:
-            State dict, or empty dict if no state file exists
+            State dict, or empty dict if no state exists
         """
-        try:
-            if not self._state_file.exists():
-                logger.debug(f"No state file for plugin '{self.name}'")
-                return {}
-
-            with open(self._state_file) as f:
-                data = json.load(f)
-
-            state = data.get("state", {})
-            saved_at = data.get("saved_at", "unknown")
-            logger.debug(f"Plugin '{self.name}' state loaded (saved at {saved_at})")
-            return state
-
-        except Exception as e:
-            logger.error(f"Failed to load state for plugin '{self.name}': {e}")
-            return {}
+        self._run_migration_if_needed()
+        result = self._store.load_state(self.name)
+        return result if result is not None else {}
 
     def clear_state(self) -> bool:
         """
-        Clear saved state file.
+        Clear saved state.
 
         Returns:
             True if cleared (or didn't exist)
         """
-        try:
-            if self._state_file.exists():
-                self._state_file.unlink()
-                logger.debug(f"Plugin '{self.name}' state cleared")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to clear state for plugin '{self.name}': {e}")
-            return False
+        return self._store.clear_state(self.name)
 
     # =========================================================================
     # MessageBus Integration
@@ -1203,33 +1175,24 @@ class PluginBase(ABC):
             self._instruments[inst.symbol] = inst
 
     def _load_holdings(self):
-        """Load holdings from file"""
-        if not self._holdings_file.exists():
-            # Create default holdings
+        """Load holdings from SQLite, falling back to fresh Holdings if absent."""
+        self._run_migration_if_needed()
+        loaded = self._store.load_holdings(self.name)
+        if loaded is not None:
+            self._holdings = loaded
+        else:
             self._holdings = Holdings(
                 plugin_name=self.name,
                 created_at=datetime.now(),
             )
-            return
-
-        with open(self._holdings_file) as f:
-            data = json.load(f)
-
-        self._holdings = Holdings.from_dict(data)
 
     def save_holdings(self):
-        """Save current holdings to file"""
+        """Save current holdings to SQLite."""
         if self._holdings is None:
             return
 
         self._holdings.last_updated = datetime.now()
-
-        # Ensure directory exists
-        self._base_path.mkdir(parents=True, exist_ok=True)
-
-        with open(self._holdings_file, "w") as f:
-            json.dump(self._holdings.to_dict(), f, indent=2)
-
+        self._store.save_holdings(self._holdings)
         logger.info(f"Saved holdings for '{self.name}'")
 
     def save_instruments(self):

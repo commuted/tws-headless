@@ -5,6 +5,7 @@ This file ensures the package can be imported correctly during tests.
 """
 
 import sys
+import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -106,3 +107,16 @@ sys.modules['plugin_executive'] = plugin_executive
 # ibctl is at root level only (not in inner ib/ package)
 from ib import ibctl
 sys.modules['ibctl'] = ibctl
+
+
+@pytest.fixture(autouse=True)
+def _isolated_plugin_store(tmp_path, monkeypatch):
+    """
+    Replace the global PluginStore singleton with a temp-DB instance for every
+    test.  This prevents state written in one test from leaking into another.
+    """
+    import ib.plugin_store as ps
+    test_store = ps.PluginStore(db_path=tmp_path / "test_plugin_store.db")
+    monkeypatch.setattr(ps, "_plugin_store", test_store)
+    yield test_store
+    monkeypatch.setattr(ps, "_plugin_store", None)
