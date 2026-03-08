@@ -84,6 +84,7 @@ class MyPlugin(PluginBase):
 
     VERSION = "1.0.0"
     IS_SYSTEM_PLUGIN = False
+    INSTRUMENT_COMPLIANCE = False   # True → signals for unlisted symbols are blocked
 
     def __init__(self, base_path=None, portfolio=None,
                  shared_holdings=None, message_bus=None):
@@ -104,10 +105,18 @@ class MyPlugin(PluginBase):
 
     def handle_request(self, request_type: str, payload: Dict) -> Dict:
         return {"success": False, "message": f"Unknown: {request_type}"}
+
+    def cli_help(self) -> str:
+        return (
+            "my_plugin commands:\n"
+            "  plugin request my_plugin get_status {}\n"
+            "  plugin message my_plugin '{\"key\": \"value\"}'\n"
+        )
 ```
 
 All six lifecycle methods and `calculate_signals` are abstract —
 they must be implemented even if they just return `True` / `[]`.
+`cli_help` is optional but strongly recommended.
 
 ---
 
@@ -117,6 +126,32 @@ they must be implemented even if they just return `True` / `[]`.
 |-----------|------|---------|---------|
 | `VERSION` | `str` | `"1.0.0"` | Stored in state files; shown in `plugin list` |
 | `IS_SYSTEM_PLUGIN` | `bool` | `False` | `True` prevents user unload/delete |
+| `INSTRUMENT_COMPLIANCE` | `bool` | `False` | `True` enforces instrument-set restriction (see §4a) |
+
+### §4a — Instrument Compliance
+
+When `INSTRUMENT_COMPLIANCE = True` the executive **blocks any `TradeSignal`
+whose symbol is not present in the plugin's registered instrument set**
+(`instruments.json` or `add_instrument()`).  Blocked signals are logged as
+warnings and silently discarded before reaching the reconciler.
+
+Use this when you want to load two instances of the same class and restrict
+each to a different basket of securities — one instance gets SPY+QQQ, another
+gets AAPL+MSFT, and the engine enforces the boundary automatically.
+
+```python
+class BasketPlugin(PluginBase):
+    INSTRUMENT_COMPLIANCE = True   # signals for unlisted symbols are dropped
+    VERSION = "1.0.0"
+    ...
+```
+
+Load two isolated instances:
+```bash
+ibctl plugin load plugins/basket/plugin.py=large_cap
+ibctl plugin load plugins/basket/plugin.py=small_cap
+# each instance gets its own instruments.json and independent state
+```
 
 ---
 
@@ -139,21 +174,35 @@ def __init__(
     )
 ```
 
-The `name` argument to `super().__init__` is the key used everywhere:
-log prefixes, state file paths, MessageBus publisher/subscriber identity,
-and the `plugin request <name>` command target.
+The `name` argument to `super().__init__` is the class-level identity:
+log prefixes, file paths, MessageBus publisher identity.
 
-**Instance attributes set by `__init__` (read-only, do not reassign):**
+**Instance attributes set by `__init__`:**
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `self.name` | `str` | Plugin name passed to super().__init__ |
+| `self.name` | `str` | Plugin class name passed to `super().__init__` |
+| `self.slot` | `str` | Stable instance storage key (defaults to `name`; overridden by `path=slot` at load time) |
 | `self.instance_id` | `str` | UUID generated at construction; unique per load |
 | `self.portfolio` | `Portfolio \| None` | IB connection; `None` in tests |
 | `self._message_bus` | `MessageBus \| None` | Pub/sub bus; set by executive |
 | `self._executive` | `PluginExecutive \| None` | Set by executive at load time |
 | `self._base_path` | `Path` | Directory for all plugin files |
-| `self._state_file` | `Path` | `<base_path>/state.json` |
+
+### Slots — multiple instances of the same class
+
+`self.slot` is the key used for SQLite state/holdings and CLI addressing.
+It defaults to `self.name`, which is fine for a single instance. When you
+load two instances of the same plugin class, give each a unique slot:
+
+```bash
+ibctl plugin load plugins/strategy/plugin.py=spy_leg
+ibctl plugin load plugins/strategy/plugin.py=qqq_leg
+```
+
+Each instance now has fully independent state, holdings, and CLI address
+(`spy_leg`, `qqq_leg`). Use `instance_id` UUID when you need unambiguous
+targeting regardless of name/slot.
 
 ---
 
@@ -731,10 +780,13 @@ access this directly — it is used for debugging via `plugin request`.
 
 ---
 
-## 11. Request Handling
+## 11. Request Handling and CLI Interface
+
+### `handle_request`
 
 `handle_request` is the plugin's external command interface. The engine
-routes `plugin request <name> <type>` socket commands here.
+routes `plugin request <name> <type>` and `plugin message <name>` socket
+commands here.
 
 ```python
 def handle_request(self, request_type: str, payload: Dict) -> Dict:
@@ -746,6 +798,11 @@ def handle_request(self, request_type: str, payload: Dict) -> Dict:
     if request_type == "set_period":
         self._period = payload.get("period", self._period)
         return {"success": True}
+    if request_type == "message":
+        # General-purpose message path (ibctl plugin message <name> <json>)
+        action = payload.get("action")
+        ...
+        return {"success": True}
     return {"success": False, "message": f"Unknown request: {request_type}"}
 ```
 
@@ -756,6 +813,33 @@ def handle_request(self, request_type: str, payload: Dict) -> Dict:
 - `payload` is the parsed JSON body of the request; it may be `{}`.
 - `handle_request` is called on the socket thread — keep it fast.
   Spawn a thread for long-running operations.
+
+### CLI entry points
+
+| CLI command | `request_type` received | Use |
+|------------|------------------------|-----|
+| `plugin request <name> <type> [json]` | whatever `<type>` is | Typed, structured commands |
+| `plugin message <name> [json]` | `"message"` | Ad-hoc / untyped messaging |
+
+### `cli_help` — self-documenting plugins
+
+Override `cli_help()` to document your plugin's command surface. The default
+returns a generic "no custom commands" string.
+
+```python
+def cli_help(self) -> str:
+    return (
+        "my_strategy commands:\n"
+        "  plugin request my_strategy get_status {}\n"
+        "  plugin request my_strategy set_period '{\"period\": 20}'\n"
+        "  plugin message my_strategy '{\"action\": \"reset\"}'\n"
+    )
+```
+
+Retrieve from the CLI:
+```bash
+ibctl plugin help my_strategy
+```
 
 ---
 
