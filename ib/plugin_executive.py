@@ -2208,6 +2208,65 @@ class PluginExecutive:
                 "message": f"Error: {str(e)}",
             }
 
+    # =========================================================================
+    # Instrument Management
+    # =========================================================================
+
+    def get_plugin_instruments(self, name: str) -> Optional[list]:
+        """Return the instrument list for a plugin, or None if not found."""
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return None
+        return config.plugin.instruments
+
+    def add_plugin_instrument(self, name: str, instrument) -> bool:
+        """Add/replace an instrument on a running plugin (persists immediately)."""
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return False
+        config.plugin.add_instrument(instrument)
+        return True
+
+    def remove_plugin_instrument(self, name: str, symbol: str) -> bool:
+        """Remove an instrument from a running plugin (persists immediately)."""
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return False
+        return config.plugin.remove_instrument(symbol)
+
+    def set_plugin_instrument_enabled(self, name: str, symbol: str, enabled: bool) -> bool:
+        """Enable or disable a single instrument on a running plugin."""
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return False
+        plugin = config.plugin
+        sym = symbol.upper()
+        inst = plugin.get_instrument(sym)
+        if inst is None:
+            return False
+        inst.enabled = enabled
+        plugin._store.set_instrument_enabled(plugin.slot, sym, enabled)
+        return True
+
+    def clear_plugin_instruments(self, name: str) -> bool:
+        """Remove all instruments from a running plugin (persists immediately)."""
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return False
+        plugin = config.plugin
+        plugin._instruments.clear()
+        plugin._store.clear_instruments(plugin.slot)
+        return True
+
+    def reload_plugin_instruments(self, name: str) -> Optional[int]:
+        """Re-read instrument list from SQLite into a running plugin.
+        Returns number of instruments loaded, or None if plugin not found."""
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return None
+        config.plugin.reload_instruments()
+        return len(config.plugin.instruments)
+
     def send_help(self, name: str) -> Optional[str]:
         """
         Return the CLI help text for a plugin (via its cli_help() method).

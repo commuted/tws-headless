@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path.home() / ".ib_plugin_store.db"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class PluginStore:
@@ -91,6 +91,21 @@ class PluginStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS plugin_instruments (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instance_key TEXT NOT NULL,
+                    symbol       TEXT NOT NULL,
+                    name         TEXT NOT NULL DEFAULT '',
+                    weight       REAL NOT NULL DEFAULT 0.0,
+                    min_weight   REAL NOT NULL DEFAULT 0.0,
+                    max_weight   REAL NOT NULL DEFAULT 100.0,
+                    enabled      INTEGER NOT NULL DEFAULT 1,
+                    exchange     TEXT NOT NULL DEFAULT 'SMART',
+                    currency     TEXT NOT NULL DEFAULT 'USD',
+                    sec_type     TEXT NOT NULL DEFAULT 'STK',
+                    UNIQUE(instance_key, symbol)
+                );
+
                 CREATE TABLE IF NOT EXISTS migration_log (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     source_file TEXT UNIQUE NOT NULL,
@@ -99,9 +114,13 @@ class PluginStore:
                 );
             """)
 
-            # Record schema version if not already set
+            # Upsert schema version
             cursor.execute(
-                "INSERT OR IGNORE INTO schema_versions (component, version, applied_at) VALUES (?, ?, ?)",
+                """INSERT INTO schema_versions (component, version, applied_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(component) DO UPDATE SET
+                     version=excluded.version, applied_at=excluded.applied_at
+                   WHERE excluded.version > version""",
                 ("plugin_store", SCHEMA_VERSION, datetime.now().isoformat()),
             )
 
@@ -312,6 +331,131 @@ class PluginStore:
             return False
 
     # =========================================================================
+    # Instruments
+    # =========================================================================
+
+    def save_instruments(self, instance_key: str, instruments: list) -> bool:
+        """Replace all instruments for this instance atomically."""
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "DELETE FROM plugin_instruments WHERE instance_key = ?",
+                    (instance_key,),
+                )
+                conn.executemany(
+                    """INSERT INTO plugin_instruments
+                       (instance_key, symbol, name, weight, min_weight, max_weight,
+                        enabled, exchange, currency, sec_type)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        (instance_key, inst.symbol, inst.name, inst.weight,
+                         inst.min_weight, inst.max_weight,
+                         1 if inst.enabled else 0,
+                         inst.exchange, inst.currency, inst.sec_type)
+                        for inst in instruments
+                    ],
+                )
+            logger.debug(f"Saved {len(instruments)} instruments for '{instance_key}'")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save instruments for '{instance_key}': {e}")
+            return False
+
+    def load_instruments(self, instance_key: str) -> Optional[list]:
+        """Return list of PluginInstrument, or None if none stored."""
+        from plugins.base import PluginInstrument
+        try:
+            with self._conn() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM plugin_instruments WHERE instance_key = ? ORDER BY id",
+                    (instance_key,),
+                ).fetchall()
+            if not rows:
+                return None
+            return [
+                PluginInstrument(
+                    symbol=r["symbol"],
+                    name=r["name"],
+                    weight=r["weight"],
+                    min_weight=r["min_weight"],
+                    max_weight=r["max_weight"],
+                    enabled=bool(r["enabled"]),
+                    exchange=r["exchange"],
+                    currency=r["currency"],
+                    sec_type=r["sec_type"],
+                )
+                for r in rows
+            ]
+        except Exception as e:
+            logger.error(f"Failed to load instruments for '{instance_key}': {e}")
+            return None
+
+    def upsert_instrument(self, instance_key: str, instrument) -> bool:
+        """Insert or replace a single instrument entry."""
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    """INSERT INTO plugin_instruments
+                       (instance_key, symbol, name, weight, min_weight, max_weight,
+                        enabled, exchange, currency, sec_type)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(instance_key, symbol) DO UPDATE SET
+                         name=excluded.name, weight=excluded.weight,
+                         min_weight=excluded.min_weight, max_weight=excluded.max_weight,
+                         enabled=excluded.enabled, exchange=excluded.exchange,
+                         currency=excluded.currency, sec_type=excluded.sec_type""",
+                    (instance_key, instrument.symbol, instrument.name,
+                     instrument.weight, instrument.min_weight, instrument.max_weight,
+                     1 if instrument.enabled else 0,
+                     instrument.exchange, instrument.currency, instrument.sec_type),
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to upsert instrument '{instrument.symbol}' for '{instance_key}': {e}")
+            return False
+
+    def remove_instrument(self, instance_key: str, symbol: str) -> bool:
+        """Delete a single instrument by symbol."""
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "DELETE FROM plugin_instruments WHERE instance_key = ? AND symbol = ?",
+                    (instance_key, symbol.upper()),
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to remove instrument '{symbol}' for '{instance_key}': {e}")
+            return False
+
+    def set_instrument_enabled(self, instance_key: str, symbol: str, enabled: bool) -> bool:
+        """Enable or disable a single instrument without removing it."""
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    """UPDATE plugin_instruments SET enabled = ?
+                       WHERE instance_key = ? AND symbol = ?""",
+                    (1 if enabled else 0, instance_key, symbol.upper()),
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set enabled for '{symbol}' in '{instance_key}': {e}")
+            return False
+
+    def clear_instruments(self, instance_key: str) -> bool:
+        """Remove all instruments for this instance."""
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "DELETE FROM plugin_instruments WHERE instance_key = ?",
+                    (instance_key,),
+                )
+            logger.debug(f"Cleared instruments for '{instance_key}'")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear instruments for '{instance_key}': {e}")
+            return False
+
+    # =========================================================================
     # Forex cost basis
     # =========================================================================
 
@@ -379,6 +523,57 @@ class PluginStore:
                VALUES (?, ?, ?)""",
             (source_file, plugin_name, datetime.now().isoformat()),
         )
+
+    def migrate_instruments_from_json(self, instance_key: str, base_path: Path) -> None:
+        """
+        Import instruments.json once if not already migrated.
+
+        Idempotent — safe to call on every plugin load.
+        JSON file left in place as backup.
+        """
+        instruments_file = Path(base_path) / "instruments.json"
+        source_key = f"instruments:{instance_key}:{instruments_file}"
+
+        with self._conn() as conn:
+            if self._already_migrated(conn, source_key):
+                return
+
+            if not instruments_file.exists():
+                self._record_migration(conn, source_key, instance_key)
+                return
+
+            try:
+                from plugins.base import PluginInstrument
+                with open(instruments_file) as f:
+                    data = json.load(f)
+                instruments = [
+                    PluginInstrument.from_dict(d)
+                    for d in data.get("instruments", [])
+                ]
+                conn.execute(
+                    "DELETE FROM plugin_instruments WHERE instance_key = ?",
+                    (instance_key,),
+                )
+                conn.executemany(
+                    """INSERT OR IGNORE INTO plugin_instruments
+                       (instance_key, symbol, name, weight, min_weight, max_weight,
+                        enabled, exchange, currency, sec_type)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        (instance_key, i.symbol, i.name, i.weight,
+                         i.min_weight, i.max_weight,
+                         1 if i.enabled else 0,
+                         i.exchange, i.currency, i.sec_type)
+                        for i in instruments
+                    ],
+                )
+                self._record_migration(conn, source_key, instance_key)
+                logger.info(
+                    f"Migrated {instruments_file} → plugin_instruments "
+                    f"({len(instruments)} instruments)"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to migrate {instruments_file}: {e}")
 
     def migrate_from_json(self, plugin_name: str, base_path: Path) -> None:
         """
