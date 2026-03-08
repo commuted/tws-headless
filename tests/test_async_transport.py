@@ -412,7 +412,7 @@ class TestAsyncIBTransportDispatch:
 class TestAsyncIBTransportSendMsg:
     """send_msg() writes pre-framed bytes to the writer or raises."""
 
-    def test_writes_bytes_to_writer(self):
+    async def test_writes_bytes_to_writer(self):
         writer = MagicMock()
         t = AsyncIBTransport(wrapper=MagicMock())
         t._writer = writer

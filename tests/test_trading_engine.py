@@ -444,6 +444,7 @@ class TestOnConnected:
             )
             engine = TradingEngine(config)
             engine._portfolio.load = AsyncMock()
+            engine._detect_market_data_type = AsyncMock(return_value=1)
 
             engine._on_connected()
             await asyncio.sleep(0)  # let the task run
@@ -463,6 +464,7 @@ class TestOnConnected:
             engine._plugin_executive.is_running = False
             engine._plugin_executive.start = AsyncMock()
             engine._portfolio.load = AsyncMock()
+            engine._detect_market_data_type = AsyncMock(return_value=1)
 
             engine._on_connected()
             await asyncio.sleep(0)  # let the task run
@@ -479,6 +481,7 @@ class TestOnConnected:
             engine._plugin_executive.is_running = False
             engine._plugin_executive.start = AsyncMock()
             engine._portfolio.load = AsyncMock()
+            engine._detect_market_data_type = AsyncMock(return_value=1)
 
             engine._on_connected()
             await asyncio.sleep(0)  # let the task run
