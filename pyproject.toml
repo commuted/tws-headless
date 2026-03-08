@@ -23,7 +23,8 @@ keywords = [
     "asynchronous", 
     "portfolio management", 
     "ibapi", 
-    "cli,"
+    "cli",
+    "IB Gateway",
 ]
 
 [project.optional-dependencies]
