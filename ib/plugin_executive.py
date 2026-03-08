@@ -730,9 +730,10 @@ class PluginExecutive:
         # Direct instance_id lookup
         if name_or_id in self._plugins:
             return name_or_id, self._plugins[name_or_id]
-        # Fall back to name lookup (first match)
+        # Fall back to slot or name lookup (first match)
         for iid, config in self._plugins.items():
-            if config.plugin.name == name_or_id:
+            plugin_slot = getattr(config.plugin, "slot", None)
+            if plugin_slot == name_or_id or config.plugin.name == name_or_id:
                 return iid, config
         return None, None
 
@@ -1720,6 +1721,7 @@ class PluginExecutive:
         bar_timeframe: DataType = DataType.BAR_1MIN,
         enabled: bool = True,
         descriptor: Any = None,
+        slot: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Load a plugin from a Python file.
@@ -1733,9 +1735,13 @@ class PluginExecutive:
             bar_timeframe: Which bar timeframe triggers ON_BAR mode
             enabled: Whether the plugin starts enabled
             descriptor: Opaque data passed to the plugin (plugin-defined semantics)
+            slot: Stable instance storage key (overrides plugin.name as the
+                  SQLite key, allowing multiple instances of the same class
+                  with independent state/holdings).  Set via ``path=slot``
+                  syntax on the CLI.
 
         Returns:
-            Dict with plugin_name, instance_id, and descriptor if loaded
+            Dict with plugin_name, slot, instance_id, and descriptor if loaded
             successfully, None otherwise
         """
         # Import plugin_loader here to avoid circular imports
@@ -1748,6 +1754,10 @@ class PluginExecutive:
             if not plugin:
                 logger.error(f"Failed to load plugin from {file_path}")
                 return None
+
+            # Set slot before load() so state/holdings load from the right key
+            if slot is not None:
+                plugin.slot = slot
 
             # Set descriptor before loading so the plugin can use it during load()
             if descriptor is not None:
@@ -1775,11 +1785,12 @@ class PluginExecutive:
 
             self._stats["plugins_loaded"] += 1
             logger.info(
-                f"Loaded plugin '{plugin.name}' "
-                f"(instance_id={plugin.instance_id[:8]}) from {file_path}"
+                f"Loaded plugin '{plugin.name}' (slot='{plugin.slot}', "
+                f"instance_id={plugin.instance_id[:8]}) from {file_path}"
             )
             return {
                 "plugin_name": plugin.name,
+                "slot": plugin.slot,
                 "instance_id": plugin.instance_id,
                 "descriptor": plugin.descriptor,
             }
@@ -2196,6 +2207,21 @@ class PluginExecutive:
                 "success": False,
                 "message": f"Error: {str(e)}",
             }
+
+    def send_help(self, name: str) -> Optional[str]:
+        """
+        Return the CLI help text for a plugin (via its cli_help() method).
+
+        Args:
+            name: Plugin name, slot, or instance_id
+
+        Returns:
+            Help string, or None if plugin not found
+        """
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return None
+        return config.plugin.cli_help()
 
     # =========================================================================
     # Enable/Disable (for continuous execution)
@@ -2647,6 +2673,17 @@ class PluginExecutive:
         """Process a trade signal from a plugin"""
         if not signal.is_actionable:
             return
+
+        # Resolve the plugin to enforce compliance if registered
+        _, config = self._resolve_plugin(plugin_name)
+        if config and config.plugin.INSTRUMENT_COMPLIANCE:
+            allowed = {inst.symbol for inst in config.plugin.instruments}
+            if signal.symbol not in allowed:
+                logger.warning(
+                    f"[{plugin_name}] Compliance: signal for '{signal.symbol}' blocked "
+                    f"(not in registered instrument set: {sorted(allowed)})"
+                )
+                return
 
         logger.info(
             f"[{plugin_name}] Signal: {signal.action} {signal.quantity} {signal.symbol} "

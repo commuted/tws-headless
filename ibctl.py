@@ -39,10 +39,13 @@ Usage:
     # Plugin/algorithm management
     ./ibctl.py plugin list                     # List all plugins
     ./ibctl.py plugin load PATH                # Load plugin from file
+    ./ibctl.py plugin load PATH=SLOT           # Load with named instance slot
     ./ibctl.py plugin load PATH DESCRIPTOR     # Load with descriptor
     ./ibctl.py plugin unload NAME_OR_ID        # Unload a plugin
     ./ibctl.py plugin status NAME_OR_ID        # Get plugin status
     ./ibctl.py plugin dump NAME_OR_ID          # Dump positions & open orders
+    ./ibctl.py plugin help NAME_OR_ID          # Show plugin CLI help
+    ./ibctl.py plugin message NAME_OR_ID JSON  # Send arbitrary message to plugin
     ./ibctl.py pause                           # Pause execution
     ./ibctl.py resume                          # Resume execution
     ./ibctl.py stop                            # Shutdown the server
@@ -187,6 +190,9 @@ def format_result(result: CommandResult, verbose: bool = False):
         if "instance_id" in result.data and "plugin_name" in result.data:
             # Plugin load response
             print(f"\n  Plugin:      {result.data['plugin_name']}")
+            slot = result.data.get("slot")
+            if slot and slot != result.data["plugin_name"]:
+                print(f"  Slot:        {slot}")
             print(f"  Instance ID: {result.data['instance_id']}")
             if result.data.get("descriptor") is not None:
                 print(f"  Descriptor:  {result.data['descriptor']}")
@@ -272,19 +278,21 @@ Commands:
   Use instance_id to target a specific instance when multiple
   instances of the same plugin are loaded.
 
-  plugin list                     List all plugins
-  plugin load PATH [DESCRIPTOR]   Load a plugin from file (returns instance_id)
-  plugin unload NAME_OR_ID        Unload a plugin
-  plugin status NAME_OR_ID        Get plugin status
-  plugin start NAME_OR_ID         Start a plugin
-  plugin stop NAME_OR_ID          Stop a plugin
-  plugin freeze NAME_OR_ID        Freeze a plugin (pause with state save)
-  plugin resume NAME_OR_ID        Resume a frozen plugin
-  plugin enable NAME_OR_ID        Enable plugin for execution
-  plugin disable NAME_OR_ID       Disable plugin
-  plugin trigger NAME_OR_ID       Manually trigger plugin run
-  plugin dump NAME_OR_ID          Dump plugin positions and open orders
-  plugin request NAME TYPE [JSON] Send a request to a plugin's handle_request()
+  plugin list                       List all plugins
+  plugin load PATH[=SLOT] [DESC]    Load plugin; optional =SLOT for instance key
+  plugin unload NAME_OR_ID          Unload a plugin
+  plugin status NAME_OR_ID          Get plugin status
+  plugin start NAME_OR_ID           Start a plugin
+  plugin stop NAME_OR_ID            Stop a plugin
+  plugin freeze NAME_OR_ID          Freeze a plugin (pause with state save)
+  plugin resume NAME_OR_ID          Resume a frozen plugin
+  plugin enable NAME_OR_ID          Enable plugin for execution
+  plugin disable NAME_OR_ID         Disable plugin
+  plugin trigger NAME_OR_ID         Manually trigger plugin run
+  plugin dump NAME_OR_ID            Dump plugin positions and open orders
+  plugin request NAME TYPE [JSON]   Send a typed request to handle_request()
+  plugin message NAME [JSON]        Send arbitrary JSON message to plugin
+  plugin help NAME                  Show plugin CLI help (cli_help())
 
   algo list            List all algorithms
   algo status NAME     Get algorithm status
@@ -314,8 +322,11 @@ Examples:
   ./ibctl.py transfer cash _unassigned momentum_5day 10000 --confirm
   ./ibctl.py transfer position _unassigned momentum_5day SPY 50 --confirm
   ./ibctl.py plugin list
-  ./ibctl.py plugin load /path/to/my_strategy/plugin.py
+  ./ibctl.py plugin load /path/to/plugin.py
+  ./ibctl.py plugin load /path/to/plugin.py=spy_momentum
   ./ibctl.py plugin load /path/to/plugin.py '{"symbol": "AAPL"}'
+  ./ibctl.py plugin help momentum_5day
+  ./ibctl.py plugin message momentum_5day '{"action": "set_threshold", "value": 0.5}'
   ./ibctl.py plugin status momentum_5day
   ./ibctl.py plugin stop 78b052d2-17e7-4ee5-ac03-282e0cd05c2b
         """,

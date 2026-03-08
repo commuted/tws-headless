@@ -530,7 +530,7 @@ class CommandHandler:
 
         Usage:
             plugin list                          - List all plugins
-            plugin load <path>                   - Load plugin from file
+            plugin load <path[=slot]>            - Load plugin from file (optional slot name)
             plugin unload <name>                 - Unload plugin
             plugin status <name>                 - Get plugin status
             plugin start <name>                  - Start plugin
@@ -539,7 +539,9 @@ class CommandHandler:
             plugin resume <name>                 - Resume plugin
             plugin enable <name>                 - Enable plugin for execution
             plugin disable <name>                - Disable plugin
-            plugin request <name> <type> <json>  - Send custom request
+            plugin request <name> <type> <json>  - Send typed request to plugin
+            plugin message <name> <json>         - Send arbitrary message to plugin
+            plugin help <name>                   - Show plugin CLI help
             plugin param <name> <key> <value>    - Set plugin parameter
             plugin params <name>                 - Get plugin parameters
             plugin feeds                         - List MessageBus channels
@@ -637,6 +639,21 @@ class CommandHandler:
                     )
                 payload = subargs[2] if len(subargs) > 2 else "{}"
                 return self._plugin_request(subargs[0], subargs[1], payload)
+            elif subcommand == "message":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin message <name> <json_payload>",
+                    )
+                payload = subargs[1] if len(subargs) > 1 else "{}"
+                return self._plugin_message(subargs[0], payload)
+            elif subcommand == "help":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin help <name>",
+                    )
+                return self._plugin_help(subargs[0])
             elif subcommand == "param":
                 if len(subargs) < 3:
                     return CommandResult(
@@ -716,16 +733,34 @@ class CommandHandler:
             data={"plugins": all_status},
         )
 
-    def _plugin_load(self, path: str, descriptor: Any = None) -> CommandResult:
-        """Load a plugin from file, optionally passing a descriptor"""
-        result = self.plugin_executive.load_plugin_from_file(path, descriptor=descriptor)
+    def _plugin_load(self, path_spec: str, descriptor: Any = None) -> CommandResult:
+        """Load a plugin from file, optionally passing a descriptor.
+
+        path_spec may be ``/path/to/plugin.py=my_slot`` to assign a stable
+        instance storage key independent of the plugin class name.
+        """
+        # Parse optional =slot suffix
+        slot = None
+        if "=" in path_spec:
+            path, slot = path_spec.split("=", 1)
+            slot = slot.strip() or None
+        else:
+            path = path_spec
+
+        result = self.plugin_executive.load_plugin_from_file(
+            path, descriptor=descriptor, slot=slot
+        )
         if result:
+            slot_display = result["slot"]
+            name_display = result["plugin_name"]
+            label = slot_display if slot_display != name_display else name_display
             return CommandResult(
                 status=CommandStatus.SUCCESS,
-                message=f"Plugin '{result['plugin_name']}' loaded "
+                message=f"Plugin '{label}' loaded "
                         f"(instance_id={result['instance_id'][:8]})",
                 data={
                     "plugin_name": result["plugin_name"],
+                    "slot": result["slot"],
                     "instance_id": result["instance_id"],
                     "descriptor": result["descriptor"],
                     "path": path,
@@ -846,6 +881,44 @@ class CommandHandler:
         return CommandResult(
             status=CommandStatus.ERROR,
             message=response.get("message", "Request failed"),
+        )
+
+    def _plugin_message(self, name: str, payload_json: str) -> CommandResult:
+        """Send an arbitrary JSON message to a plugin (routes to handle_request type='message')."""
+        import json
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Invalid JSON payload: {e}",
+            )
+
+        response = self.plugin_executive.send_request(name, "message", payload)
+
+        if response.get("success"):
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=response.get("message", "Message delivered"),
+                data=response.get("data", {}),
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message=response.get("message", "Plugin did not handle message"),
+            data=response.get("data", {}),
+        )
+
+    def _plugin_help(self, name: str) -> CommandResult:
+        """Return CLI help text from a plugin's cli_help() method."""
+        help_text = self.plugin_executive.send_help(name)
+        if help_text is None:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Plugin '{name}' not found",
+            )
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=help_text,
         )
 
     def _plugin_set_param(self, name: str, key: str, value: str) -> CommandResult:

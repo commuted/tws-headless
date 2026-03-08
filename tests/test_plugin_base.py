@@ -596,3 +596,103 @@ class TestNewCallbacks:
         """on_commission works with all four expected arguments."""
         plugin = ConcreteTestPlugin()
         plugin.on_commission("exec_001", 1.25, 0.0, "USD")  # should not raise
+
+
+# =============================================================================
+# Slot / instance key
+# =============================================================================
+
+
+class TestPluginSlot:
+    def test_slot_defaults_to_name(self):
+        plugin = ConcreteTestPlugin("my_plugin")
+        assert plugin.slot == "my_plugin"
+
+    def test_slot_can_be_overridden(self):
+        plugin = ConcreteTestPlugin("my_plugin")
+        plugin.slot = "spy_momentum"
+        assert plugin.slot == "spy_momentum"
+        assert plugin.name == "my_plugin"  # name unchanged
+
+    def test_slot_used_as_storage_key(self):
+        """State is stored and retrieved under the slot key."""
+        plugin = ConcreteTestPlugin("my_plugin")
+        plugin.slot = "spy_momentum"
+
+        plugin.save_state({"x": 99})
+        loaded = plugin.load_state()
+        assert loaded == {"x": 99}
+
+    def test_two_slots_independent_state(self):
+        """Two instances with different slots have independent state."""
+        p1 = ConcreteTestPlugin("my_plugin")
+        p1.slot = "slot_a"
+        p2 = ConcreteTestPlugin("my_plugin")
+        p2.slot = "slot_b"
+
+        p1.save_state({"from": "a"})
+        p2.save_state({"from": "b"})
+
+        assert p1.load_state() == {"from": "a"}
+        assert p2.load_state() == {"from": "b"}
+
+    def test_slot_in_get_status(self):
+        plugin = ConcreteTestPlugin("my_plugin")
+        plugin.slot = "spy_momentum"
+        status = plugin.get_status()
+        assert status["slot"] == "spy_momentum"
+        assert status["name"] == "my_plugin"
+
+
+# =============================================================================
+# INSTRUMENT_COMPLIANCE
+# =============================================================================
+
+
+class TestInstrumentCompliance:
+    def test_default_compliance_false(self):
+        plugin = ConcreteTestPlugin()
+        assert plugin.INSTRUMENT_COMPLIANCE is False
+
+    def test_compliance_class_attribute(self):
+        class CompliantPlugin(ConcreteTestPlugin):
+            INSTRUMENT_COMPLIANCE = True
+
+        p = CompliantPlugin()
+        assert p.INSTRUMENT_COMPLIANCE is True
+
+    def test_compliance_in_get_status(self):
+        class CompliantPlugin(ConcreteTestPlugin):
+            INSTRUMENT_COMPLIANCE = True
+
+        p = CompliantPlugin()
+        assert p.get_status()["instrument_compliance"] is True
+
+    def test_non_compliant_status(self):
+        plugin = ConcreteTestPlugin()
+        assert plugin.get_status()["instrument_compliance"] is False
+
+
+# =============================================================================
+# cli_help
+# =============================================================================
+
+
+class TestCLIHelp:
+    def test_default_cli_help_returns_string(self):
+        plugin = ConcreteTestPlugin("my_plugin")
+        result = plugin.cli_help()
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_override_cli_help(self):
+        class HelpfulPlugin(ConcreteTestPlugin):
+            def cli_help(self) -> str:
+                return "helpful_plugin commands:\n  request helpful_plugin ping {}"
+
+        p = HelpfulPlugin()
+        assert "ping" in p.cli_help()
+
+    def test_default_mentions_plugin_name(self):
+        plugin = ConcreteTestPlugin("my_plugin")
+        assert "my_plugin" in plugin.cli_help()
