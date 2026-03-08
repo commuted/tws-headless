@@ -131,9 +131,9 @@ they must be implemented even if they just return `True` / `[]`.
 ### §4a — Instrument Compliance
 
 When `INSTRUMENT_COMPLIANCE = True` the executive **blocks any `TradeSignal`
-whose symbol is not present in the plugin's registered instrument set**
-(`instruments.json` or `add_instrument()`).  Blocked signals are logged as
-warnings and silently discarded before reaching the reconciler.
+whose symbol is not present in the plugin's registered instrument set**.
+Blocked signals are logged as warnings and silently discarded before reaching
+the reconciler.
 
 Use this when you want to load two instances of the same class and restrict
 each to a different basket of securities — one instance gets SPY+QQQ, another
@@ -150,8 +150,47 @@ Load two isolated instances:
 ```bash
 ibctl plugin load plugins/basket/plugin.py=large_cap
 ibctl plugin load plugins/basket/plugin.py=small_cap
-# each instance gets its own instruments.json and independent state
 ```
+
+Each slot gets **independent instrument storage in SQLite** — no JSON files
+required. Manage the lists from the CLI at any time, including while the
+plugin is running:
+
+```bash
+# Populate the large-cap basket
+ibctl plugin instruments add large_cap SPY  --weight 0.6
+ibctl plugin instruments add large_cap QQQ  --weight 0.4
+
+# Populate the small-cap basket
+ibctl plugin instruments add small_cap IWM  --weight 1.0
+
+# Inspect
+ibctl plugin instruments list large_cap
+
+# Hot-swap: disable one symbol without removing it
+ibctl plugin instruments disable large_cap QQQ
+
+# Apply changes to the running plugin's in-memory state
+ibctl plugin instruments reload large_cap
+```
+
+**CLI instrument flags for `add`:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--name TEXT` | `""` | Human-readable label |
+| `--weight FLOAT` | `0.0` | Target allocation weight |
+| `--min-weight FLOAT` | `0.0` | Lower bound |
+| `--max-weight FLOAT` | `100.0` | Upper bound |
+| `--exchange TEXT` | `SMART` | IB routing exchange |
+| `--currency TEXT` | `USD` | Settlement currency |
+| `--sec-type TEXT` | `STK` | Security type (`STK`, `ETF`, `OPT`, …) |
+| `--disabled` | *(off)* | Add the instrument in disabled state |
+
+**Migration from `instruments.json`:** On first load, the engine automatically
+imports any existing `instruments.json` file into SQLite and records the
+migration so it is never repeated. The source file is left in place as a
+backup.
 
 ---
 

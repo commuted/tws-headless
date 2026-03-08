@@ -696,3 +696,69 @@ class TestCLIHelp:
     def test_default_mentions_plugin_name(self):
         plugin = ConcreteTestPlugin("my_plugin")
         assert "my_plugin" in plugin.cli_help()
+
+
+# =============================================================================
+# Instrument SQLite persistence
+# =============================================================================
+
+
+class TestInstrumentSQLitePersistence:
+    """Tests that add_instrument, remove_instrument, and save_instruments
+    write through to SQLite and that reload_instruments reads back."""
+
+    def test_add_instrument_persists(self, _isolated_plugin_store):
+        """add_instrument writes to store immediately."""
+        plugin = ConcreteTestPlugin("persist_test")
+        plugin.add_instrument(PluginInstrument("SPY", "S&P 500"))
+        stored = _isolated_plugin_store.load_instruments(plugin.slot)
+        assert stored is not None
+        assert any(i.symbol == "SPY" for i in stored)
+
+    def test_remove_instrument_persists(self, _isolated_plugin_store):
+        """remove_instrument deletes from store immediately."""
+        plugin = ConcreteTestPlugin("persist_test")
+        plugin.add_instrument(PluginInstrument("SPY", "S&P 500"))
+        plugin.add_instrument(PluginInstrument("QQQ", "Nasdaq"))
+        plugin.remove_instrument("SPY")
+        stored = _isolated_plugin_store.load_instruments(plugin.slot)
+        assert not any(i.symbol == "SPY" for i in stored)
+        assert any(i.symbol == "QQQ" for i in stored)
+
+    def test_save_instruments_writes_all(self, _isolated_plugin_store):
+        """save_instruments replaces all rows."""
+        plugin = ConcreteTestPlugin("persist_test")
+        plugin.add_instrument(PluginInstrument("SPY", "S&P 500"))
+        plugin.add_instrument(PluginInstrument("QQQ", "Nasdaq"))
+        # Overwrite with single instrument
+        plugin._instruments.clear()
+        plugin._instruments["AAPL"] = PluginInstrument("AAPL", "Apple")
+        plugin.save_instruments()
+        stored = _isolated_plugin_store.load_instruments(plugin.slot)
+        assert len(stored) == 1
+        assert stored[0].symbol == "AAPL"
+
+    def test_reload_instruments_reads_from_store(self, _isolated_plugin_store):
+        """reload_instruments re-reads SQLite into memory."""
+        plugin = ConcreteTestPlugin("persist_test")
+        plugin.add_instrument(PluginInstrument("SPY", "S&P 500"))
+        # Directly inject a new instrument into the store bypassing memory
+        _isolated_plugin_store.upsert_instrument(
+            plugin.slot, PluginInstrument("TSLA", "Tesla")
+        )
+        plugin.reload_instruments()
+        assert "TSLA" in plugin._instruments
+        assert "SPY" in plugin._instruments
+
+    def test_slot_isolates_instruments(self, _isolated_plugin_store):
+        """Two plugins with different slots store instruments independently."""
+        p1 = ConcreteTestPlugin("shared_name")
+        p1.slot = "slot_a"
+        p2 = ConcreteTestPlugin("shared_name")
+        p2.slot = "slot_b"
+        p1.add_instrument(PluginInstrument("SPY", "S&P 500"))
+        p2.add_instrument(PluginInstrument("QQQ", "Nasdaq"))
+        stored_a = _isolated_plugin_store.load_instruments("slot_a")
+        stored_b = _isolated_plugin_store.load_instruments("slot_b")
+        assert stored_a[0].symbol == "SPY"
+        assert stored_b[0].symbol == "QQQ"

@@ -67,7 +67,7 @@ class TestPluginStoreInit:
                 "SELECT version FROM schema_versions WHERE component = 'plugin_store'"
             ).fetchone()
         assert row is not None
-        assert row[0] == 1
+        assert row[0] == 2
 
     def test_all_tables_exist(self, store):
         import sqlite3
@@ -322,7 +322,7 @@ class TestPluginStoreSchemaVersioning:
                 "SELECT version, applied_at FROM schema_versions WHERE component='plugin_store'"
             ).fetchone()
         assert row is not None
-        assert row[0] == 1
+        assert row[0] == 2
         assert row[1]  # non-empty timestamp
 
     def test_reinit_does_not_reset_version(self, tmp_path):
@@ -347,3 +347,128 @@ class TestPluginStoreGlobalSingleton:
 
     def test_singleton_is_plugin_store(self):
         assert isinstance(get_plugin_store(), PluginStore)
+
+
+# =============================================================================
+# 9. Instrument storage
+# =============================================================================
+
+
+class TestPluginStoreInstruments:
+    """Tests for plugin_instruments CRUD methods."""
+
+    def _make_instrument(self, symbol="SPY", name="S&P 500 ETF", weight=1.0,
+                         min_weight=0.0, max_weight=100.0, enabled=True,
+                         exchange="SMART", currency="USD", sec_type="STK"):
+        from plugins.base import PluginInstrument
+        return PluginInstrument(
+            symbol=symbol, name=name, weight=weight,
+            min_weight=min_weight, max_weight=max_weight,
+            enabled=enabled, exchange=exchange, currency=currency,
+            sec_type=sec_type,
+        )
+
+    def test_load_returns_none_when_empty(self, store):
+        assert store.load_instruments("no_such_plugin") is None
+
+    def test_save_and_load_roundtrip(self, store):
+        instruments = [
+            self._make_instrument("SPY"),
+            self._make_instrument("QQQ", name="Nasdaq ETF", weight=0.5),
+        ]
+        store.save_instruments("myplugin", instruments)
+        loaded = store.load_instruments("myplugin")
+        assert loaded is not None
+        assert len(loaded) == 2
+        symbols = {i.symbol for i in loaded}
+        assert symbols == {"SPY", "QQQ"}
+
+    def test_save_overwrites_fully(self, store):
+        """Second save replaces all rows — no stale entries."""
+        store.save_instruments("myplugin", [self._make_instrument("SPY"), self._make_instrument("QQQ")])
+        store.save_instruments("myplugin", [self._make_instrument("AAPL")])
+        loaded = store.load_instruments("myplugin")
+        assert len(loaded) == 1
+        assert loaded[0].symbol == "AAPL"
+
+    def test_upsert_adds_new(self, store):
+        store.upsert_instrument("myplugin", self._make_instrument("SPY"))
+        loaded = store.load_instruments("myplugin")
+        assert loaded is not None and len(loaded) == 1
+
+    def test_upsert_updates_existing(self, store):
+        store.upsert_instrument("myplugin", self._make_instrument("SPY", weight=1.0))
+        store.upsert_instrument("myplugin", self._make_instrument("SPY", weight=2.0))
+        loaded = store.load_instruments("myplugin")
+        assert len(loaded) == 1
+        assert loaded[0].weight == pytest.approx(2.0)
+
+    def test_remove_instrument(self, store):
+        store.upsert_instrument("myplugin", self._make_instrument("SPY"))
+        store.upsert_instrument("myplugin", self._make_instrument("QQQ"))
+        store.remove_instrument("myplugin", "SPY")
+        loaded = store.load_instruments("myplugin")
+        assert len(loaded) == 1
+        assert loaded[0].symbol == "QQQ"
+
+    def test_remove_nonexistent_is_noop(self, store):
+        store.remove_instrument("myplugin", "MISSING")  # should not raise
+
+    def test_set_instrument_enabled(self, store):
+        store.upsert_instrument("myplugin", self._make_instrument("SPY", enabled=True))
+        store.set_instrument_enabled("myplugin", "SPY", False)
+        loaded = store.load_instruments("myplugin")
+        assert loaded[0].enabled is False
+        store.set_instrument_enabled("myplugin", "SPY", True)
+        loaded = store.load_instruments("myplugin")
+        assert loaded[0].enabled is True
+
+    def test_clear_instruments(self, store):
+        store.upsert_instrument("myplugin", self._make_instrument("SPY"))
+        store.upsert_instrument("myplugin", self._make_instrument("QQQ"))
+        store.clear_instruments("myplugin")
+        assert store.load_instruments("myplugin") is None
+
+    def test_instruments_isolated_by_slot(self, store):
+        store.upsert_instrument("slot_a", self._make_instrument("SPY"))
+        store.upsert_instrument("slot_b", self._make_instrument("QQQ"))
+        a = store.load_instruments("slot_a")
+        b = store.load_instruments("slot_b")
+        assert a[0].symbol == "SPY"
+        assert b[0].symbol == "QQQ"
+
+    def test_schema_version_is_2(self, store):
+        import sqlite3
+        with sqlite3.connect(store.db_path) as conn:
+            row = conn.execute(
+                "SELECT version FROM schema_versions WHERE component='plugin_store'"
+            ).fetchone()
+        assert row[0] == 2
+
+    def test_migrate_instruments_from_json(self, store, tmp_path):
+        (tmp_path / "instruments.json").write_text(json.dumps({
+            "instruments": [
+                {"symbol": "SPY", "name": "S&P ETF", "weight": 1.0,
+                 "min_weight": 0.0, "max_weight": 100.0, "enabled": True,
+                 "exchange": "SMART", "currency": "USD", "sec_type": "STK"},
+            ]
+        }))
+        store.migrate_instruments_from_json("myplugin", str(tmp_path))
+        loaded = store.load_instruments("myplugin")
+        assert loaded is not None
+        assert loaded[0].symbol == "SPY"
+
+    def test_migrate_instruments_idempotent(self, store, tmp_path):
+        (tmp_path / "instruments.json").write_text(json.dumps({
+            "instruments": [{"symbol": "SPY", "name": "", "weight": 1.0,
+                             "min_weight": 0.0, "max_weight": 100.0, "enabled": True,
+                             "exchange": "SMART", "currency": "USD", "sec_type": "STK"}]
+        }))
+        store.migrate_instruments_from_json("myplugin", str(tmp_path))
+        store.migrate_instruments_from_json("myplugin", str(tmp_path))
+        loaded = store.load_instruments("myplugin")
+        assert len(loaded) == 1  # not duplicated
+
+    def test_migrate_instruments_missing_file_skipped(self, store, tmp_path):
+        store.migrate_instruments_from_json("myplugin", str(tmp_path / "nonexistent"))
+        # Should not raise; no instruments stored since file absent

@@ -529,25 +529,32 @@ class CommandHandler:
         Handle 'plugin' command - plugin lifecycle control.
 
         Usage:
-            plugin list                          - List all plugins
-            plugin load <path[=slot]>            - Load plugin from file (optional slot name)
-            plugin unload <name>                 - Unload plugin
-            plugin status <name>                 - Get plugin status
-            plugin start <name>                  - Start plugin
-            plugin stop <name>                   - Stop plugin
-            plugin freeze <name>                 - Freeze plugin
-            plugin resume <name>                 - Resume plugin
-            plugin enable <name>                 - Enable plugin for execution
-            plugin disable <name>                - Disable plugin
-            plugin request <name> <type> <json>  - Send typed request to plugin
-            plugin message <name> <json>         - Send arbitrary message to plugin
-            plugin help <name>                   - Show plugin CLI help
-            plugin param <name> <key> <value>    - Set plugin parameter
-            plugin params <name>                 - Get plugin parameters
-            plugin feeds                         - List MessageBus channels
-            plugin history <channel> [count]     - Get channel message history
-            plugin dump <name>                   - Dump positions and open orders
-            plugin departures [--clear]          - Show departure status board
+            plugin list                               - List all plugins
+            plugin load <path[=slot]>                 - Load plugin from file (optional slot name)
+            plugin unload <name>                      - Unload plugin
+            plugin status <name>                      - Get plugin status
+            plugin start <name>                       - Start plugin
+            plugin stop <name>                        - Stop plugin
+            plugin freeze <name>                      - Freeze plugin
+            plugin resume <name>                      - Resume plugin
+            plugin enable <name>                      - Enable plugin for execution
+            plugin disable <name>                     - Disable plugin
+            plugin request <name> <type> <json>       - Send typed request to plugin
+            plugin message <name> <json>              - Send arbitrary message to plugin
+            plugin help <name>                        - Show plugin CLI help
+            plugin param <name> <key> <value>         - Set plugin parameter
+            plugin params <name>                      - Get plugin parameters
+            plugin feeds                              - List MessageBus channels
+            plugin history <channel> [count]          - Get channel message history
+            plugin dump <name>                        - Dump positions and open orders
+            plugin departures [--clear]               - Show departure status board
+            plugin instruments list <name>            - List instruments for a plugin
+            plugin instruments add <name> <symbol> [options]  - Add/update instrument
+            plugin instruments remove <name> <symbol> - Remove instrument
+            plugin instruments enable <name> <symbol> - Enable instrument
+            plugin instruments disable <name> <symbol>- Disable instrument
+            plugin instruments clear <name>           - Remove all instruments
+            plugin instruments reload <name>          - Re-read instruments from SQLite
         """
         if self.plugin_executive is None:
             return CommandResult(
@@ -702,6 +709,8 @@ class CommandHandler:
             elif subcommand == "departures":
                 clear = "--clear" in subargs
                 return self._plugin_departures(clear)
+            elif subcommand == "instruments":
+                return self._plugin_instruments(subargs)
             else:
                 return CommandResult(
                     status=CommandStatus.ERROR,
@@ -882,6 +891,117 @@ class CommandHandler:
             status=CommandStatus.ERROR,
             message=response.get("message", "Request failed"),
         )
+
+    def _plugin_instruments(self, args: List[str]) -> CommandResult:
+        """Handle 'plugin instruments <sub> ...' commands."""
+        import json as _json
+        if not args:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Usage: plugin instruments list|add|remove|enable|disable|clear|reload <name> [symbol] [options]",
+            )
+
+        sub = args[0].lower()
+        rest = args[1:]
+
+        if sub == "list":
+            if not rest:
+                return CommandResult(status=CommandStatus.ERROR,
+                                     message="Usage: plugin instruments list <name>")
+            instruments = self.plugin_executive.get_plugin_instruments(rest[0])
+            if instruments is None:
+                return CommandResult(status=CommandStatus.ERROR,
+                                     message=f"Plugin '{rest[0]}' not found")
+            data = [i.to_dict() for i in instruments]
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"{len(data)} instrument(s) for '{rest[0]}'",
+                data={"instruments": data},
+            )
+
+        if sub == "add":
+            # plugin instruments add <name> <symbol> [--name NAME] [--weight W]
+            # [--exchange X] [--currency C] [--sec-type T] [--disabled]
+            if len(rest) < 2:
+                return CommandResult(status=CommandStatus.ERROR,
+                                     message="Usage: plugin instruments add <name> <symbol> [options]")
+            plugin_name, symbol = rest[0], rest[1].upper()
+            flags = rest[2:]
+
+            def _flag(key, default=None):
+                for i, f in enumerate(flags):
+                    if f == key and i + 1 < len(flags):
+                        return flags[i + 1]
+                return default
+
+            from plugins.base import PluginInstrument
+            inst = PluginInstrument(
+                symbol=symbol,
+                name=_flag("--name", symbol),
+                weight=float(_flag("--weight", 0.0)),
+                min_weight=float(_flag("--min-weight", 0.0)),
+                max_weight=float(_flag("--max-weight", 100.0)),
+                enabled="--disabled" not in flags,
+                exchange=_flag("--exchange", "SMART"),
+                currency=_flag("--currency", "USD"),
+                sec_type=_flag("--sec-type", "STK"),
+            )
+            if self.plugin_executive.add_plugin_instrument(plugin_name, inst):
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=f"Instrument '{symbol}' added to '{plugin_name}'",
+                    data=inst.to_dict(),
+                )
+            return CommandResult(status=CommandStatus.ERROR,
+                                 message=f"Plugin '{plugin_name}' not found")
+
+        if sub == "remove":
+            if len(rest) < 2:
+                return CommandResult(status=CommandStatus.ERROR,
+                                     message="Usage: plugin instruments remove <name> <symbol>")
+            plugin_name, symbol = rest[0], rest[1].upper()
+            if self.plugin_executive.remove_plugin_instrument(plugin_name, symbol):
+                return CommandResult(status=CommandStatus.SUCCESS,
+                                     message=f"Instrument '{symbol}' removed from '{plugin_name}'")
+            return CommandResult(status=CommandStatus.ERROR,
+                                 message=f"Plugin '{plugin_name}' or symbol '{symbol}' not found")
+
+        if sub in ("enable", "disable"):
+            if len(rest) < 2:
+                return CommandResult(status=CommandStatus.ERROR,
+                                     message=f"Usage: plugin instruments {sub} <name> <symbol>")
+            plugin_name, symbol = rest[0], rest[1].upper()
+            enabled = sub == "enable"
+            if self.plugin_executive.set_plugin_instrument_enabled(plugin_name, symbol, enabled):
+                action = "enabled" if enabled else "disabled"
+                return CommandResult(status=CommandStatus.SUCCESS,
+                                     message=f"Instrument '{symbol}' {action} in '{plugin_name}'")
+            return CommandResult(status=CommandStatus.ERROR,
+                                 message=f"Plugin '{plugin_name}' or symbol '{symbol}' not found")
+
+        if sub == "clear":
+            if not rest:
+                return CommandResult(status=CommandStatus.ERROR,
+                                     message="Usage: plugin instruments clear <name>")
+            if self.plugin_executive.clear_plugin_instruments(rest[0]):
+                return CommandResult(status=CommandStatus.SUCCESS,
+                                     message=f"All instruments cleared from '{rest[0]}'")
+            return CommandResult(status=CommandStatus.ERROR,
+                                 message=f"Plugin '{rest[0]}' not found")
+
+        if sub == "reload":
+            if not rest:
+                return CommandResult(status=CommandStatus.ERROR,
+                                     message="Usage: plugin instruments reload <name>")
+            count = self.plugin_executive.reload_plugin_instruments(rest[0])
+            if count is None:
+                return CommandResult(status=CommandStatus.ERROR,
+                                     message=f"Plugin '{rest[0]}' not found")
+            return CommandResult(status=CommandStatus.SUCCESS,
+                                 message=f"Reloaded {count} instrument(s) for '{rest[0]}'")
+
+        return CommandResult(status=CommandStatus.ERROR,
+                             message=f"Unknown instruments subcommand: {sub}")
 
     def _plugin_message(self, name: str, payload_json: str) -> CommandResult:
         """Send an arbitrary JSON message to a plugin (routes to handle_request type='message')."""

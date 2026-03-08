@@ -228,6 +228,28 @@ def format_result(result: CommandResult, verbose: bool = False):
             else:
                 print("\n  Open orders: (none)")
 
+        elif "instruments" in result.data and "compliance" in result.data:
+            # Plugin instruments list response
+            instruments = result.data["instruments"]
+            compliance = result.data["compliance"]
+            print(f"\n  Compliance enforcement: {'ON' if compliance else 'off'}")
+            if instruments:
+                print(f"\n  {'Symbol':<8} {'Name':<20} {'Weight':>8} {'Min':>6} {'Max':>6} "
+                      f"{'Exch':<6} {'Ccy':<4} {'Type':<4} {'En'}")
+                print(f"  {'-' * 72}")
+                for i in instruments:
+                    enabled = "yes" if i.get("enabled", True) else "no"
+                    print(f"  {i['symbol']:<8} {i.get('name',''):<20} "
+                          f"{i.get('weight', 0.0):>8.2f} "
+                          f"{i.get('min_weight', 0.0):>6.2f} "
+                          f"{i.get('max_weight', 100.0):>6.2f} "
+                          f"{i.get('exchange','SMART'):<6} "
+                          f"{i.get('currency','USD'):<4} "
+                          f"{i.get('sec_type','STK'):<4} "
+                          f"{enabled}")
+            else:
+                print("\n  Instruments: (none)")
+
         elif "positions" in result.data:
             positions = result.data["positions"]
             if positions:
@@ -293,6 +315,13 @@ Commands:
   plugin request NAME TYPE [JSON]   Send a typed request to handle_request()
   plugin message NAME [JSON]        Send arbitrary JSON message to plugin
   plugin help NAME                  Show plugin CLI help (cli_help())
+  plugin instruments list NAME      List instruments for a plugin instance
+  plugin instruments add NAME SYM [--weight W] [--exchange X] [--currency C] [--sec-type T] [--disabled]
+  plugin instruments remove NAME SYM   Remove an instrument
+  plugin instruments enable NAME SYM   Enable an instrument
+  plugin instruments disable NAME SYM  Disable an instrument
+  plugin instruments clear NAME        Remove all instruments from a plugin
+  plugin instruments reload NAME       Re-read instruments from SQLite into memory
 
   algo list            List all algorithms
   algo status NAME     Get algorithm status
@@ -329,6 +358,10 @@ Examples:
   ./ibctl.py plugin message momentum_5day '{"action": "set_threshold", "value": 0.5}'
   ./ibctl.py plugin status momentum_5day
   ./ibctl.py plugin stop 78b052d2-17e7-4ee5-ac03-282e0cd05c2b
+  ./ibctl.py plugin instruments list spy_momentum
+  ./ibctl.py plugin instruments add spy_momentum SPY --weight 1.0
+  ./ibctl.py plugin instruments remove spy_momentum AAPL
+  ./ibctl.py plugin instruments enable spy_momentum QQQ
         """,
     )
 

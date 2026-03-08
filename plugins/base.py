@@ -603,6 +603,7 @@ class PluginBase(ABC):
         """Migrate legacy JSON files into SQLite once per instance."""
         if not self._migration_done:
             self._store.migrate_from_json(self.slot, self._base_path)
+            self._store.migrate_instruments_from_json(self.slot, self._base_path)
             self._migration_done = True
 
     def save_state(self, state: Dict[str, Any]) -> bool:
@@ -1192,18 +1193,14 @@ class PluginBase(ABC):
             return False
 
     def _load_instruments(self):
-        """Load instruments from file"""
-        if not self._instruments_file.exists():
-            logger.warning(f"Instruments file not found: {self._instruments_file}")
-            return
-
-        with open(self._instruments_file) as f:
-            data = json.load(f)
-
-        self._instruments.clear()
-        for inst_data in data.get("instruments", []):
-            inst = PluginInstrument.from_dict(inst_data)
-            self._instruments[inst.symbol] = inst
+        """Load instruments from SQLite (migrating from JSON on first call)."""
+        self._run_migration_if_needed()
+        loaded = self._store.load_instruments(self.slot)
+        if loaded is not None:
+            self._instruments.clear()
+            for inst in loaded:
+                self._instruments[inst.symbol] = inst
+        # If None (nothing in DB yet), leave _instruments empty — fresh instance
 
     def _load_holdings(self):
         """Load holdings from SQLite, falling back to fresh Holdings if absent."""
@@ -1227,20 +1224,18 @@ class PluginBase(ABC):
         logger.info(f"Saved holdings for '{self.slot}'")
 
     def save_instruments(self):
-        """Save instruments to file"""
-        # Ensure directory exists
-        self._base_path.mkdir(parents=True, exist_ok=True)
+        """Save current instrument list to SQLite."""
+        self._store.save_instruments(self.slot, list(self._instruments.values()))
+        logger.info(f"Saved {len(self._instruments)} instruments for '{self.slot}'")
 
-        data = {
-            "plugin": self.name,
-            "description": self.description,
-            "instruments": [i.to_dict() for i in self._instruments.values()],
-        }
-
-        with open(self._instruments_file, "w") as f:
-            json.dump(data, f, indent=2)
-
-        logger.info(f"Saved instruments for '{self.name}'")
+    def reload_instruments(self):
+        """Re-read instrument list from SQLite into memory (picks up CLI changes)."""
+        loaded = self._store.load_instruments(self.slot)
+        if loaded is not None:
+            self._instruments.clear()
+            for inst in loaded:
+                self._instruments[inst.symbol] = inst
+        logger.info(f"Reloaded {len(self._instruments)} instruments for '{self.slot}'")
 
     # =========================================================================
     # Instrument Management
@@ -1251,17 +1246,18 @@ class PluginBase(ABC):
         return self._instruments.get(symbol.upper())
 
     def add_instrument(self, instrument: PluginInstrument) -> bool:
-        """Add an instrument to the plugin"""
-        if instrument.symbol in self._instruments:
-            return False
+        """Add an instrument and persist to SQLite."""
         self._instruments[instrument.symbol] = instrument
+        self._store.upsert_instrument(self.slot, instrument)
         return True
 
     def remove_instrument(self, symbol: str) -> bool:
-        """Remove an instrument from the plugin"""
-        if symbol.upper() not in self._instruments:
+        """Remove an instrument and persist to SQLite."""
+        sym = symbol.upper()
+        if sym not in self._instruments:
             return False
-        del self._instruments[symbol.upper()]
+        del self._instruments[sym]
+        self._store.remove_instrument(self.slot, sym)
         return True
 
     def get_contracts(self) -> List[Contract]:
