@@ -2,7 +2,7 @@
 
 A headless, plugin-based algorithmic trading engine for Interactive Brokers. Connects to TWS or IB Gateway over the IB API, streams real-time market data, routes it to plugins, executes trade signals, and exposes a Unix socket command interface for external control.
 
-📖 **[Wiki](https://github.com/commuted/tws-headless/wiki)** — [Theory of Operation](https://github.com/commuted/tws-headless/wiki/Theory-of-Operation) · [CLI Task Guide](https://github.com/commuted/tws-headless/wiki/CLI) · [Plugin Design](https://github.com/commuted/tws-headless/wiki/Plugin-Design)
+📖 **[Wiki](https://github.com/commuted/tws-headless/wiki)** — [Theory of Operation](https://github.com/commuted/tws-headless/wiki/Theory-of-Operation) · [CLI Task Guide](https://github.com/commuted/tws-headless/wiki/CLI) · [Plugin Design](https://github.com/commuted/tws-headless/wiki/Plugin-Design) · [Plugin Manual](https://github.com/commuted/tws-headless/wiki/Plugin-Manual)
 
 ## Requirements
 
@@ -92,7 +92,7 @@ Sends commands to a running engine over the Unix socket.
 
 ## Plugins
 
-Plugins are Python classes that subclass `PluginBase`. They receive market data, publish signals, and interact with the MessageBus. See the **[Plugin Design wiki](https://github.com/commuted/tws-headless/wiki/Plugin-Design)** or **[PLUGIN_MANUAL.md](PLUGIN_MANUAL.md)** for the full authoring reference.
+Plugins are Python classes that subclass `PluginBase`. They receive market data, publish signals, and interact with the MessageBus. See the **[Plugin Manual](https://github.com/commuted/tws-headless/wiki/Plugin-Manual)** for the full authoring reference.
 
 ### File layout
 
