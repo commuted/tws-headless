@@ -29,47 +29,53 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 # ETF pairs: (symbol_a, symbol_b)
 #
-# All pairs use leveraged ETFs for amplified price movement, which makes
-# limit and stop conditions more likely to trigger in the test window.
+# All ordinary (non-leveraged, non-inverse) ETFs.  Each pair is chosen so
+# that a market move in either direction is likely to hit at least one leg
+# within the 5-minute fill window:
 #
-# Three underlying pairs, assigned by test characteristics:
+#   SPY / QQQ  – large-cap equity / Nasdaq 100.  Both move with the market;
+#                BUY SPY fires when SPY dips, SELL QQQ fires when QQQ rises.
+#                Ideal for immediate-fill tests (market, MOC, MOO, MTL) where
+#                fills happen regardless of direction.
 #
-#   TQQQ/SQQQ  – QQQ +3×/−3× (inverse to each other).  Both legs fire in
-#                the same market direction; ideal for immediate-fill tests
-#                (market, MOC, MOO, MTL) where direction does not matter.
+#   QQQ / IWM  – Nasdaq 100 / Russell 2000.  Correlated but independent
+#                underlyings.  Typical 5-min range ~0.15–0.25%; the 0.30%
+#                offset is hit on most active trading days.
 #
-#   SPXU/SDS   – SPY −3×/−2× (same direction, opposite to SPY).  BUY side
-#                fires when SPY rises; SELL side fires when SPY falls.
-#                One leg fills regardless of market direction.
-#
-#   SDOW/DXD   – DOW −3×/−2× (same direction, opposite to DIA).  Same
-#                property as SPXU/SDS on an independent underlying.
+#   IWM / GLD  – Russell 2000 / Gold.  Typically negatively correlated on
+#                risk-off days; provides an independent second theme for
+#                stop and MOO tests.  GLD 5-min range ~0.08–0.15%.
 #
 # Index → test use:
-#   0 TQQQ/SQQQ  market / immediate
-#   1 SPXU/SDS   limit
-#   2 SDOW/DXD   stop
-#   3 SPXU/SDS   stop-limit
-#   4 TQQQ/SQQQ  MOC / immediate
-#   5 SDOW/DXD   MOO / immediate
-#   6 TQQQ/SQQQ  MTL / immediate
+#   0 SPY/QQQ   market / immediate
+#   1 QQQ/IWM   limit
+#   2 IWM/GLD   stop
+#   3 QQQ/IWM   stop-limit
+#   4 SPY/QQQ   MOC / immediate
+#   5 IWM/GLD   MOO / immediate
+#   6 SPY/QQQ   MTL / immediate
 # ===========================================================================
 ETF_PAIRS: List[Tuple[str, str]] = [
-    ("TQQQ", "SQQQ"),   # 0 – QQQ +3× / −3× inverse
-    ("SPXU", "SDS"),    # 1 – SPY −3× / −2× (same dir; one fires either way)
-    ("SDOW", "DXD"),    # 2 – DOW −3× / −2× (same dir; one fires either way)
-    ("SPXU", "SDS"),    # 3 – SPY −3× / −2× (same dir; one fires either way)
-    ("TQQQ", "SQQQ"),   # 4 – QQQ +3× / −3× inverse
-    ("SDOW", "DXD"),    # 5 – DOW −3× / −2× (same dir; one fires either way)
-    ("TQQQ", "SQQQ"),   # 6 – QQQ +3× / −3× inverse
+    ("SPY",  "QQQ"),    # 0 – S&P 500 / Nasdaq 100 (immediate)
+    ("QQQ",  "IWM"),    # 1 – Nasdaq 100 / Russell 2000 (limit)
+    ("IWM",  "GLD"),    # 2 – Russell 2000 / Gold (stop)
+    ("QQQ",  "IWM"),    # 3 – Nasdaq 100 / Russell 2000 (stop-limit)
+    ("SPY",  "QQQ"),    # 4 – S&P 500 / Nasdaq 100 (MOC immediate)
+    ("IWM",  "GLD"),    # 5 – Russell 2000 / Gold (MOO immediate)
+    ("SPY",  "QQQ"),    # 6 – S&P 500 / Nasdaq 100 (MTL immediate)
 ]
 
 # Quantity for all test orders (1 share – small footprint on paper account)
 TEST_QTY = Decimal("1")
 
-# Fraction below/above current price for aggressive limit-type orders
-OFFSET_BELOW = 0.995   # BUY limit/stop-limit below market
-OFFSET_ABOVE = 1.005   # SELL limit/stop-limit above market
+# Fraction below/above current price for conditional order offsets.
+# Calibrated to the typical 5-minute move of the ETFs above:
+#   SPY/QQQ: avg 5-min range ~0.12–0.20%; 0.30% offset is ~1–2× that range.
+#   IWM:     avg 5-min range ~0.15–0.25%; 0.30% offset is within range on most days.
+#   GLD:     avg 5-min range ~0.08–0.15%; 0.30% offset hits on active sessions.
+# Tests still PASS on "submitted" even when limits do not fill in window.
+OFFSET_BELOW = 0.997   # BUY limit/stop 0.30% below market
+OFFSET_ABOVE = 1.003   # SELL limit/stop 0.30% above market
 
 # Paper trading ports
 PAPER_PORTS = (7497, 4002)

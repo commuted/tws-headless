@@ -14,18 +14,18 @@ Additional order features exercised
 
 Round-trip tests (position opened AND closed on same symbol)
 ────────────────────────────────────────────────────────────
-  mkt_mkt           MKT buy TQQQ  → MKT sell            (baseline, always fills)
-  mkt_lmt           MKT buy SQQQ  → LMT sell fill+0.5%  (profit-target exit; fallback MKT)
-  lmt_mkt           LMT buy SPXU −0.3% → MKT sell       (patient entry, instant exit)
-  mkt_trail         MKT buy SDS   → TRAIL 0.5%           (trailing exit; fallback MKT)
-  mkt_stplmt        MKT buy SDOW  → STP LMT −1%/−1.5%  (protective exit; fallback MKT)
-  adaptive          Adaptive BUY SPXU (Urgent) → MKT sell
-  iceberg           LMT buy TQQQ 200 shares displaySize=100 → MKT sell 200
+  mkt_mkt           MKT buy QQQ   → MKT sell            (baseline, always fills)
+  mkt_lmt           MKT buy IWM   → LMT sell fill+0.5%  (profit-target exit; fallback MKT)
+  lmt_mkt           LMT buy QQQ −0.3% → MKT sell        (patient entry, instant exit)
+  mkt_trail         MKT buy GLD   → TRAIL 0.5%           (trailing exit; fallback MKT)
+  mkt_stplmt        MKT buy IWM   → STP LMT −1%/−1.5%  (protective exit; fallback MKT)
+  adaptive          Adaptive BUY QQQ (Urgent) → MKT sell
+  iceberg           LMT buy IWM 200 shares displaySize=100 → MKT sell 200
 
 No-position tests (order placed, verified, then cancelled / killed)
 ────────────────────────────────────────────────────────────────────
-  ioc_no_fill       IOC LMT at −2% DXD  → confirm cancel, no fill
-  gtc_lifecycle     GTC LMT at −3% SQQQ → confirm submitted → explicit cancel
+  ioc_no_fill       IOC LMT at −2% GLD  → confirm cancel, no fill
+  gtc_lifecycle     GTC LMT at −3% IWM  → confirm submitted → explicit cancel
   fok_market        FOK MKT SPY         → fills (liquid) or kills; if filled: MKT exit
 
 Run via: plugin request paper_test_orders_6 run_tests
@@ -54,7 +54,7 @@ TEST_QTY = Decimal("1")
 _BELOW_003 = 0.997   # 0.3% below — aggressive limit, should fill within minutes
 _BELOW_200 = 0.980   # 2.0% below — IOC bait, should NOT fill
 _BELOW_300 = 0.970   # 3.0% below — GTC bait, should NOT fill
-_ABOVE_005 = 1.005   # 0.5% above — limit profit target
+_ABOVE_003 = 1.003   # 0.3% above — limit profit target (calibrated to IWM 5-min range)
 
 
 # =============================================================================
@@ -426,10 +426,10 @@ class PaperTestOrders6Plugin(PluginBase):
     # Primary exchange for each symbol used in this plugin.
     # Required so IB can route historical data requests without ambiguity.
     _PRIMARY_EXCHANGE: Dict[str, str] = {
-        "TQQQ": "NASDAQ", "SQQQ": "NASDAQ",
-        "SPXU": "ARCA",   "SDS":  "ARCA",
-        "SDOW": "ARCA",   "DXD":  "ARCA",
-        "SPY":  "ARCA",
+        "SPY": "ARCA",
+        "QQQ": "NASDAQ",
+        "IWM": "ARCA",
+        "GLD": "ARCA",
     }
 
     def _make_contract(self, symbol: str):
@@ -522,7 +522,7 @@ class PaperTestOrders6Plugin(PluginBase):
 
         return None
 
-    def _is_market_open(self, symbol: str = "TQQQ") -> bool:
+    def _is_market_open(self, symbol: str = "SPY") -> bool:
         """
         Use reqContractDetails to check whether the symbol is currently in its
         liquid (regular) trading hours.
@@ -672,10 +672,10 @@ class PaperTestOrders6Plugin(PluginBase):
 
     def _test_mkt_mkt(self) -> RoundTripResult:
         """
-        MKT buy TQQQ → MKT sell.
+        MKT buy QQQ → MKT sell.
         Baseline round-trip: guaranteed to fill immediately on both legs.
         """
-        sym = "TQQQ"
+        sym = "QQQ"
         r = RoundTripResult(test_name="mkt_mkt_roundtrip", order_type="MKT→MKT", symbol=sym)
         start = time.time()
         try:
@@ -732,10 +732,12 @@ class PaperTestOrders6Plugin(PluginBase):
 
     def _test_mkt_lmt(self) -> RoundTripResult:
         """
-        MKT buy SQQQ → LMT sell at fill+0.5% (profit target).
+        MKT buy IWM → LMT sell at fill+0.3% (profit target).
         Falls back to MKT sell after 2 minutes if the limit does not fill.
+        IWM (Russell 2000) has a typical 5-min range of 0.15–0.25%; 0.3%
+        profit target is aggressive but reachable on active trading days.
         """
-        sym = "SQQQ"
+        sym = "IWM"
         r = RoundTripResult(
             test_name="mkt_lmt_roundtrip", order_type="MKT→LMT(fb:MKT)", symbol=sym
         )
@@ -764,8 +766,8 @@ class PaperTestOrders6Plugin(PluginBase):
             r.entry_fill_price = ef
             logger.info(f"  [{sym}] Entry fill @ ${ef:.4f}")
 
-            # Exit: limit sell at entry+0.5% — profit target
-            lmt_px = round(ef * _ABOVE_005, 2)
+            # Exit: limit sell at entry+0.3% — profit target
+            lmt_px = round(ef * _ABOVE_003, 2)
             xo = Order(); xo.action = "SELL"; xo.orderType = "LMT"
             xo.totalQuantity = TEST_QTY
             xo.lmtPrice = lmt_px
@@ -805,11 +807,13 @@ class PaperTestOrders6Plugin(PluginBase):
 
     def _test_lmt_mkt(self) -> RoundTripResult:
         """
-        LMT buy SPXU 0.3% below market → MKT sell when filled.
+        LMT buy QQQ 0.3% below market → MKT sell when filled.
         Tests a passive entry: waits up to 5 minutes for the limit to fill,
-        then exits immediately at market.
+        then exits immediately at market.  QQQ (Nasdaq 100) has a typical
+        5-min range of 0.15–0.25%, making the 0.3% offset reachable on
+        most active trading days.
         """
-        sym = "SPXU"
+        sym = "QQQ"
         r = RoundTripResult(test_name="lmt_mkt_roundtrip", order_type="LMT→MKT", symbol=sym)
         start = time.time()
         try:
@@ -874,11 +878,13 @@ class PaperTestOrders6Plugin(PluginBase):
 
     def _test_mkt_trail(self) -> RoundTripResult:
         """
-        MKT buy SDS → TRAIL STOP sell (trail = 0.5% of fill price).
+        MKT buy GLD → TRAIL STOP sell (trail = 0.5% of fill price).
         Tests using a trailing stop as the exit mechanism.
+        GLD (Gold ETF) is independent of equity direction, providing a
+        different market factor for the trailing stop test.
         Falls back to MKT sell after 5 minutes.
         """
-        sym = "SDS"
+        sym = "GLD"
         r = RoundTripResult(
             test_name="mkt_trail_roundtrip", order_type="MKT→TRAIL(fb:MKT)", symbol=sym
         )
@@ -947,11 +953,13 @@ class PaperTestOrders6Plugin(PluginBase):
 
     def _test_mkt_stplmt(self) -> RoundTripResult:
         """
-        MKT buy SDOW → STP LMT sell (stop=1% below fill, limit=1.5% below fill).
+        MKT buy IWM → STP LMT sell (stop=1% below fill, limit=1.5% below fill).
         Tests a protective stop-limit as the exit mechanism.
+        IWM (Russell 2000) has higher intraday volatility than SPY, increasing
+        the likelihood the stop level is touched within the test window.
         Falls back to MKT sell after 3 minutes.
         """
-        sym = "SDOW"
+        sym = "IWM"
         r = RoundTripResult(
             test_name="mkt_stplmt_roundtrip", order_type="MKT→STP LMT(fb:MKT)", symbol=sym
         )
@@ -1028,12 +1036,13 @@ class PaperTestOrders6Plugin(PluginBase):
 
     def _test_ioc_no_fill(self) -> RoundTripResult:
         """
-        IOC LMT buy DXD 2% below market → confirm cancel, no position opened.
+        IOC LMT buy GLD 2% below market → confirm cancel, no position opened.
         A limit 2% below market will never fill within the IOC window; IB
         cancels it instantly.  The test verifies the cancel and that no shares
         were acquired.  If it unexpectedly fills, the position is closed.
+        GLD (Gold ETF) is liquid and independent of the equity ETFs used elsewhere.
         """
-        sym = "DXD"
+        sym = "GLD"
         r = RoundTripResult(
             test_name="ioc_no_fill", order_type="IOC", symbol=sym,
             expected_no_fill=True,
@@ -1088,11 +1097,11 @@ class PaperTestOrders6Plugin(PluginBase):
 
     def _test_gtc_lifecycle(self) -> RoundTripResult:
         """
-        GTC LMT buy SQQQ 3% below market → verify it is live → explicit cancel.
+        GTC LMT buy IWM 3% below market → verify it is live → explicit cancel.
         Confirms that (a) GTC orders are accepted, (b) they persist after
         placement, and (c) they can be explicitly cancelled before EOD.
         """
-        sym = "SQQQ"
+        sym = "IWM"
         r = RoundTripResult(
             test_name="gtc_lifecycle", order_type="GTC+cancel", symbol=sym,
             expected_no_fill=True,
@@ -1229,11 +1238,13 @@ class PaperTestOrders6Plugin(PluginBase):
 
     def _test_adaptive_roundtrip(self) -> RoundTripResult:
         """
-        Adaptive algo BUY SPXU (urgency=Urgent) → MKT sell when filled.
+        Adaptive algo BUY QQQ (urgency=Urgent) → MKT sell when filled.
         IB's Adaptive algo routes through SMART with pacing; Urgent behaves
         close to a market order while still allowing price improvement.
+        QQQ is among the most liquid US equity ETFs, ensuring the adaptive
+        algo fills promptly even with controlled pacing.
         """
-        sym = "SPXU"
+        sym = "QQQ"
         r = RoundTripResult(
             test_name="adaptive_roundtrip", order_type="ADAPT(Urgent)→MKT", symbol=sym
         )
@@ -1298,16 +1309,17 @@ class PaperTestOrders6Plugin(PluginBase):
 
     def _test_iceberg_roundtrip(self) -> RoundTripResult:
         """
-        Iceberg LMT buy TQQQ — 200 shares total, displaySize=100 (1 round lot shown).
+        Iceberg LMT buy IWM — 200 shares total, displaySize=100 (1 round lot shown).
         → MKT sell 200 shares when the iceberg fully fills.
         Tests IB's reserve/iceberg order: only `displaySize` shares are shown
         on the order book at any time; refreshed automatically as each tranche fills.
         Uses 0.3% below market so the limit is aggressive enough to fill.
 
+        IWM (~$220/share): 200 shares ≈ $44k notional on paper — manageable footprint.
         Note: IB requires displaySize to be a multiple of the exchange lot size
         (100 shares for US stocks). displaySize=1 is rejected on paper accounts.
         """
-        sym = "TQQQ"
+        sym = "IWM"
         qty = Decimal("200")
         display_size = 100   # 1 round lot; IB requires multiple of lot size (100)
         r = RoundTripResult(
