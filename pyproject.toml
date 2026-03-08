@@ -10,6 +10,9 @@ requires-python = ">=3.10"
 dependencies = [
     "ibapi",
 ]
+authors = [
+    { name = "Ron", email = "git-commuted@proton.me" }
+keywords = ["interactive brokers", "tws", "headless", "stock trading", "asynchronous", "portfolio management", "ibapi", "cli"]
 
 [project.optional-dependencies]
 dev = [
