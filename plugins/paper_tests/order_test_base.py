@@ -21,6 +21,18 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from ibapi.contract import Contract
 from ibapi.order import Order
 
+# Primary exchange for each ETF used across the order test plugins.
+# Required so IB can resolve the contract without ambiguity on SMART routing.
+# All SPDR sector ETFs and the Russell 2000 ETF list on NYSE Arca.
+_PRIMARY_EXCHANGE: Dict[str, str] = {
+    "SPY": "ARCA",
+    "QQQ": "NASDAQ",
+    "IWM": "ARCA",
+    "XLF": "ARCA",
+    "XLK": "ARCA",
+    "XLE": "ARCA",
+}
+
 from ib.data_feed import DataType, TickData
 from plugins.base import PluginBase, TradeSignal
 
@@ -93,12 +105,17 @@ PAPER_PORTS = (7497, 4002)
 
 def make_stk_contract(symbol: str, exchange: str = "SMART",
                       currency: str = "USD") -> Contract:
-    """Create a basic STK (equity) contract."""
+    """Create a basic STK (equity) contract.
+
+    Sets primaryExch from _PRIMARY_EXCHANGE when available so IB can resolve
+    the contract without ambiguity on SMART routing.
+    """
     c = Contract()
     c.symbol = symbol
     c.secType = "STK"
     c.exchange = exchange
     c.currency = currency
+    c.primaryExch = _PRIMARY_EXCHANGE.get(symbol, "")
     return c
 
 
