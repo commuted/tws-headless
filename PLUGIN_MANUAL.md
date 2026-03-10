@@ -33,9 +33,11 @@ Complete reference for writing plugins for TWS Headless.
 15. [Contract Builder](#15-contract-builder)
 16. [Self-Unload](#16-self-unload)
 17. [Engine Commands](#17-engine-commands)
+    - 17.1 [`abandon` — system-level teardown](#abandon--system-level-teardown)
 18. [Threading Rules](#18-threading-rules)
 19. [Naming Conventions](#19-naming-conventions)
 20. [Complete Examples](#20-complete-examples)
+21. [Paper Test Runner](#21-paper-test-runner)
 
 ---
 
@@ -1189,13 +1191,26 @@ if rec:
 
 ### Market data type (paper accounts)
 
-```python
-# Delayed ticks (use before reqMktData on paper without live subscription)
-self.portfolio.reqMarketDataType(3)
+The engine auto-detects the appropriate market data type at connect time
+and sets it once, before any plugin is started. Plugins must not call
+`self.portfolio.reqMarketDataType()` directly — it is a session-wide
+setting shared across all plugins.
 
-# Live mode (required for reqRealTimeBars)
-self.portfolio.reqMarketDataType(1)
-```
+To override the auto-detected type, pass `--market-data-type N` (where
+N is 1=live, 2=frozen, 3=delayed, 4=delayed-frozen) on the engine
+command line, or set the `MARKET_DATA_TYPE` environment variable.
+
+Paper accounts with a live data subscription shared from a funded account
+will auto-detect as type 1 and receive live ticks and real-time bars.
+Paper accounts without a live subscription will detect as type 3 and
+receive delayed ticks; `BAR_*` subscriptions will be silent in that mode.
+
+**Paper test plugins only:** `OrderTestPluginBase._fetch_price` temporarily
+switches to type 3 and then immediately restores type 1 in order to retrieve
+a delayed bid/ask price when no cached price exists. This is safe only
+because order test plugins run **sequentially** (never concurrently).
+Do not run order test plugins in parallel — the global toggle would corrupt
+market data delivery for any other plugin active on the same connection.
 
 ### Historical data (low-level)
 
@@ -1374,6 +1389,34 @@ plugin dump my_plugin
 
 # Unload (calls stop then removes from registry)
 plugin unload my_plugin
+
+# Abandon a plugin — cancel all open orders, zero holdings, then unload
+plugin request my_plugin abandon
+plugin request my_plugin abandon '{"timeout": 60.0}'
+```
+
+### `abandon` — system-level teardown
+
+`abandon` is a built-in system command intercepted by the engine before
+`handle_request` is called, so **no plugin needs to implement it**.
+
+Sequence:
+1. Finds all orders registered to the plugin via the engine's order-id index.
+2. Sends `cancelOrder` for every non-terminal order.
+3. Polls up to `timeout` seconds (default 30) for IB cancellation acknowledgements.
+4. Zeros `plugin._holdings.current_positions` and `current_cash`, saves state.
+5. Tears down all streams, then unloads the plugin.
+
+Use `abandon` when a plugin has open orders that you need cancelled before
+teardown. In contrast, `plugin stop` / `plugin unload` do **not** cancel
+open orders on their own.
+
+```bash
+# With default 30-second cancel timeout
+plugin request my_plugin abandon
+
+# With extended timeout (seconds)
+plugin request my_plugin abandon '{"timeout": 60.0}'
 ```
 
 The `plugin load` command resolves the module, finds the first class that
@@ -1755,3 +1798,69 @@ class RSIStrategyPlugin(PluginBase):
                             reason=f"RSI overbought ({rsi:.1f})", confidence=0.8)
             )
 ```
+
+---
+
+## 21. Paper Test Runner
+
+`run_paper_tests.py` drives the order-test and feed-test plugins against a
+live paper account. It is an operational tool, not a plugin itself.
+
+### Requirements
+
+- **Must be run during regular market hours** (NYSE: 09:30–16:00 ET, Mon–Fri).
+  Delayed-mode tick subscriptions can deliver bid/ask prices outside market
+  hours, but live order flow and fills require an open session. Historical
+  close prices (tier-3 fallback in `_fetch_price`) will be fetched instead,
+  but limit-order tests may not fill outside hours.
+
+- A paper account connected to TWS or IB Gateway on the standard paper port
+  (`7497` for TWS, `4002` for Gateway).
+
+### Usage
+
+```bash
+# Run all order tests (plugins 1–5 run sequentially, one at a time)
+python run_paper_tests.py
+
+# Run only feed tests (dual-plugin concurrent feed validation)
+python run_paper_tests.py --feeds-only
+
+# Restart the engine between test suites for a clean slate
+python run_paper_tests.py --restart-engine
+
+# Combined: restart engine, then run all tests
+python run_paper_tests.py --restart-engine --all
+```
+
+### `--restart-engine`
+
+Performs a graceful engine restart between test suites:
+1. Sends `shutdown` via the socket — triggers `stop()` on all plugins and
+   cancels open orders.
+2. Falls back to SIGINT if the socket is unreachable.
+3. Polls 15 seconds for process exit; sends 3× SIGINT if the engine is stuck
+   (the engine requires three SIGINT signals to force-quit).
+4. Spawns a fresh engine process and waits 12 seconds for it to connect,
+   then verifies `Connected: True` before proceeding.
+
+Use `--restart-engine` after a test run that left open orders, or when
+switching between order-test and feed-test suites to ensure a clean state.
+
+### Order test base class (`OrderTestPluginBase`)
+
+Order test plugins (1–5) inherit from
+`plugins.paper_tests.order_test_base.OrderTestPluginBase`.
+
+**`_fetch_price(symbol, contract, timeout=15.0) → Optional[float]`**
+
+Three-tier price lookup used before placing test orders:
+
+| Tier | Source | Notes |
+|------|--------|-------|
+| 1 — cache | `portfolio._last_prices` | Returns immediately if a price exists from any prior subscription |
+| 2 — tick stream | delayed bid/ask tick | Subscribes, waits up to `timeout` seconds, cancels |
+| 3 — historical | `get_historical_data("2 D", "1 day")` | Last daily close; always works, any session |
+
+Tier 3 is the reason paper tests can **fetch prices** outside market hours,
+but fills still require an open session.
