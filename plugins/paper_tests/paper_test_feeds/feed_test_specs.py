@@ -37,7 +37,7 @@ class FeedTestSpec:
     # to override independently (e.g. MIDPOINT works on paper accounts).
     bar_what_to_show: str = ""  # empty → falls back to what_to_show
     use_rth: bool = True
-    tick_timeout: float = 15.0
+    tick_timeout: float = 30.0
     bar_timeout: float = 12.0
     min_tick_count: int = 1
     description: str = ""

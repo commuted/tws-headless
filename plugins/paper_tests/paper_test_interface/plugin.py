@@ -635,15 +635,20 @@ class PaperTestInterfacePlugin(PluginBase):
             self._fail("state_load_roundtrip", cat,
                        f"expected={test_state!r} got={loaded2!r}")
 
-        # JSON file has expected outer metadata keys
+        # SQLite row has expected metadata columns
         try:
-            with open(self._state_file) as f:
-                raw = json.load(f)
-            if all(k in raw for k in ("plugin_name", "state", "saved_at")):
-                self._pass("state_metadata_present", cat, f"keys={sorted(raw.keys())}")
+            with self._store._conn() as conn:
+                row = conn.execute(
+                    "SELECT plugin_name, plugin_version, state, saved_at "
+                    "FROM plugin_states WHERE plugin_name = ?",
+                    (self.slot,),
+                ).fetchone()
+            if row and all(row[k] for k in ("plugin_name", "saved_at")):
+                self._pass("state_metadata_present", cat,
+                           f"keys={sorted(row.keys())}")
             else:
-                self._fail("state_metadata_present", cat,
-                           f"missing keys; got={sorted(raw.keys())!r}")
+                row_repr = dict(row) if row else None
+                self._fail("state_metadata_present", cat, f"row={row_repr!r}")
         except Exception as e:
             self._fail("state_metadata_present", cat, str(e))
 
