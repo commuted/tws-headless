@@ -1011,3 +1011,162 @@ class TestPluginAbandon:
         executive.abandon_plugin(plugin.name, timeout=1.0)
 
         executive.deferred_unload_plugin.assert_called_once_with(plugin.instance_id)
+
+
+# =============================================================================
+# Registry status tracking tests
+# =============================================================================
+
+
+class TestPluginRegistryTracking:
+    """Lifecycle transitions write the correct status to plugin_registry."""
+
+    def _make_tracked(self, tmp_path, slot="reg_plugin"):
+        """Return (executive, plugin, store) wired to a temp DB."""
+        from unittest.mock import patch
+        from pathlib import Path
+        from ib.plugin_store import PluginStore
+
+        store = PluginStore(db_path=tmp_path / "track.db")
+
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            plugin = MockPlugin(slot)
+            executive.register_plugin(plugin)
+            executive._plugins[plugin.instance_id].source_file = Path("/fake/plugin.py")
+            # Simulate what load_plugin_from_file does after register
+            executive._update_registry_status(plugin, "unloaded")
+
+        return executive, plugin, store
+
+    def test_load_writes_registry_unloaded(self, tmp_path):
+        from unittest.mock import patch
+        from pathlib import Path
+        from ib.plugin_store import PluginStore
+
+        store = PluginStore(db_path=tmp_path / "t.db")
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            plugin = MockPlugin("load_test")
+            executive.register_plugin(plugin)
+            executive._plugins[plugin.instance_id].source_file = Path("/fake/plugin.py")
+            executive._update_registry_status(plugin, "unloaded")
+
+        entry = store.get_registry_entry("load_test")
+        assert entry is not None
+        assert entry["status"] == "unloaded"
+        assert entry["class_path"] == "/fake/plugin.py"
+
+    def test_start_writes_registry_started(self, tmp_path):
+        from unittest.mock import patch
+        from pathlib import Path
+        from ib.plugin_store import PluginStore
+
+        store = PluginStore(db_path=tmp_path / "t.db")
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            plugin = MockPlugin("start_test")
+            executive.register_plugin(plugin)
+            executive._plugins[plugin.instance_id].source_file = Path("/fake/plugin.py")
+            executive._update_registry_status(plugin, "unloaded")
+
+            executive.start_plugin("start_test")
+
+        entry = store.get_registry_entry("start_test")
+        assert entry["status"] == "started"
+
+    def test_freeze_writes_registry_frozen(self, tmp_path):
+        from unittest.mock import patch
+        from pathlib import Path
+        from ib.plugin_store import PluginStore
+
+        store = PluginStore(db_path=tmp_path / "t.db")
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            plugin = MockPlugin("freeze_test")
+            executive.register_plugin(plugin)
+            executive._plugins[plugin.instance_id].source_file = Path("/fake/plugin.py")
+            executive._update_registry_status(plugin, "unloaded")
+            executive.start_plugin("freeze_test")
+
+            executive.freeze_plugin("freeze_test")
+
+        entry = store.get_registry_entry("freeze_test")
+        assert entry["status"] == "frozen"
+
+    def test_stop_writes_registry_unloaded(self, tmp_path):
+        from unittest.mock import patch
+        from pathlib import Path
+        from ib.plugin_store import PluginStore
+
+        store = PluginStore(db_path=tmp_path / "t.db")
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            plugin = MockPlugin("stop_test")
+            executive.register_plugin(plugin)
+            executive._plugins[plugin.instance_id].source_file = Path("/fake/plugin.py")
+            executive._update_registry_status(plugin, "unloaded")
+            executive.start_plugin("stop_test")
+
+            executive.stop_plugin("stop_test")
+
+        entry = store.get_registry_entry("stop_test")
+        assert entry["status"] == "unloaded"
+
+    def test_reload_auto_starts_started_slots(self, tmp_path):
+        from unittest.mock import patch
+        from ib.plugin_store import PluginStore
+
+        store = PluginStore(db_path=tmp_path / "t.db")
+        fake_file = tmp_path / "myplugin.py"
+        fake_file.write_text("# placeholder")
+        store.upsert_registry("my_slot", str(fake_file), "1.0", "started")
+
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            executive.load_plugin_from_file = Mock(return_value={
+                "plugin_name": "my_slot", "slot": "my_slot",
+                "instance_id": "abc123", "descriptor": None,
+            })
+            executive.start_plugin = Mock(return_value=True)
+
+            result = executive.reload_registered_plugins()
+
+            executive.load_plugin_from_file.assert_called_once_with(
+                str(fake_file), slot="my_slot", descriptor=None,
+            )
+            executive.start_plugin.assert_called_once_with("my_slot")
+            assert "my_slot" in result["reloaded"]
+
+    def test_reload_skips_missing_file(self, tmp_path):
+        from unittest.mock import patch
+        from ib.plugin_store import PluginStore
+
+        store = PluginStore(db_path=tmp_path / "t.db")
+        store.upsert_registry("dead_slot", "/nonexistent/plugin.py", "1.0", "started")
+
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            result = executive.reload_registered_plugins()
+
+        assert "dead_slot" in result["skipped"]
+        assert "dead_slot" not in result["reloaded"]
+
+    def test_reload_skips_already_loaded_slot(self, tmp_path):
+        from unittest.mock import patch
+        from ib.plugin_store import PluginStore
+
+        store = PluginStore(db_path=tmp_path / "t.db")
+        fake_file = tmp_path / "plugin.py"
+        fake_file.write_text("# placeholder")
+        store.upsert_registry("already_loaded", str(fake_file), "1.0", "started")
+
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            plugin = MockPlugin("already_loaded")
+            executive.register_plugin(plugin)
+
+            result = executive.reload_registered_plugins()
+
+        assert "already_loaded" in result["skipped"]
+        assert "already_loaded" not in result["reloaded"]

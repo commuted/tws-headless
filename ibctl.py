@@ -322,6 +322,8 @@ Commands:
   plugin instruments disable NAME SYM  Disable an instrument
   plugin instruments clear NAME        Remove all instruments from a plugin
   plugin instruments reload NAME       Re-read instruments from SQLite into memory
+  plugin export SLOT [FILE]            Export instance to portable JSON
+  plugin import FILE                   Import instance from JSON
 
   algo list            List all algorithms
   algo status NAME     Get algorithm status

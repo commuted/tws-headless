@@ -762,3 +762,109 @@ class TestInstrumentSQLitePersistence:
         stored_b = _isolated_plugin_store.load_instruments("slot_b")
         assert stored_a[0].symbol == "SPY"
         assert stored_b[0].symbol == "QQQ"
+
+
+# =============================================================================
+# config property
+# =============================================================================
+
+
+class TestConfigProperty:
+    def test_config_property_returns_dict_when_descriptor_is_dict(self):
+        plugin = ConcreteTestPlugin("cfg_plugin")
+        plugin.descriptor = {"symbol": "SPY", "threshold": 0.5}
+        assert plugin.config == {"symbol": "SPY", "threshold": 0.5}
+
+    def test_config_property_non_dict_string_returns_none(self):
+        plugin = ConcreteTestPlugin("str_plugin")
+        plugin.descriptor = "some_string_descriptor"
+        assert plugin.config is None
+
+    def test_config_property_none_descriptor_returns_none(self):
+        plugin = ConcreteTestPlugin("none_plugin")
+        plugin.descriptor = None
+        assert plugin.config is None
+
+    def test_config_property_list_descriptor_returns_none(self):
+        plugin = ConcreteTestPlugin("list_plugin")
+        plugin.descriptor = ["a", "b"]
+        assert plugin.config is None
+
+    def test_config_property_int_descriptor_returns_none(self):
+        plugin = ConcreteTestPlugin("int_plugin")
+        plugin.descriptor = 42
+        assert plugin.config is None
+
+
+# =============================================================================
+# migration directory guard
+# =============================================================================
+
+
+class TestMigrationDirectoryGuard:
+    def test_migration_skipped_when_dir_absent(self, tmp_path):
+        """_run_migration_if_needed must not call store when directory doesn't exist."""
+        plugin = ConcreteTestPlugin("guard_plugin")
+        plugin._base_path = tmp_path / "nonexistent_dir"
+        plugin._migration_done = False
+
+        mock_store = Mock()
+        plugin._store = mock_store
+
+        plugin._run_migration_if_needed()
+
+        assert plugin._migration_done is True
+        mock_store.migrate_from_json.assert_not_called()
+        mock_store.migrate_instruments_from_json.assert_not_called()
+
+    def test_migration_runs_when_dir_exists(self, tmp_path):
+        """_run_migration_if_needed must call store methods when directory exists."""
+        plugin_dir = tmp_path / "my_plugin"
+        plugin_dir.mkdir()
+
+        plugin = ConcreteTestPlugin("dir_plugin")
+        plugin._base_path = plugin_dir
+        plugin._migration_done = False
+
+        mock_store = Mock()
+        plugin._store = mock_store
+
+        plugin._run_migration_if_needed()
+
+        assert plugin._migration_done is True
+        mock_store.migrate_from_json.assert_called_once_with("dir_plugin", plugin_dir)
+        mock_store.migrate_instruments_from_json.assert_called_once_with(
+            "dir_plugin", plugin_dir
+        )
+
+    def test_migration_runs_only_once(self, tmp_path):
+        """_run_migration_if_needed must be idempotent."""
+        plugin_dir = tmp_path / "once_plugin"
+        plugin_dir.mkdir()
+
+        plugin = ConcreteTestPlugin("once_plugin")
+        plugin._base_path = plugin_dir
+        plugin._migration_done = False
+
+        mock_store = Mock()
+        plugin._store = mock_store
+
+        plugin._run_migration_if_needed()
+        plugin._run_migration_if_needed()
+
+        assert mock_store.migrate_from_json.call_count == 1
+        assert mock_store.migrate_instruments_from_json.call_count == 1
+
+    def test_migration_skipped_when_base_path_is_none(self):
+        """If _base_path is None, no migration attempted."""
+        plugin = ConcreteTestPlugin("null_path_plugin")
+        plugin._base_path = None
+        plugin._migration_done = False
+
+        mock_store = Mock()
+        plugin._store = mock_store
+
+        plugin._run_migration_if_needed()
+
+        assert plugin._migration_done is True
+        mock_store.migrate_from_json.assert_not_called()

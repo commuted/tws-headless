@@ -82,6 +82,11 @@ Sends commands to a running engine over the Unix socket.
 ./ibctl.py plugin help     my_plugin   # show plugin CLI help
 ./ibctl.py plugin unload   my_plugin
 
+# Portable export / import
+./ibctl.py plugin export my_plugin /tmp/my_plugin.json   # snapshot to file
+./ibctl.py plugin export my_plugin                       # inline JSON
+./ibctl.py plugin import /tmp/my_plugin.json             # restore (then load)
+
 # Internal bookkeeping transfers (no IB orders placed)
 ./ibctl.py transfer list     _unassigned
 ./ibctl.py transfer cash     _unassigned my_plugin 10000 --confirm
@@ -96,6 +101,8 @@ Sends commands to a running engine over the Unix socket.
 ## Plugins
 
 Plugins are Python classes that subclass `PluginBase`. They receive market data, publish signals, and interact with the MessageBus. See the **[Plugin Manual](https://github.com/commuted/tws-headless/wiki/Plugin-Manual)** for the full authoring reference.
+
+Plugins that were running when the engine last stopped are **automatically reloaded on the next start** — no manual `plugin load` / `plugin start` needed. The engine records each instance in `~/.ib_plugin_store.db` and replays their last lifecycle status (`started` → auto-start; `frozen` → load only).
 
 ### File layout
 
@@ -147,6 +154,7 @@ class MyStrategyPlugin(PluginBase):
 ib/                     Core engine package
   trading_engine.py     Top-level engine (connects portfolio, data, plugins)
   plugin_executive.py   Plugin lifecycle, signal routing, order execution
+  plugin_store.py       SQLite persistence (state, holdings, registry, export/import)
   portfolio.py          IB connection, positions, account data
   data_feed.py          Real-time tick/bar streaming and aggregation
   command_server.py     Unix socket command server

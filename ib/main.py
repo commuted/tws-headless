@@ -711,6 +711,21 @@ class CommandHandler:
                 return self._plugin_departures(clear)
             elif subcommand == "instruments":
                 return self._plugin_instruments(subargs)
+            elif subcommand == "export":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin export <slot> [file]",
+                    )
+                fp = subargs[1] if len(subargs) > 1 else None
+                return self._plugin_export(subargs[0], fp)
+            elif subcommand == "import":
+                if not subargs:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Usage: plugin import <file>",
+                    )
+                return self._plugin_import(subargs[0])
             else:
                 return CommandResult(
                     status=CommandStatus.ERROR,
@@ -1202,6 +1217,60 @@ class CommandHandler:
             status=CommandStatus.SUCCESS,
             message=msg,
             data={"departures": departures},
+        )
+
+    def _plugin_export(self, slot: str, filepath: Optional[str] = None) -> CommandResult:
+        """Export a plugin instance to a portable JSON document."""
+        import json as _json
+        data = self.plugin_executive.export_plugin(slot)
+        if data is None:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"No registry entry found for slot '{slot}'",
+            )
+        if filepath:
+            try:
+                with open(filepath, "w") as f:
+                    _json.dump(data, f, indent=2, default=str)
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=f"Exported slot '{slot}' to {filepath}",
+                    data=data,
+                )
+            except Exception as e:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Failed to write export file: {e}",
+                )
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"Exported slot '{slot}'",
+            data=data,
+        )
+
+    def _plugin_import(self, filepath: str) -> CommandResult:
+        """Import a plugin instance from a portable JSON document."""
+        import json as _json
+        try:
+            with open(filepath) as f:
+                data = _json.load(f)
+        except Exception as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Failed to read import file: {e}",
+            )
+        if self.plugin_executive.import_plugin(data):
+            slot = data.get("slot", "?")
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=(
+                    f"Imported slot '{slot}' — use 'plugin load' to activate"
+                ),
+                data={"slot": slot},
+            )
+        return CommandResult(
+            status=CommandStatus.ERROR,
+            message="Import failed — missing 'slot' or 'class_path' in document",
         )
 
     def handle_db(self, args: List[str]) -> CommandResult:

@@ -28,6 +28,7 @@ from ibapi.contract import Contract
 from ibapi.order import Order
 
 from plugins.base import PluginBase, PluginResult, TradeSignal, PluginState
+from .plugin_store import get_plugin_store
 from plugins.unassigned import UnassignedPlugin, UNASSIGNED_PLUGIN_NAME
 from .data_feed import DataFeed, DataType, TickData, TickByTickData, MarketDepth
 from .models import Bar, PnLData
@@ -1711,6 +1712,26 @@ class PluginExecutive:
         return "\n".join(lines)
 
     # =========================================================================
+    # Registry helpers
+    # =========================================================================
+
+    def _update_registry_status(self, plugin: PluginBase, status: str) -> None:
+        """Write plugin lifecycle status to plugin_registry (non-system plugins only)."""
+        if plugin.is_system_plugin:
+            return
+        cfg = self._plugins.get(plugin.instance_id)
+        class_path = str(cfg.source_file) if (cfg and cfg.source_file) else ""
+        if not class_path:
+            return  # only track file-loaded plugins
+        get_plugin_store().upsert_registry(
+            slot=plugin.slot,
+            class_path=class_path,
+            version=plugin.VERSION,
+            status=status,
+            config=plugin.descriptor,
+        )
+
+    # =========================================================================
     # Dynamic Plugin Loading
     # =========================================================================
 
@@ -1783,6 +1804,7 @@ class PluginExecutive:
             # Track source file
             self._plugins[plugin.instance_id].source_file = Path(file_path)
 
+            self._update_registry_status(plugin, "unloaded")
             self._stats["plugins_loaded"] += 1
             logger.info(
                 f"Loaded plugin '{plugin.name}' (slot='{plugin.slot}', "
@@ -1853,6 +1875,8 @@ class PluginExecutive:
         # Evict oldest if over capacity
         while len(self._departures) > self._max_departures:
             self._departures.popitem(last=False)
+
+        self._update_registry_status(config.plugin, "unloaded")
 
         # Remove from registry
         del self._plugins[iid]
@@ -2032,6 +2056,7 @@ class PluginExecutive:
         try:
             if plugin.start():
                 plugin.state = PluginState.STARTED
+                self._update_registry_status(plugin, "started")
                 logger.info(f"Plugin '{name}' started")
                 if self.on_plugin_state_change:
                     self.on_plugin_state_change(name, PluginState.STARTED)
@@ -2075,6 +2100,7 @@ class PluginExecutive:
         try:
             if plugin.stop():
                 plugin.state = PluginState.STOPPED
+                self._update_registry_status(plugin, "unloaded")
                 # Clean up any streams the plugin had open
                 self.stream_manager.cancel_all_streams(plugin.name)
                 logger.info(f"Plugin '{name}' stopped")
@@ -2121,6 +2147,7 @@ class PluginExecutive:
         try:
             if plugin.freeze():
                 plugin.state = PluginState.FROZEN
+                self._update_registry_status(plugin, "frozen")
                 logger.info(f"Plugin '{name}' frozen")
                 if self.on_plugin_state_change:
                     self.on_plugin_state_change(name, PluginState.FROZEN)
@@ -2164,6 +2191,7 @@ class PluginExecutive:
         try:
             if plugin.resume():
                 plugin.state = PluginState.STARTED
+                self._update_registry_status(plugin, "started")
                 logger.info(f"Plugin '{name}' resumed")
                 if self.on_plugin_state_change:
                     self.on_plugin_state_change(name, PluginState.STARTED)
@@ -3116,6 +3144,7 @@ class PluginExecutive:
 
         return {
             "name": plugin.name,
+            "slot": plugin.slot,
             "instance_id": iid,
             "version": plugin.VERSION,
             "state": plugin.state.value,
@@ -3193,6 +3222,76 @@ class PluginExecutive:
             "message_bus_channels": len(self.message_bus.list_channels()),
             "stream_manager": self.stream_manager.get_status(),
         }
+
+    def reload_registered_plugins(self) -> Dict[str, Any]:
+        """
+        Reload plugins that were active at last shutdown.
+
+        - status='started' → load_plugin_from_file + start_plugin
+        - status='frozen'  → load_plugin_from_file only (operator resumes manually)
+
+        Skips slots already loaded in memory and slots whose class_path file
+        is missing (logs a warning for those).
+
+        Returns a dict with lists: ``reloaded``, ``skipped``, ``failed``.
+        """
+        result: Dict[str, Any] = {"reloaded": [], "skipped": [], "failed": []}
+
+        # Collect already-loaded slots to avoid duplicates
+        loaded_slots = {
+            config.plugin.slot for config in self._plugins.values()
+        }
+
+        store = get_plugin_store()
+        entries = store.list_registry()  # all statuses
+
+        for entry in entries:
+            slot = entry["slot"]
+            status = entry["status"]
+            class_path = entry["class_path"]
+
+            if status not in ("started", "frozen"):
+                continue
+
+            if slot in loaded_slots:
+                result["skipped"].append(slot)
+                continue
+
+            if not Path(class_path).exists():
+                logger.warning(
+                    f"reload_registered_plugins: class_path not found for slot "
+                    f"'{slot}': {class_path}"
+                )
+                result["skipped"].append(slot)
+                continue
+
+            load_result = self.load_plugin_from_file(
+                class_path, slot=slot, descriptor=entry.get("config")
+            )
+            if load_result is None:
+                logger.warning(f"reload_registered_plugins: failed to load slot '{slot}'")
+                result["failed"].append(slot)
+                continue
+
+            if status == "started":
+                if not self.start_plugin(slot):
+                    logger.warning(
+                        f"reload_registered_plugins: loaded but failed to start slot '{slot}'"
+                    )
+                    result["failed"].append(slot)
+                    continue
+
+            result["reloaded"].append(slot)
+
+        return result
+
+    def export_plugin(self, slot: str) -> Optional[Dict]:
+        """Export a plugin instance as a portable JSON-serialisable dict."""
+        return get_plugin_store().export_instance(slot)
+
+    def import_plugin(self, data: Dict) -> bool:
+        """Import a plugin instance from a portable dict. Does not auto-load."""
+        return get_plugin_store().import_instance(data)
 
     def get_execution_history(
         self,

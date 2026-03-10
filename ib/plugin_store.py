@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path.home() / ".ib_plugin_store.db"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class PluginStore:
@@ -111,6 +111,17 @@ class PluginStore:
                     source_file TEXT UNIQUE NOT NULL,
                     plugin_name TEXT,
                     migrated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS plugin_registry (
+                    slot        TEXT PRIMARY KEY,
+                    class_path  TEXT NOT NULL,
+                    version     TEXT NOT NULL DEFAULT '',
+                    status      TEXT NOT NULL DEFAULT 'unloaded'
+                                CHECK(status IN ('unloaded','started','frozen')),
+                    config      TEXT,
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL
                 );
             """)
 
@@ -453,6 +464,309 @@ class PluginStore:
             return True
         except Exception as e:
             logger.error(f"Failed to clear instruments for '{instance_key}': {e}")
+            return False
+
+    # =========================================================================
+    # Registry
+    # =========================================================================
+
+    def upsert_registry(
+        self,
+        slot: str,
+        class_path: str,
+        version: str,
+        status: str,
+        config: Any = None,
+    ) -> bool:
+        """INSERT OR REPLACE a plugin registry row, preserving created_at."""
+        try:
+            now = datetime.now().isoformat()
+            config_json = json.dumps(config, default=str) if config is not None else None
+            with self._conn() as conn:
+                conn.execute(
+                    """INSERT INTO plugin_registry
+                       (slot, class_path, version, status, config, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(slot) DO UPDATE SET
+                         class_path=excluded.class_path,
+                         version=excluded.version,
+                         status=excluded.status,
+                         config=excluded.config,
+                         updated_at=excluded.updated_at""",
+                    (slot, class_path, version, status, config_json, now, now),
+                )
+            logger.debug(f"Upserted registry entry for slot '{slot}' status={status}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to upsert registry for slot '{slot}': {e}")
+            return False
+
+    def get_registry_entry(self, slot: str) -> Optional[Dict]:
+        """Return registry row as dict (config parsed from JSON), or None."""
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM plugin_registry WHERE slot = ?", (slot,)
+                ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            if d.get("config"):
+                d["config"] = json.loads(d["config"])
+            return d
+        except Exception as e:
+            logger.error(f"Failed to get registry entry for slot '{slot}': {e}")
+            return None
+
+    def list_registry(self, status_filter: Optional[str] = None) -> List[Dict]:
+        """Return all registry rows, optionally filtered by status."""
+        try:
+            with self._conn() as conn:
+                if status_filter:
+                    rows = conn.execute(
+                        "SELECT * FROM plugin_registry WHERE status = ? ORDER BY slot",
+                        (status_filter,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM plugin_registry ORDER BY slot"
+                    ).fetchall()
+            result = []
+            for row in rows:
+                d = dict(row)
+                if d.get("config"):
+                    d["config"] = json.loads(d["config"])
+                result.append(d)
+            return result
+        except Exception as e:
+            logger.error(f"Failed to list registry: {e}")
+            return []
+
+    def delete_registry_entry(self, slot: str) -> bool:
+        """Remove one registry row."""
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "DELETE FROM plugin_registry WHERE slot = ?", (slot,)
+                )
+            logger.debug(f"Deleted registry entry for slot '{slot}'")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete registry entry for slot '{slot}': {e}")
+            return False
+
+    def export_instance(self, slot: str) -> Optional[Dict]:
+        """
+        Assemble a portable export document for a plugin slot.
+
+        Returns None if no registry row exists for the slot.
+        """
+        try:
+            with self._conn() as conn:
+                reg_row = conn.execute(
+                    "SELECT * FROM plugin_registry WHERE slot = ?", (slot,)
+                ).fetchone()
+                if reg_row is None:
+                    return None
+
+                state_row = conn.execute(
+                    "SELECT state FROM plugin_states WHERE plugin_name = ?", (slot,)
+                ).fetchone()
+
+                holdings_row = conn.execute(
+                    "SELECT * FROM plugin_holdings WHERE plugin_name = ?", (slot,)
+                ).fetchone()
+
+                holdings_dict = None
+                if holdings_row:
+                    pos_rows = conn.execute(
+                        "SELECT * FROM plugin_positions WHERE plugin_name = ? ORDER BY id",
+                        (slot,),
+                    ).fetchall()
+                    initial_pos = [
+                        {
+                            "symbol": r["symbol"],
+                            "quantity": r["quantity"],
+                            "cost_basis": r["cost_basis"],
+                            "current_price": r["current_price"],
+                            "market_value": r["market_value"],
+                        }
+                        for r in pos_rows if r["slot"] == "initial"
+                    ]
+                    current_pos = [
+                        {
+                            "symbol": r["symbol"],
+                            "quantity": r["quantity"],
+                            "cost_basis": r["cost_basis"],
+                            "current_price": r["current_price"],
+                            "market_value": r["market_value"],
+                        }
+                        for r in pos_rows if r["slot"] == "current"
+                    ]
+                    holdings_dict = {
+                        "plugin": slot,
+                        "initial_funding": {
+                            "cash": holdings_row["initial_cash"],
+                            "positions": initial_pos,
+                        },
+                        "current_holdings": {
+                            "cash": holdings_row["current_cash"],
+                            "positions": current_pos,
+                        },
+                        "created_at": holdings_row["created_at"],
+                        "last_updated": holdings_row["last_updated"],
+                    }
+
+                inst_rows = conn.execute(
+                    "SELECT * FROM plugin_instruments WHERE instance_key = ? ORDER BY id",
+                    (slot,),
+                ).fetchall()
+                instruments = [
+                    {
+                        "symbol": r["symbol"],
+                        "name": r["name"],
+                        "weight": r["weight"],
+                        "min_weight": r["min_weight"],
+                        "max_weight": r["max_weight"],
+                        "enabled": bool(r["enabled"]),
+                        "exchange": r["exchange"],
+                        "currency": r["currency"],
+                        "sec_type": r["sec_type"],
+                    }
+                    for r in inst_rows
+                ]
+
+            config = json.loads(reg_row["config"]) if reg_row["config"] else None
+
+            return {
+                "slot": reg_row["slot"],
+                "class_path": reg_row["class_path"],
+                "version": reg_row["version"],
+                "config": config,
+                "state": json.loads(state_row["state"]) if state_row else None,
+                "holdings": holdings_dict,
+                "instruments": instruments,
+                "exported_at": datetime.now().isoformat(),
+                "schema_version": SCHEMA_VERSION,
+            }
+        except Exception as e:
+            logger.error(f"Failed to export instance '{slot}': {e}")
+            return None
+
+    def import_instance(self, data: Dict) -> bool:
+        """
+        Import a portable export document.
+
+        Forces status='unloaded' regardless of what the document contains.
+        Returns False if slot or class_path is missing.
+        """
+        slot = data.get("slot")
+        class_path = data.get("class_path")
+        if not slot or not class_path:
+            logger.error("import_instance: missing required keys 'slot' and/or 'class_path'")
+            return False
+
+        try:
+            now = datetime.now().isoformat()
+            version = data.get("version", "")
+            config = data.get("config")
+            config_json = json.dumps(config, default=str) if config is not None else None
+
+            with self._conn() as conn:
+                # Upsert registry — always unloaded
+                conn.execute(
+                    """INSERT INTO plugin_registry
+                       (slot, class_path, version, status, config, created_at, updated_at)
+                       VALUES (?, ?, ?, 'unloaded', ?, ?, ?)
+                       ON CONFLICT(slot) DO UPDATE SET
+                         class_path=excluded.class_path,
+                         version=excluded.version,
+                         status='unloaded',
+                         config=excluded.config,
+                         updated_at=excluded.updated_at""",
+                    (slot, class_path, version, config_json, now, now),
+                )
+
+                # State
+                state_data = data.get("state")
+                if state_data is not None:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO plugin_states
+                           (plugin_name, plugin_version, state, saved_at)
+                           VALUES (?, ?, ?, ?)""",
+                        (slot, version, json.dumps(state_data, default=str), now),
+                    )
+
+                # Holdings
+                holdings_data = data.get("holdings")
+                if holdings_data is not None:
+                    initial = holdings_data.get("initial_funding", {})
+                    current = holdings_data.get("current_holdings", {})
+                    conn.execute(
+                        """INSERT OR REPLACE INTO plugin_holdings
+                           (plugin_name, initial_cash, current_cash, created_at, last_updated)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            slot,
+                            initial.get("cash", 0.0),
+                            current.get("cash", 0.0),
+                            holdings_data.get("created_at", now),
+                            holdings_data.get("last_updated", now),
+                        ),
+                    )
+                    conn.execute(
+                        "DELETE FROM plugin_positions WHERE plugin_name = ?", (slot,)
+                    )
+                    for pos in initial.get("positions", []):
+                        conn.execute(
+                            """INSERT INTO plugin_positions
+                               (plugin_name, slot, symbol, quantity, cost_basis,
+                                current_price, market_value)
+                               VALUES (?, 'initial', ?, ?, ?, ?, ?)""",
+                            (
+                                slot, pos["symbol"],
+                                pos.get("quantity", 0), pos.get("cost_basis", 0.0),
+                                pos.get("current_price", 0.0), pos.get("market_value", 0.0),
+                            ),
+                        )
+                    for pos in current.get("positions", []):
+                        conn.execute(
+                            """INSERT INTO plugin_positions
+                               (plugin_name, slot, symbol, quantity, cost_basis,
+                                current_price, market_value)
+                               VALUES (?, 'current', ?, ?, ?, ?, ?)""",
+                            (
+                                slot, pos["symbol"],
+                                pos.get("quantity", 0), pos.get("cost_basis", 0.0),
+                                pos.get("current_price", 0.0), pos.get("market_value", 0.0),
+                            ),
+                        )
+
+                # Instruments
+                instruments = data.get("instruments", [])
+                conn.execute(
+                    "DELETE FROM plugin_instruments WHERE instance_key = ?", (slot,)
+                )
+                for inst in instruments:
+                    conn.execute(
+                        """INSERT INTO plugin_instruments
+                           (instance_key, symbol, name, weight, min_weight, max_weight,
+                            enabled, exchange, currency, sec_type)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            slot, inst["symbol"], inst.get("name", ""),
+                            inst.get("weight", 0.0), inst.get("min_weight", 0.0),
+                            inst.get("max_weight", 100.0),
+                            1 if inst.get("enabled", True) else 0,
+                            inst.get("exchange", "SMART"), inst.get("currency", "USD"),
+                            inst.get("sec_type", "STK"),
+                        ),
+                    )
+
+            logger.info(f"Imported instance '{slot}' from class_path '{class_path}'")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to import instance '{slot}': {e}")
             return False
 
     # =========================================================================
