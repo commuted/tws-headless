@@ -47,6 +47,8 @@ PRICE_TICK_TYPES = (
     TickTypeEnum.DELAYED_CLOSE,
     TickTypeEnum.BID,
     TickTypeEnum.ASK,
+    TickTypeEnum.DELAYED_BID,
+    TickTypeEnum.DELAYED_ASK,
 )
 
 # Mapping tick type to name for display
@@ -57,6 +59,8 @@ TICK_TYPE_NAMES = {
     TickTypeEnum.DELAYED_CLOSE: "DELAYED_CLOSE",
     TickTypeEnum.BID: "BID",
     TickTypeEnum.ASK: "ASK",
+    TickTypeEnum.DELAYED_BID: "DELAYED_BID",
+    TickTypeEnum.DELAYED_ASK: "DELAYED_ASK",
     TickTypeEnum.HIGH: "HIGH",
     TickTypeEnum.LOW: "LOW",
     TickTypeEnum.OPEN: "OPEN",
@@ -1170,7 +1174,8 @@ class Portfolio(IBClient):
             return False
 
         try:
-            self.cancelOrder(order_id, "")
+            from ibapi.order_cancel import OrderCancel
+            self.cancelOrder(order_id, OrderCancel())
             logger.info(f"Sent cancel request for order {order_id}")
             return True
         except Exception as e:

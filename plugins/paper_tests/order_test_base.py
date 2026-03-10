@@ -416,7 +416,30 @@ class OrderTestPluginBase(PluginBase):
 
     def _fetch_price(self, symbol: str, contract: Contract,
                      timeout: float = 15.0) -> Optional[float]:
-        """Subscribe to a tick stream, wait for one valid price, cancel stream."""
+        """Return the current market price for *symbol*.
+
+        Strategy:
+        1. Fast path — if a cached price already exists in portfolio._last_prices
+           (from any prior subscription), return it immediately.
+        2. Tick path — subscribe a delayed tick stream (reqMarketDataType(3)),
+           wait up to *timeout* seconds for the first valid price tick.
+        3. Historical fallback — if no tick arrives in time (common after market
+           hours when delayed bid/ask quotes are absent), request the most-recent
+           close price via reqHistoricalData.  This always works regardless of
+           market session.
+        """
+        # ── fast path ──────────────────────────────────────────────────────
+        if self.portfolio:
+            for tick_type in ("LAST", "DELAYED_LAST", "CLOSE", "DELAYED_CLOSE",
+                              "DELAYED_BID", "DELAYED_ASK", "BID", "ASK"):
+                cached = self.portfolio.get_last_price(symbol, tick_type)
+                if cached and cached > 0:
+                    logger.debug(
+                        f"_fetch_price({symbol}): cached {tick_type}={cached}"
+                    )
+                    return cached
+
+        # ── tick path ──────────────────────────────────────────────────────
         price_event = threading.Event()
         captured: Dict[str, float] = {}
 
@@ -424,6 +447,15 @@ class OrderTestPluginBase(PluginBase):
             if tick.symbol == symbol and tick.price > 0 and not price_event.is_set():
                 captured["price"] = tick.price
                 price_event.set()
+
+        if self.portfolio:
+            # NOTE: reqMarketDataType is a global IB connection setting — it affects
+            # ALL active subscriptions on this connection, not just this plugin.
+            # This is safe only because order test plugins run sequentially (one at a
+            # time, blocking).  Do NOT run order test plugins concurrently (e.g. with
+            # --feeds-dual style parallelism) — the toggle would corrupt market data
+            # delivery for any plugin that doesn't own the setting at that moment.
+            self.portfolio.reqMarketDataType(3)
 
         self.request_stream(
             symbol=symbol,
@@ -435,7 +467,37 @@ class OrderTestPluginBase(PluginBase):
         price_event.wait(timeout=timeout)
         self.cancel_stream(symbol)
 
-        return captured.get("price")
+        if self.portfolio:
+            self.portfolio.reqMarketDataType(1)  # restore; see comment above
+
+        if captured.get("price"):
+            return captured["price"]
+
+        # ── historical fallback ────────────────────────────────────────────
+        # After market hours (or when IB is slow) delayed ticks may not arrive
+        # within the timeout.  Fall back to the most-recent close from a 2-day
+        # daily bar request, which succeeds regardless of session.
+        logger.debug(
+            f"_fetch_price({symbol}): tick path timed out, "
+            "trying historical close fallback"
+        )
+        bars = self.get_historical_data(
+            contract,
+            duration_str="2 D",
+            bar_size_setting="1 day",
+            what_to_show="TRADES",
+            use_rth=True,
+            timeout=15.0,
+        )
+        if bars:
+            close_price = float(bars[-1].close)
+            if close_price > 0:
+                logger.debug(
+                    f"_fetch_price({symbol}): historical close={close_price}"
+                )
+                return close_price
+
+        return None
 
     # -----------------------------------------------------------------------
     # Order placement helpers

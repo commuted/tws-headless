@@ -1882,9 +1882,18 @@ class PluginExecutive:
             asyncio.get_running_loop().create_task(_do_unload())
         except RuntimeError:
             # Called from a thread (e.g. asyncio.to_thread plugin execution).
-            # run_coroutine_threadsafe schedules the coroutine on the loop safely.
-            loop = self._loop or asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(_do_unload(), loop)
+            # Use the stored loop reference; avoid asyncio.get_event_loop() which
+            # raises RuntimeError on non-main threads in Python 3.12+.
+            loop = self._loop
+            if loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(_do_unload(), loop)
+            else:
+                # No event loop available — unload synchronously.
+                try:
+                    self.unload_plugin(name)
+                except Exception as e:
+                    logger.error(f"Deferred unload of plugin '{name}' failed: {e}")
+                return
         logger.info(f"Deferred unload scheduled for plugin '{name}'")
 
     def get_departures(self, clear: bool = False) -> Dict[str, Dict[str, Any]]:
@@ -2191,6 +2200,11 @@ class PluginExecutive:
         Returns:
             Response dictionary with at least "success" key
         """
+        # ── System-level commands intercepted before plugin dispatch ────────
+        if request_type == "abandon":
+            timeout = float(payload.get("timeout", 30.0))
+            return self.abandon_plugin(name, timeout=timeout)
+
         iid, config = self._resolve_plugin(name)
         if not config:
             return {"success": False, "message": f"Plugin '{name}' not found"}
@@ -3235,6 +3249,116 @@ class PluginExecutive:
         names = self._order_id_to_plugins.setdefault(order_id, [])
         if plugin_name not in names:
             names.append(plugin_name)
+
+    def get_plugin_order_ids(self, plugin_name: str) -> List[int]:
+        """Return all order IDs currently registered to a plugin."""
+        return [oid for oid, names in self._order_id_to_plugins.items()
+                if plugin_name in names]
+
+    def abandon_plugin(self, name: str, timeout: float = 30.0) -> Dict[str, Any]:
+        """
+        Compulsory disengage sequence for a plugin:
+
+        1. Cancel every non-terminal order registered to the plugin and wait
+           up to *timeout* seconds for IB cancellation acknowledgements.
+        2. Release holdings: zero current_positions and current_cash so those
+           positions appear as 'unassigned' in the account summary.
+        3. Cancel all market-data streams the plugin holds.
+        4. Request self-unload (async — runs after this call returns).
+
+        Designed to be called from send_request() so it works on every plugin
+        without requiring subclasses to implement anything.
+
+        Returns a result dict with keys:
+            success, message,
+            orders_cancelled, orders_already_terminal, orders_unacknowledged,
+            positions_released, cash_released
+        """
+        from ib.models import OrderStatus
+        from datetime import datetime as _dt
+
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return {"success": False, "message": f"Plugin '{name}' not found"}
+
+        plugin = config.plugin
+        portfolio = plugin.portfolio
+
+        # ── 1. Cancel all non-terminal orders ────────────────────────────
+        order_ids = self.get_plugin_order_ids(name)
+        to_cancel: List[int] = []
+        already_terminal: List[int] = []
+
+        if portfolio:
+            for oid in order_ids:
+                rec = portfolio.get_order(oid)
+                if rec is not None and rec.is_complete:
+                    already_terminal.append(oid)
+                else:
+                    to_cancel.append(oid)
+                    portfolio.cancel_order(oid)
+                    logger.info(f"[abandon:{name}] Cancelling order {oid}")
+
+        # ── 2. Wait for cancellation acks ────────────────────────────────
+        unacknowledged: List[int] = list(to_cancel)
+        if unacknowledged and portfolio:
+            deadline = time.time() + timeout
+            while unacknowledged and time.time() < deadline:
+                still_open = []
+                for oid in unacknowledged:
+                    rec = portfolio.get_order(oid)
+                    if rec is None or not rec.is_complete:
+                        still_open.append(oid)
+                unacknowledged = still_open
+                if unacknowledged:
+                    time.sleep(0.25)
+
+        if unacknowledged:
+            logger.warning(
+                f"[abandon:{name}] {len(unacknowledged)} order(s) did not ack "
+                f"within {timeout}s: {unacknowledged}"
+            )
+
+        # ── 3. Release holdings to unassigned ────────────────────────────
+        positions_released: List[str] = []
+        cash_released: float = 0.0
+
+        if plugin._holdings is not None:
+            positions_released = [p.symbol for p in plugin._holdings.current_positions]
+            cash_released = plugin._holdings.current_cash
+            plugin._holdings.current_positions = []
+            plugin._holdings.current_cash = 0.0
+            plugin._holdings.last_updated = _dt.now()
+            plugin.save_holdings()
+            logger.info(
+                f"[abandon:{name}] Released {len(positions_released)} position(s) "
+                f"and ${cash_released:.2f} cash to unassigned"
+            )
+
+        # ── 4. Cancel all streams ─────────────────────────────────────────
+        self.stream_manager.cancel_all_streams(plugin.name)
+
+        # ── 5. Unload (deferred — safe to call from request thread) ──────
+        self.deferred_unload_plugin(plugin.instance_id)
+
+        n_cancelled = len(to_cancel) - len(unacknowledged)
+        msg = (
+            f"Abandoned '{name}': "
+            f"{n_cancelled}/{len(to_cancel)} order(s) cancelled"
+            + (f" ({len(unacknowledged)} unacknowledged after {timeout}s)" if unacknowledged else "")
+            + f", {len(positions_released)} position(s) released to unassigned"
+        )
+        logger.info(f"[abandon:{name}] {msg}")
+
+        return {
+            "success": True,
+            "message": msg,
+            "orders_cancelled": to_cancel,
+            "orders_already_terminal": already_terminal,
+            "orders_unacknowledged": unacknowledged,
+            "positions_released": positions_released,
+            "cash_released": cash_released,
+        }
 
     def _handle_order_status_for_plugins(self, order_record) -> None:
         """

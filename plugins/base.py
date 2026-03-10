@@ -642,7 +642,10 @@ class PluginBase(ABC):
         Returns:
             True if cleared (or didn't exist)
         """
-        return self._store.clear_state(self.slot)
+        result = self._store.clear_state(self.slot)
+        if self._state_file.exists():
+            self._state_file.unlink()
+        return result
 
     # =========================================================================
     # MessageBus Integration
@@ -1246,7 +1249,9 @@ class PluginBase(ABC):
         return self._instruments.get(symbol.upper())
 
     def add_instrument(self, instrument: PluginInstrument) -> bool:
-        """Add an instrument and persist to SQLite."""
+        """Add an instrument and persist to SQLite. Returns False if already present."""
+        if instrument.symbol in self._instruments:
+            return False
         self._instruments[instrument.symbol] = instrument
         self._store.upsert_instrument(self.slot, instrument)
         return True

@@ -796,3 +796,218 @@ class TestCommissionAndPnL:
 
         assert len(received) == 1
         assert received[0] == ("exec_abc", 2.50, 100.0, "USD")
+
+
+class TestPluginAbandon:
+    """Tests for the compulsory abandon command."""
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _make_executive_with_plugin(self, name="abandon_test"):
+        executive = PluginExecutive(None, None)
+        plugin = MockPlugin(name)
+        executive.register_plugin(plugin)
+        executive.start_plugin(name)
+        return executive, plugin
+
+    def _make_mock_portfolio(self, orders: dict):
+        """Return a mock portfolio whose get_order() returns OrderRecord stubs.
+
+        orders: {order_id: is_complete}  — True means already terminal.
+        """
+        from ib.models import OrderRecord, OrderStatus
+
+        portfolio = Mock()
+        portfolio.connected = True
+
+        def get_order(oid):
+            if oid not in orders:
+                return None
+            rec = Mock(spec=OrderRecord)
+            rec.is_complete = orders[oid]
+            return rec
+
+        portfolio.get_order = get_order
+        portfolio.cancel_order = Mock(return_value=True)
+        return portfolio
+
+    # ------------------------------------------------------------------
+    # Unknown plugin
+    # ------------------------------------------------------------------
+
+    def test_abandon_unknown_plugin_returns_failure(self):
+        executive = PluginExecutive(None, None)
+        result = executive.abandon_plugin("no_such_plugin")
+        assert result["success"] is False
+        assert "not found" in result["message"]
+
+    # ------------------------------------------------------------------
+    # Order cancellation
+    # ------------------------------------------------------------------
+
+    def test_abandon_cancels_non_terminal_orders(self):
+        executive, plugin = self._make_executive_with_plugin()
+        # Both orders non-terminal throughout — cancel_order must be called for each
+        portfolio = self._make_mock_portfolio({10: False, 11: False})
+        plugin.portfolio = portfolio
+
+        executive.register_order_for_plugin(10, plugin.name)
+        executive.register_order_for_plugin(11, plugin.name)
+
+        # Short timeout so the poll loop exits quickly
+        result = executive.abandon_plugin(plugin.name, timeout=0.1)
+
+        assert result["success"] is True
+        assert portfolio.cancel_order.call_count == 2
+        called_ids = {c.args[0] for c in portfolio.cancel_order.call_args_list}
+        assert called_ids == {10, 11}
+
+    def test_abandon_skips_already_terminal_orders(self):
+        executive, plugin = self._make_executive_with_plugin()
+        # Order 10 already terminal, order 11 non-terminal
+        portfolio = self._make_mock_portfolio({10: True, 11: False})
+        plugin.portfolio = portfolio
+
+        executive.register_order_for_plugin(10, plugin.name)
+        executive.register_order_for_plugin(11, plugin.name)
+
+        result = executive.abandon_plugin(plugin.name, timeout=0.1)
+
+        assert result["success"] is True
+        assert result["orders_already_terminal"] == [10]
+        assert 11 in result["orders_cancelled"]
+        called_ids = {c.args[0] for c in portfolio.cancel_order.call_args_list}
+        assert 10 not in called_ids
+        assert 11 in called_ids
+
+    def test_abandon_no_portfolio_skips_order_steps(self):
+        executive, plugin = self._make_executive_with_plugin()
+        plugin.portfolio = None
+
+        executive.register_order_for_plugin(10, plugin.name)
+
+        result = executive.abandon_plugin(plugin.name, timeout=1.0)
+
+        assert result["success"] is True
+        # No portfolio → entire order section is skipped
+        assert result["orders_cancelled"] == []
+        assert result["orders_already_terminal"] == []
+
+    def test_abandon_no_orders_registered(self):
+        executive, plugin = self._make_executive_with_plugin()
+        plugin.portfolio = Mock()
+
+        result = executive.abandon_plugin(plugin.name, timeout=1.0)
+
+        assert result["success"] is True
+        assert result["orders_cancelled"] == []
+        assert result["orders_already_terminal"] == []
+
+    def test_abandon_reports_unacknowledged_orders(self):
+        """Orders that never go terminal within timeout appear in unacknowledged."""
+        executive, plugin = self._make_executive_with_plugin()
+
+        portfolio = Mock()
+        portfolio.connected = True
+        portfolio.cancel_order = Mock(return_value=True)
+
+        from ib.models import OrderRecord
+        rec = Mock(spec=OrderRecord)
+        rec.is_complete = False          # never becomes terminal
+        portfolio.get_order = Mock(return_value=rec)
+
+        plugin.portfolio = portfolio
+        executive.register_order_for_plugin(42, plugin.name)
+
+        result = executive.abandon_plugin(plugin.name, timeout=0.1)
+
+        assert result["success"] is True
+        assert 42 in result["orders_unacknowledged"]
+
+    # ------------------------------------------------------------------
+    # Holdings release
+    # ------------------------------------------------------------------
+
+    def test_abandon_clears_holdings(self):
+        from plugins.base import Holdings, HoldingPosition
+        executive, plugin = self._make_executive_with_plugin()
+        plugin.portfolio = None
+
+        plugin._holdings = Holdings(plugin_name=plugin.name, current_cash=5000.0)
+        plugin._holdings.current_positions = [
+            HoldingPosition("SPY", 10, cost_basis=500.0),
+            HoldingPosition("QQQ", 5, cost_basis=400.0),
+        ]
+        plugin.save_holdings = Mock()
+
+        result = executive.abandon_plugin(plugin.name, timeout=1.0)
+
+        assert result["success"] is True
+        assert set(result["positions_released"]) == {"SPY", "QQQ"}
+        assert result["cash_released"] == 5000.0
+        assert plugin._holdings.current_positions == []
+        assert plugin._holdings.current_cash == 0.0
+        plugin.save_holdings.assert_called_once()
+
+    def test_abandon_no_holdings_does_not_crash(self):
+        executive, plugin = self._make_executive_with_plugin()
+        plugin.portfolio = None
+        plugin._holdings = None
+
+        result = executive.abandon_plugin(plugin.name, timeout=1.0)
+
+        assert result["success"] is True
+        assert result["positions_released"] == []
+        assert result["cash_released"] == 0.0
+
+    # ------------------------------------------------------------------
+    # send_request intercept
+    # ------------------------------------------------------------------
+
+    def test_abandon_intercepted_by_send_request(self):
+        """send_request('abandon') is handled at the executive level,
+        not delegated to plugin.handle_request."""
+        executive, plugin = self._make_executive_with_plugin()
+        plugin.portfolio = None
+        plugin.handle_request = Mock(side_effect=AssertionError("should not be called"))
+
+        result = executive.send_request(plugin.name, "abandon", {})
+
+        assert result["success"] is True
+        plugin.handle_request.assert_not_called()
+
+    def test_abandon_timeout_param_passed_through(self):
+        """send_request passes 'timeout' payload key to abandon_plugin."""
+        executive, plugin = self._make_executive_with_plugin()
+        plugin.portfolio = None
+        executive.abandon_plugin = Mock(return_value={"success": True, "message": ""})
+
+        executive.send_request(plugin.name, "abandon", {"timeout": 99.0})
+
+        executive.abandon_plugin.assert_called_once_with(plugin.name, timeout=99.0)
+
+    # ------------------------------------------------------------------
+    # Streams and unload
+    # ------------------------------------------------------------------
+
+    def test_abandon_cancels_streams(self):
+        executive, plugin = self._make_executive_with_plugin()
+        plugin.portfolio = None
+        executive.stream_manager.cancel_all_streams = Mock()
+        # Mock deferred_unload so it doesn't trigger a second cancel_all_streams call
+        executive.deferred_unload_plugin = Mock()
+
+        executive.abandon_plugin(plugin.name, timeout=1.0)
+
+        executive.stream_manager.cancel_all_streams.assert_called_once_with(plugin.name)
+
+    def test_abandon_triggers_unload(self):
+        executive, plugin = self._make_executive_with_plugin()
+        plugin.portfolio = None
+        executive.deferred_unload_plugin = Mock()
+
+        executive.abandon_plugin(plugin.name, timeout=1.0)
+
+        executive.deferred_unload_plugin.assert_called_once_with(plugin.instance_id)

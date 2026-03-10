@@ -259,7 +259,16 @@ class TradingEngine:
             if req_id == probe_req_id and not result.done():
                 result.set_result(mdt)
 
+        def _on_probe_error(req_id: int, error_code: int, error_string: str):
+            # IB error 10089: "Requested market data requires additional
+            # subscription … Delayed market data is available."
+            # This fires instead of a marketDataType callback when live data
+            # is not available, so treat it as a downgrade to delayed (3).
+            if req_id == probe_req_id and error_code == 10089 and not result.done():
+                result.set_result(3)
+
         self._portfolio._callbacks["marketDataType"] = _on_mdt
+        self._portfolio._callbacks["error"] = _on_probe_error
 
         try:
             from ibapi.contract import Contract
@@ -277,6 +286,7 @@ class TradingEngine:
                 # A marketDataType callback fires only when IB *downgrades*
                 # from the requested type. If we requested type 1 and the
                 # callback fires with type 3, live data is not available.
+                # Error 10089 also signals no live subscription.
                 # If the timeout expires with no callback, IB delivered live
                 # data silently — type 1 is confirmed available.
                 downgraded_to = await asyncio.wait_for(asyncio.shield(result), timeout=5.0)
@@ -292,6 +302,7 @@ class TradingEngine:
                 return 1
         finally:
             self._portfolio._callbacks.pop("marketDataType", None)
+            self._portfolio._callbacks.pop("error", None)
             try:
                 self._portfolio.cancelMktData(probe_req_id)
             except Exception:

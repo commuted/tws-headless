@@ -17,10 +17,15 @@ Usage:
     ./run_paper_tests.py --socket /tmp/x.sock # custom socket
     ./run_paper_tests.py --timeout 3600       # per-plugin timeout (seconds)
     ./run_paper_tests.py --dry-run            # show plan, don't execute
+    ./run_paper_tests.py --restart-engine     # graceful shutdown + fresh start first
+    ./run_paper_tests.py --restart-engine --engine-port 4002  # use gateway port
 """
 
 import argparse
 import json
+import os
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -118,6 +123,102 @@ def _cmd(command: str, socket_path: str, timeout: float) -> Tuple[bool, str, Dic
     r = send_command(command, socket_path=socket_path, timeout=timeout)
     ok = r.status == CommandStatus.SUCCESS
     return ok, r.message, r.data
+
+
+def _restart_engine(
+    socket_path: str,
+    port: int = 7497,
+    mode: str = "immediate",
+    client_id: int = 4,
+    startup_wait: float = 12.0,
+) -> bool:
+    """Gracefully shut down a running engine, then start a fresh one.
+
+    Shutdown strategy:
+      1. Send the 'shutdown' command via the socket (clean stop: all plugins
+         get stop() called, test orders are cancelled).
+      2. If the socket is unreachable, fall back to SIGINT on any running
+         ib.run_engine process.
+      3. Wait up to 15 s for the process to exit.
+      4. Start a new engine and wait *startup_wait* seconds for it to connect.
+
+    Returns True if the new engine is reachable and connected, False otherwise.
+    """
+    # ── 1. Attempt graceful shutdown via socket ───────────────────────────
+    pids = [int(p) for p in subprocess.run(
+        ["pgrep", "-f", "ib.run_engine"], capture_output=True, text=True
+    ).stdout.split() if p.strip()]
+
+    if pids:
+        ok, _, _ = _cmd("shutdown", socket_path, timeout=5.0)
+        if ok:
+            print("  Sent shutdown command — waiting for engine to exit...")
+        else:
+            print("  Socket unreachable — sending SIGINT to engine process(es)...")
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+
+        # ── 2. Wait for process(es) to exit ──────────────────────────────
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            alive = [p for p in pids if _pid_alive(p)]
+            if not alive:
+                break
+            time.sleep(0.5)
+        else:
+            # Last resort: SIGINT again (engine requires 3 to force-quit)
+            for pid in [p for p in pids if _pid_alive(p)]:
+                for _ in range(3):
+                    try:
+                        os.kill(pid, signal.SIGINT)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.3)
+            time.sleep(2.0)
+
+        print("  Engine stopped.")
+    else:
+        print("  No running engine found — starting fresh.")
+
+    # ── 3. Start new engine ───────────────────────────────────────────────
+    log_path = "/tmp/engine.log"
+    with open(log_path, "a") as log_fh:
+        subprocess.Popen(
+            [
+                sys.executable, "-m", "ib.run_engine",
+                "--port", str(port),
+                "--mode", mode,
+                "--client-id", str(client_id),
+                "--verbose",
+            ],
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+        )
+    print(f"  Engine started (log: {log_path}). Waiting {startup_wait:.0f}s for connect...")
+    time.sleep(startup_wait)
+
+    # ── 4. Verify reachable and connected ────────────────────────────────
+    ok, msg, _ = _cmd("status", socket_path, timeout=10.0)
+    if not ok:
+        print(f"  [ERROR] Engine not responding after restart: {msg}")
+        return False
+    if "Connected: True" not in msg:
+        print(f"  [ERROR] Engine started but not connected to IB: {msg.splitlines()[0]}")
+        return False
+    print(f"  Engine ready: {msg.splitlines()[0]}")
+    return True
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
 
 
 def _is_loaded(plugin_name: str, socket_path: str) -> bool:
@@ -559,11 +660,34 @@ def main():
         help="Run only the specified order plugin numbers (1-5)",
     )
     parser.add_argument(
+        "--restart-engine",
+        action="store_true",
+        dest="restart_engine",
+        help=(
+            "Gracefully shut down the running engine before starting tests "
+            "(sends 'shutdown' command so plugins cancel open orders), "
+            "then start a fresh engine. Picks up code changes."
+        ),
+    )
+    parser.add_argument(
+        "--engine-port",
+        type=int,
+        default=7497,
+        dest="engine_port",
+        help="Port for --restart-engine to use when starting the new engine (default: 7497)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show which plugins would run without executing",
     )
     args = parser.parse_args()
+
+    # ── Optional engine restart (graceful shutdown + fresh start) ────────────
+    if args.restart_engine and not args.dry_run:
+        print("Restarting engine (graceful shutdown → fresh start)...")
+        if not _restart_engine(args.socket, port=args.engine_port):
+            sys.exit(1)
 
     # Build plugin list
     plugins_to_run: List[Dict] = []
