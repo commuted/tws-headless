@@ -247,6 +247,14 @@ def main():
             else:
                 logger.info("Reconciliation complete: holdings match account")
 
+        # Auto-reload plugins from last session
+        if engine.plugin_executive:
+            result = engine.plugin_executive.reload_registered_plugins()
+            if result["reloaded"]:
+                logger.info(f"Auto-reloaded plugins: {result['reloaded']}")
+            if result["failed"]:
+                logger.warning(f"Failed to reload plugins: {result['failed']}")
+
         logger.info("Streaming data - press Ctrl+C 3x to stop")
 
     def on_stopped():

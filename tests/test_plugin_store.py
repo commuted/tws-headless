@@ -67,7 +67,7 @@ class TestPluginStoreInit:
                 "SELECT version FROM schema_versions WHERE component = 'plugin_store'"
             ).fetchone()
         assert row is not None
-        assert row[0] == 2
+        assert row[0] == 3
 
     def test_all_tables_exist(self, store):
         import sqlite3
@@ -78,6 +78,7 @@ class TestPluginStoreInit:
         expected = {
             "schema_versions", "plugin_states", "plugin_holdings",
             "plugin_positions", "forex_cost_basis", "migration_log",
+            "plugin_registry",
         }
         assert expected.issubset(tables)
 
@@ -322,7 +323,7 @@ class TestPluginStoreSchemaVersioning:
                 "SELECT version, applied_at FROM schema_versions WHERE component='plugin_store'"
             ).fetchone()
         assert row is not None
-        assert row[0] == 2
+        assert row[0] == 3
         assert row[1]  # non-empty timestamp
 
     def test_reinit_does_not_reset_version(self, tmp_path):
@@ -437,13 +438,13 @@ class TestPluginStoreInstruments:
         assert a[0].symbol == "SPY"
         assert b[0].symbol == "QQQ"
 
-    def test_schema_version_is_2(self, store):
+    def test_schema_version_is_3(self, store):
         import sqlite3
         with sqlite3.connect(store.db_path) as conn:
             row = conn.execute(
                 "SELECT version FROM schema_versions WHERE component='plugin_store'"
             ).fetchone()
-        assert row[0] == 2
+        assert row[0] == 3
 
     def test_migrate_instruments_from_json(self, store, tmp_path):
         (tmp_path / "instruments.json").write_text(json.dumps({
@@ -472,3 +473,206 @@ class TestPluginStoreInstruments:
     def test_migrate_instruments_missing_file_skipped(self, store, tmp_path):
         store.migrate_instruments_from_json("myplugin", str(tmp_path / "nonexistent"))
         # Should not raise; no instruments stored since file absent
+
+
+# =============================================================================
+# 7. Registry
+# =============================================================================
+
+
+class TestPluginRegistry:
+    def test_upsert_and_get(self, store):
+        ok = store.upsert_registry(
+            slot="nav1", class_path="/plugins/nav.py",
+            version="1.0", status="unloaded",
+        )
+        assert ok
+        entry = store.get_registry_entry("nav1")
+        assert entry is not None
+        assert entry["slot"] == "nav1"
+        assert entry["class_path"] == "/plugins/nav.py"
+        assert entry["version"] == "1.0"
+        assert entry["status"] == "unloaded"
+        assert entry["config"] is None
+
+    def test_upsert_with_config(self, store):
+        cfg = {"symbol": "SPY", "threshold": 0.5}
+        store.upsert_registry(
+            slot="nav2", class_path="/plugins/nav.py",
+            version="1.0", status="started", config=cfg,
+        )
+        entry = store.get_registry_entry("nav2")
+        assert entry["config"] == cfg
+        assert entry["status"] == "started"
+
+    def test_status_update(self, store):
+        store.upsert_registry("nav3", "/p/nav.py", "1.0", "unloaded")
+        store.upsert_registry("nav3", "/p/nav.py", "1.0", "started")
+        entry = store.get_registry_entry("nav3")
+        assert entry["status"] == "started"
+
+    def test_created_at_preserved_on_update(self, store):
+        store.upsert_registry("nav4", "/p/nav.py", "1.0", "unloaded")
+        first = store.get_registry_entry("nav4")["created_at"]
+        store.upsert_registry("nav4", "/p/nav.py", "1.0", "started")
+        second = store.get_registry_entry("nav4")["created_at"]
+        # created_at should be unchanged (ON CONFLICT preserves it)
+        assert first == second
+
+    def test_list_no_filter(self, store):
+        store.upsert_registry("a", "/p/a.py", "1.0", "unloaded")
+        store.upsert_registry("b", "/p/b.py", "1.0", "started")
+        entries = store.list_registry()
+        slots = [e["slot"] for e in entries]
+        assert "a" in slots
+        assert "b" in slots
+
+    def test_list_with_status_filter(self, store):
+        store.upsert_registry("x1", "/p/x.py", "1.0", "unloaded")
+        store.upsert_registry("x2", "/p/x.py", "1.0", "started")
+        store.upsert_registry("x3", "/p/x.py", "1.0", "frozen")
+        started = store.list_registry(status_filter="started")
+        assert len(started) == 1
+        assert started[0]["slot"] == "x2"
+
+    def test_delete_registry_entry(self, store):
+        store.upsert_registry("del1", "/p/d.py", "1.0", "unloaded")
+        assert store.get_registry_entry("del1") is not None
+        store.delete_registry_entry("del1")
+        assert store.get_registry_entry("del1") is None
+
+    def test_get_missing_returns_none(self, store):
+        assert store.get_registry_entry("does_not_exist") is None
+
+    def test_schema_version_is_3(self, store):
+        import sqlite3
+        with sqlite3.connect(store.db_path) as conn:
+            row = conn.execute(
+                "SELECT version FROM schema_versions WHERE component = 'plugin_store'"
+            ).fetchone()
+        assert row[0] == 3
+
+
+# =============================================================================
+# 8. Export / Import
+# =============================================================================
+
+
+class TestExportImport:
+    def _seed_full(self, store):
+        """Seed a complete slot for roundtrip tests."""
+        store.upsert_registry(
+            slot="ship1",
+            class_path="/plugins/ship.py",
+            version="2.0",
+            status="started",
+            config={"symbol": "SPY"},
+        )
+        store.save_state("ship1", "2.0", {"rudder": 0.5, "keel": -100.0})
+        from plugins.base import Holdings, HoldingPosition
+        h = Holdings(
+            plugin_name="ship1",
+            initial_cash=50000.0,
+            current_cash=48000.0,
+            created_at=datetime(2024, 1, 1),
+            last_updated=datetime(2024, 6, 1),
+        )
+        h.initial_positions = [
+            HoldingPosition("SPY", 10, 450.0, 450.0, 4500.0)
+        ]
+        h.current_positions = [
+            HoldingPosition("SPY", 10, 450.0, 460.0, 4600.0)
+        ]
+        store.save_holdings(h)
+        from plugins.base import PluginInstrument
+        store.save_instruments("ship1", [
+            PluginInstrument(symbol="SPY", name="S&P ETF", weight=1.0)
+        ])
+
+    def test_export_not_found(self, store):
+        result = store.export_instance("nonexistent_slot")
+        assert result is None
+
+    def test_export_contains_expected_keys(self, store):
+        self._seed_full(store)
+        doc = store.export_instance("ship1")
+        assert doc is not None
+        for key in ("slot", "class_path", "version", "config", "state",
+                    "holdings", "instruments", "exported_at", "schema_version"):
+            assert key in doc, f"Missing key: {key}"
+
+    def test_export_roundtrip(self, store, tmp_path):
+        """Export → import to fresh store → re-export — key fields match."""
+        self._seed_full(store)
+        doc = store.export_instance("ship1")
+        assert doc is not None
+
+        store2 = PluginStore(db_path=tmp_path / "import_test.db")
+        assert store2.import_instance(doc)
+
+        doc2 = store2.export_instance("ship1")
+        assert doc2 is not None
+
+        assert doc2["slot"] == doc["slot"]
+        assert doc2["class_path"] == doc["class_path"]
+        assert doc2["version"] == doc["version"]
+        assert doc2["config"] == doc["config"]
+        assert doc2["state"] == doc["state"]
+        assert doc2["holdings"]["initial_funding"]["cash"] == \
+               doc["holdings"]["initial_funding"]["cash"]
+        assert len(doc2["instruments"]) == len(doc["instruments"])
+        assert doc2["instruments"][0]["symbol"] == doc["instruments"][0]["symbol"]
+
+    def test_import_forces_unloaded_status(self, store, tmp_path):
+        self._seed_full(store)
+        doc = store.export_instance("ship1")
+        # doc has status='started' in registry; import should force 'unloaded'
+        store2 = PluginStore(db_path=tmp_path / "import_unloaded.db")
+        store2.import_instance(doc)
+        entry = store2.get_registry_entry("ship1")
+        assert entry["status"] == "unloaded"
+
+    def test_import_missing_required_keys_returns_false(self, store):
+        # Missing both slot and class_path
+        assert store.import_instance({}) is False
+        # Missing class_path
+        assert store.import_instance({"slot": "s1"}) is False
+        # Missing slot
+        assert store.import_instance({"class_path": "/p.py"}) is False
+
+    def test_import_no_state_no_holdings(self, store):
+        """Import with only registry data (no state/holdings) should succeed."""
+        doc = {
+            "slot": "bare",
+            "class_path": "/plugins/bare.py",
+            "version": "1.0",
+            "config": None,
+            "state": None,
+            "holdings": None,
+            "instruments": [],
+        }
+        assert store.import_instance(doc)
+        entry = store.get_registry_entry("bare")
+        assert entry is not None
+        assert entry["slot"] == "bare"
+
+    def test_export_state_values(self, store):
+        self._seed_full(store)
+        doc = store.export_instance("ship1")
+        assert doc["state"]["rudder"] == 0.5
+        assert doc["state"]["keel"] == -100.0
+
+    def test_export_holdings_values(self, store):
+        self._seed_full(store)
+        doc = store.export_instance("ship1")
+        assert doc["holdings"]["initial_funding"]["cash"] == 50000.0
+        assert doc["holdings"]["current_holdings"]["cash"] == 48000.0
+        assert len(doc["holdings"]["initial_funding"]["positions"]) == 1
+        assert doc["holdings"]["initial_funding"]["positions"][0]["symbol"] == "SPY"
+
+    def test_export_instruments(self, store):
+        self._seed_full(store)
+        doc = store.export_instance("ship1")
+        assert len(doc["instruments"]) == 1
+        assert doc["instruments"][0]["symbol"] == "SPY"
+        assert doc["instruments"][0]["name"] == "S&P ETF"

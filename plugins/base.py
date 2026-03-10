@@ -602,8 +602,9 @@ class PluginBase(ABC):
     def _run_migration_if_needed(self) -> None:
         """Migrate legacy JSON files into SQLite once per instance."""
         if not self._migration_done:
-            self._store.migrate_from_json(self.slot, self._base_path)
-            self._store.migrate_instruments_from_json(self.slot, self._base_path)
+            if self._base_path and self._base_path.is_dir():
+                self._store.migrate_from_json(self.slot, self._base_path)
+                self._store.migrate_instruments_from_json(self.slot, self._base_path)
             self._migration_done = True
 
     def save_state(self, state: Dict[str, Any]) -> bool:
@@ -1129,6 +1130,11 @@ class PluginBase(ABC):
     def is_system_plugin(self) -> bool:
         """Whether this is a system-managed plugin (cannot be unloaded by user)"""
         return self.IS_SYSTEM_PLUGIN
+
+    @property
+    def config(self) -> Optional[Dict[str, Any]]:
+        """Per-instance config (alias of self.descriptor when it is a dict)."""
+        return self.descriptor if isinstance(self.descriptor, dict) else None
 
     # =========================================================================
     # Runtime Parameters Interface
