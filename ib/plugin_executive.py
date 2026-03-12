@@ -3285,14 +3285,6 @@ class PluginExecutive:
 
         return result
 
-    def export_plugin(self, slot: str) -> Optional[Dict]:
-        """Export a plugin instance as a portable JSON-serialisable dict."""
-        return get_plugin_store().export_instance(slot)
-
-    def import_plugin(self, data: Dict) -> bool:
-        """Import a plugin instance from a portable dict. Does not auto-load."""
-        return get_plugin_store().import_instance(data)
-
     def get_execution_history(
         self,
         plugin_name: Optional[str] = None,

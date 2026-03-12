@@ -59,6 +59,7 @@ ExecutionDB - logs all trades and commissions
 | **DataFeed** | `data_feed.py` | Real-time tick/bar streaming with circular buffers |
 | **AlgorithmRunner** | `algorithm_runner.py` | Executes algorithms on bar/tick events; circuit breaker for fault tolerance |
 | **PluginExecutive** | `plugin_executive.py` | Plugin lifecycle (start/stop/freeze/resume); state persistence |
+| **PluginBase** | `plugins/base.py` | Base class; `plugin_dir` property gives each plugin its own directory for state.json, holdings.json, instruments.json |
 | **TradingEngine** | `trading_engine.py` | Unified interface combining ConnectionManager + DataFeed + Runner |
 | **CommandServer** | `command_server.py` | Unix socket interface for external control |
 | **MessageBus** | `message_bus.py` | Pub/Sub for inter-plugin communication |

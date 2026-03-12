@@ -5,7 +5,7 @@ Provides the foundation for implementing trading plugins with:
 - Standardized lifecycle commands (start, stop, freeze, resume)
 - Custom request handling
 - Pub/Sub MessageBus integration for indicator feeds
-- Automatic state persistence to SQLite (via ib.plugin_store)
+- File-based state persistence — each plugin owns its directory
 - Instrument management and market data subscriptions
 - Holdings tracking and order execution
 """
@@ -24,8 +24,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, List, Dict, Optional, Any, Set, Tuple, Callable
 
 from ibapi.contract import Contract
-
-from ib.plugin_store import get_plugin_store
 
 if TYPE_CHECKING:
     from ib.models import PnLData
@@ -316,13 +314,13 @@ class PluginBase(ABC):
     - Standardized lifecycle (start, stop, freeze, resume)
     - Custom request handling (handle_request)
     - Pub/Sub MessageBus integration
-    - Automatic state persistence
+    - File-based state persistence (save_state/load_state → {plugin_dir}/state.json)
     - Instruments, holdings, and trading execution
 
-    Each plugin manages its own:
-    - Instruments file (allowed securities with target weights)
-    - Holdings (either per-plugin or shared)
-    - State file (for recovery)
+    Each plugin manages its own directory (self.plugin_dir):
+    - instruments.json  — approved securities with target weights
+    - holdings.json     — persistent position tracking
+    - state.json        — written/read by save_state / load_state
     - Trading logic (implemented in subclasses)
 
     Lifecycle States:
@@ -403,8 +401,6 @@ class PluginBase(ABC):
         self.portfolio = portfolio
         self._shared_holdings = shared_holdings
         self._message_bus = message_bus
-        self._store = get_plugin_store()
-        self._migration_done = False
 
         # Set up paths
         if base_path:
@@ -599,17 +595,9 @@ class PluginBase(ABC):
     # State Persistence
     # =========================================================================
 
-    def _run_migration_if_needed(self) -> None:
-        """Migrate legacy JSON files into SQLite once per instance."""
-        if not self._migration_done:
-            if self._base_path and self._base_path.is_dir():
-                self._store.migrate_from_json(self.slot, self._base_path)
-                self._store.migrate_instruments_from_json(self.slot, self._base_path)
-            self._migration_done = True
-
     def save_state(self, state: Dict[str, Any]) -> bool:
         """
-        Save plugin state to SQLite.
+        Save plugin state to {plugin_dir}/state.json.
 
         Automatically called on freeze() and stop().
         Can also be called manually for periodic saves.
@@ -620,33 +608,49 @@ class PluginBase(ABC):
         Returns:
             True if saved successfully
         """
-        return self._store.save_state(self.slot, self.VERSION, state)
+        try:
+            self._base_path.mkdir(parents=True, exist_ok=True)
+            data = {
+                "plugin_version": self.VERSION,
+                "state": state,
+                "saved_at": datetime.now().isoformat(),
+            }
+            self._state_file.write_text(json.dumps(data, default=str))
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save state for '{self.slot}': {e}")
+            return False
 
     def load_state(self) -> Dict[str, Any]:
         """
-        Load plugin state from SQLite.
+        Load plugin state from {plugin_dir}/state.json.
 
         Should be called during start() to restore previous state.
-        Automatically migrates legacy state.json on first call.
 
         Returns:
-            State dict, or empty dict if no state exists
+            State dict, or empty dict if no file exists
         """
-        self._run_migration_if_needed()
-        result = self._store.load_state(self.slot)
-        return result if result is not None else {}
+        try:
+            if not self._state_file.exists():
+                return {}
+            data = json.loads(self._state_file.read_text())
+            if "state" in data:
+                return data["state"]
+            return data
+        except Exception as e:
+            logger.error(f"Failed to load state for '{self.slot}': {e}")
+            return {}
 
     def clear_state(self) -> bool:
         """
-        Clear saved state.
+        Clear saved state by deleting state.json.
 
         Returns:
             True if cleared (or didn't exist)
         """
-        result = self._store.clear_state(self.slot)
         if self._state_file.exists():
             self._state_file.unlink()
-        return result
+        return True
 
     # =========================================================================
     # MessageBus Integration
@@ -1107,6 +1111,11 @@ class PluginBase(ABC):
     # =========================================================================
 
     @property
+    def plugin_dir(self) -> Path:
+        """Directory where this plugin stores its files (state.json, holdings.json, etc.)"""
+        return self._base_path
+
+    @property
     def instruments(self) -> List[PluginInstrument]:
         """Get list of all instruments"""
         return list(self._instruments.values())
@@ -1202,48 +1211,56 @@ class PluginBase(ABC):
             return False
 
     def _load_instruments(self):
-        """Load instruments from SQLite (migrating from JSON on first call)."""
-        self._run_migration_if_needed()
-        loaded = self._store.load_instruments(self.slot)
-        if loaded is not None:
+        """Load instruments from instruments.json."""
+        instruments_file = self._base_path / "instruments.json"
+        if not instruments_file.exists():
+            return
+        try:
+            data = json.loads(instruments_file.read_text())
             self._instruments.clear()
-            for inst in loaded:
+            for d in data.get("instruments", []):
+                inst = PluginInstrument.from_dict(d)
                 self._instruments[inst.symbol] = inst
-        # If None (nothing in DB yet), leave _instruments empty — fresh instance
+        except Exception as e:
+            logger.error(f"Failed to load instruments for '{self.slot}': {e}")
 
     def _load_holdings(self):
-        """Load holdings from SQLite, falling back to fresh Holdings if absent."""
-        self._run_migration_if_needed()
-        loaded = self._store.load_holdings(self.slot)
-        if loaded is not None:
-            self._holdings = loaded
-        else:
-            self._holdings = Holdings(
-                plugin_name=self.slot,
-                created_at=datetime.now(),
-            )
+        """Load holdings from holdings.json, falling back to fresh Holdings if absent."""
+        holdings_file = self._base_path / "holdings.json"
+        if holdings_file.exists():
+            try:
+                data = json.loads(holdings_file.read_text())
+                self._holdings = Holdings.from_dict(data)
+                return
+            except Exception as e:
+                logger.error(f"Failed to load holdings for '{self.slot}': {e}")
+        self._holdings = Holdings(
+            plugin_name=self.slot,
+            created_at=datetime.now(),
+        )
 
     def save_holdings(self):
-        """Save current holdings to SQLite."""
+        """Save current holdings to holdings.json."""
         if self._holdings is None:
             return
 
+        self._base_path.mkdir(parents=True, exist_ok=True)
         self._holdings.last_updated = datetime.now()
-        self._store.save_holdings(self._holdings)
+        holdings_file = self._base_path / "holdings.json"
+        holdings_file.write_text(json.dumps(self._holdings.to_dict(), default=str))
         logger.info(f"Saved holdings for '{self.slot}'")
 
     def save_instruments(self):
-        """Save current instrument list to SQLite."""
-        self._store.save_instruments(self.slot, list(self._instruments.values()))
+        """Save current instrument list to instruments.json."""
+        self._base_path.mkdir(parents=True, exist_ok=True)
+        instruments_file = self._base_path / "instruments.json"
+        data = {"instruments": [i.to_dict() for i in self._instruments.values()]}
+        instruments_file.write_text(json.dumps(data, default=str))
         logger.info(f"Saved {len(self._instruments)} instruments for '{self.slot}'")
 
     def reload_instruments(self):
-        """Re-read instrument list from SQLite into memory (picks up CLI changes)."""
-        loaded = self._store.load_instruments(self.slot)
-        if loaded is not None:
-            self._instruments.clear()
-            for inst in loaded:
-                self._instruments[inst.symbol] = inst
+        """Re-read instrument list from instruments.json into memory."""
+        self._load_instruments()
         logger.info(f"Reloaded {len(self._instruments)} instruments for '{self.slot}'")
 
     # =========================================================================
@@ -1255,20 +1272,20 @@ class PluginBase(ABC):
         return self._instruments.get(symbol.upper())
 
     def add_instrument(self, instrument: PluginInstrument) -> bool:
-        """Add an instrument and persist to SQLite. Returns False if already present."""
+        """Add an instrument and persist to instruments.json. Returns False if already present."""
         if instrument.symbol in self._instruments:
             return False
         self._instruments[instrument.symbol] = instrument
-        self._store.upsert_instrument(self.slot, instrument)
+        self.save_instruments()
         return True
 
     def remove_instrument(self, symbol: str) -> bool:
-        """Remove an instrument and persist to SQLite."""
+        """Remove an instrument and persist to instruments.json."""
         sym = symbol.upper()
         if sym not in self._instruments:
             return False
         del self._instruments[sym]
-        self._store.remove_instrument(self.slot, sym)
+        self.save_instruments()
         return True
 
     def get_contracts(self) -> List[Contract]:

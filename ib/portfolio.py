@@ -6,7 +6,9 @@ from Interactive Brokers. Supports both snapshot and streaming market data.
 """
 
 import asyncio
+import json
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional, Callable
 from datetime import datetime
 
@@ -34,8 +36,6 @@ from .execution_db import (
     CommissionRecord,
     get_execution_db,
 )
-from .plugin_store import get_plugin_store
-
 logger = logging.getLogger(__name__)
 
 
@@ -161,8 +161,6 @@ class Portfolio(IBClient):
         # Execution tracking
         self._executions_done = asyncio.Event()
         self._execution_db: Optional[ExecutionDatabase] = None
-
-        self._store = get_plugin_store()
 
         # Load persisted forex cost basis
         self._load_forex_cost_basis()
@@ -1923,17 +1921,22 @@ class Portfolio(IBClient):
                     logger.info(f"Applied forex rate to {symbol}: rate={rate} value={pos.market_value}")
 
     def _load_forex_cost_basis(self):
-        """Load persisted forex cost basis from SQLite (migrating JSON once if needed)."""
-        from pathlib import Path
-
-        legacy_path = Path.home() / ".ib_forex_cost_basis.json"
-        self._store.migrate_forex_cost_basis(legacy_path)
-        self._forex_cost_basis = self._store.load_forex_cost_basis()
+        """Load persisted forex cost basis from ~/.ib_forex_cost_basis.json."""
+        forex_file = Path.home() / ".ib_forex_cost_basis.json"
+        if forex_file.exists():
+            try:
+                self._forex_cost_basis = json.loads(forex_file.read_text())
+            except Exception as e:
+                logger.warning(f"Failed to load forex cost basis: {e}")
+                self._forex_cost_basis = {}
+        else:
+            self._forex_cost_basis = {}
         logger.debug(f"Loaded forex cost basis: {self._forex_cost_basis}")
 
     def _save_forex_cost_basis(self):
-        """Save forex cost basis to SQLite."""
-        self._store.save_forex_cost_basis(self._forex_cost_basis)
+        """Save forex cost basis to ~/.ib_forex_cost_basis.json."""
+        forex_file = Path.home() / ".ib_forex_cost_basis.json"
+        forex_file.write_text(json.dumps(self._forex_cost_basis))
         logger.debug(f"Saved forex cost basis: {self._forex_cost_basis}")
 
     def _update_forex_positions(self):

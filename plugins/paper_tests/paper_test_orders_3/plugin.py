@@ -2,7 +2,10 @@
 paper_test_orders_3/plugin.py – Pegged and trailing-variant order types
 
 Tests: Trailing-Stop-Limit, Pegged-to-Market, Relative/Pegged-to-Primary,
-       Passive-Relative, Pegged-to-Midpoint (IBKRATS), Auction, Adjusted Order
+       Passive-Relative, Pegged-to-Midpoint (IBKRATS), Adjusted Order
+
+At-Auction (MTL+AUC) has been moved to paper_test_orders_open, as it must
+be submitted within the pre-open window.
 """
 
 from decimal import Decimal
@@ -74,17 +77,6 @@ def _peg_mid(action: str, offset: float, price_cap: float) -> Order:
     return o
 
 
-def _auction(action: str, price: float) -> Order:
-    """At-Auction order (MTL with AUC tif, pre-market)."""
-    o = Order()
-    o.action = action
-    o.orderType = "MTL"
-    o.totalQuantity = TEST_QTY
-    o.lmtPrice = round(price, 2)
-    o.tif = "AUC"
-    return o
-
-
 def _adjusted_trail(action: str, stop_price: float, trail_amt: float,
                     trigger_price: float) -> Order:
     """
@@ -152,15 +144,6 @@ _CASES: List[OrderTestCase] = [
         notes="IBKRATS/PEG MID: executes at bid-ask midpoint; cap at ±0.5%",
     ),
     OrderTestCase(
-        name="auction",
-        order_type_label="MTL+AUC",
-        pair_index=5,
-        build_long=lambda p: _auction("BUY",  p * OFFSET_BELOW),
-        build_short=lambda p: _auction("SELL", p * OFFSET_ABOVE),
-        fill_timeout=30.0,
-        notes="At-Auction (MTL + AUC tif): participates in opening/closing auction",
-    ),
-    OrderTestCase(
         name="adjusted_stop_to_trail",
         order_type_label="STP→TRAIL",
         pair_index=6,
@@ -189,7 +172,8 @@ class PaperTestOrders3Plugin(OrderTestPluginBase):
     Plugin 3 of 5: Pegged and trailing-variant order types.
 
     Tests: Trailing-Stop-Limit, Pegged-to-Market, REL, Passive-REL,
-           PEG MID (IBKRATS), Auction, Adjusted Order (STP→TRAIL).
+           PEG MID (IBKRATS), Adjusted Order (STP→TRAIL).
+    (At-Auction moved to paper_test_orders_open)
     Run via: plugin request paper_test_orders_3 run_tests
     """
 
@@ -211,5 +195,5 @@ class PaperTestOrders3Plugin(OrderTestPluginBase):
     def description(self) -> str:
         return (
             "Paper Test Orders 3 – Pegged & trailing: "
-            "Trail-Limit, PEG MKT, REL, PASSV REL, PEG MID, Auction, Adjusted"
+            "Trail-Limit, PEG MKT, REL, PASSV REL, PEG MID, Adjusted"
         )

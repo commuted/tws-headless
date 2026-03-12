@@ -416,10 +416,9 @@ class TestPluginStatePersistence:
     def test_save_and_load_state(self):
         """Test saving and loading state"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_file = Path(tmpdir) / "state.json"
-
             plugin = ConcreteTestPlugin()
-            plugin._state_file = state_file
+            plugin._base_path = Path(tmpdir)
+            plugin._state_file = Path(tmpdir) / "state.json"
 
             # Save state
             plugin.save_state({"counter": 42, "data": [1, 2, 3]})
@@ -623,11 +622,11 @@ class TestPluginSlot:
         loaded = plugin.load_state()
         assert loaded == {"x": 99}
 
-    def test_two_slots_independent_state(self):
-        """Two instances with different slots have independent state."""
-        p1 = ConcreteTestPlugin("my_plugin")
+    def test_two_slots_independent_state(self, tmp_path):
+        """Two instances with different base paths have independent state."""
+        p1 = ConcreteTestPlugin("my_plugin", base_path=tmp_path / "slot_a")
         p1.slot = "slot_a"
-        p2 = ConcreteTestPlugin("my_plugin")
+        p2 = ConcreteTestPlugin("my_plugin", base_path=tmp_path / "slot_b")
         p2.slot = "slot_b"
 
         p1.save_state({"from": "a"})
@@ -699,69 +698,80 @@ class TestCLIHelp:
 
 
 # =============================================================================
-# Instrument SQLite persistence
+# Instrument file-based persistence
 # =============================================================================
 
 
-class TestInstrumentSQLitePersistence:
+class TestInstrumentFilePersistence:
     """Tests that add_instrument, remove_instrument, and save_instruments
-    write through to SQLite and that reload_instruments reads back."""
+    write through to instruments.json and that reload_instruments reads back."""
 
-    def test_add_instrument_persists(self, _isolated_plugin_store):
-        """add_instrument writes to store immediately."""
-        plugin = ConcreteTestPlugin("persist_test")
+    def test_add_instrument_persists(self, tmp_path):
+        """add_instrument writes to instruments.json immediately."""
+        plugin = ConcreteTestPlugin("persist_test", base_path=tmp_path / "persist_test")
         plugin.add_instrument(PluginInstrument("SPY", "S&P 500"))
-        stored = _isolated_plugin_store.load_instruments(plugin.slot)
-        assert stored is not None
-        assert any(i.symbol == "SPY" for i in stored)
+        instruments_file = plugin.plugin_dir / "instruments.json"
+        assert instruments_file.exists()
+        import json
+        data = json.loads(instruments_file.read_text())
+        symbols = [i["symbol"] for i in data["instruments"]]
+        assert "SPY" in symbols
 
-    def test_remove_instrument_persists(self, _isolated_plugin_store):
-        """remove_instrument deletes from store immediately."""
-        plugin = ConcreteTestPlugin("persist_test")
+    def test_remove_instrument_persists(self, tmp_path):
+        """remove_instrument updates instruments.json immediately."""
+        plugin = ConcreteTestPlugin("persist_test", base_path=tmp_path / "persist_test")
         plugin.add_instrument(PluginInstrument("SPY", "S&P 500"))
         plugin.add_instrument(PluginInstrument("QQQ", "Nasdaq"))
         plugin.remove_instrument("SPY")
-        stored = _isolated_plugin_store.load_instruments(plugin.slot)
-        assert not any(i.symbol == "SPY" for i in stored)
-        assert any(i.symbol == "QQQ" for i in stored)
+        import json
+        data = json.loads((plugin.plugin_dir / "instruments.json").read_text())
+        symbols = [i["symbol"] for i in data["instruments"]]
+        assert "SPY" not in symbols
+        assert "QQQ" in symbols
 
-    def test_save_instruments_writes_all(self, _isolated_plugin_store):
-        """save_instruments replaces all rows."""
-        plugin = ConcreteTestPlugin("persist_test")
+    def test_save_instruments_writes_all(self, tmp_path):
+        """save_instruments replaces all entries in instruments.json."""
+        plugin = ConcreteTestPlugin("persist_test", base_path=tmp_path / "persist_test")
         plugin.add_instrument(PluginInstrument("SPY", "S&P 500"))
         plugin.add_instrument(PluginInstrument("QQQ", "Nasdaq"))
         # Overwrite with single instrument
         plugin._instruments.clear()
         plugin._instruments["AAPL"] = PluginInstrument("AAPL", "Apple")
         plugin.save_instruments()
-        stored = _isolated_plugin_store.load_instruments(plugin.slot)
-        assert len(stored) == 1
-        assert stored[0].symbol == "AAPL"
+        import json
+        data = json.loads((plugin.plugin_dir / "instruments.json").read_text())
+        assert len(data["instruments"]) == 1
+        assert data["instruments"][0]["symbol"] == "AAPL"
 
-    def test_reload_instruments_reads_from_store(self, _isolated_plugin_store):
-        """reload_instruments re-reads SQLite into memory."""
-        plugin = ConcreteTestPlugin("persist_test")
+    def test_reload_instruments_reads_from_file(self, tmp_path):
+        """reload_instruments re-reads instruments.json into memory."""
+        plugin = ConcreteTestPlugin("persist_test", base_path=tmp_path / "persist_test")
         plugin.add_instrument(PluginInstrument("SPY", "S&P 500"))
-        # Directly inject a new instrument into the store bypassing memory
-        _isolated_plugin_store.upsert_instrument(
-            plugin.slot, PluginInstrument("TSLA", "Tesla")
-        )
+        # Write a new instrument directly to the file
+        import json
+        instruments_file = plugin.plugin_dir / "instruments.json"
+        data = json.loads(instruments_file.read_text())
+        data["instruments"].append({
+            "symbol": "TSLA", "name": "Tesla", "weight": 0.0,
+            "min_weight": 0.0, "max_weight": 100.0, "enabled": True,
+            "exchange": "SMART", "currency": "USD", "sec_type": "STK",
+        })
+        instruments_file.write_text(json.dumps(data))
         plugin.reload_instruments()
         assert "TSLA" in plugin._instruments
         assert "SPY" in plugin._instruments
 
-    def test_slot_isolates_instruments(self, _isolated_plugin_store):
-        """Two plugins with different slots store instruments independently."""
-        p1 = ConcreteTestPlugin("shared_name")
-        p1.slot = "slot_a"
-        p2 = ConcreteTestPlugin("shared_name")
-        p2.slot = "slot_b"
+    def test_dir_isolates_instruments(self, tmp_path):
+        """Two plugins with different base_paths store instruments independently."""
+        p1 = ConcreteTestPlugin("shared_name", base_path=tmp_path / "slot_a")
+        p2 = ConcreteTestPlugin("shared_name", base_path=tmp_path / "slot_b")
         p1.add_instrument(PluginInstrument("SPY", "S&P 500"))
         p2.add_instrument(PluginInstrument("QQQ", "Nasdaq"))
-        stored_a = _isolated_plugin_store.load_instruments("slot_a")
-        stored_b = _isolated_plugin_store.load_instruments("slot_b")
-        assert stored_a[0].symbol == "SPY"
-        assert stored_b[0].symbol == "QQQ"
+        import json
+        data_a = json.loads((p1.plugin_dir / "instruments.json").read_text())
+        data_b = json.loads((p2.plugin_dir / "instruments.json").read_text())
+        assert data_a["instruments"][0]["symbol"] == "SPY"
+        assert data_b["instruments"][0]["symbol"] == "QQQ"
 
 
 # =============================================================================
@@ -797,74 +807,120 @@ class TestConfigProperty:
 
 
 # =============================================================================
-# migration directory guard
+# File-based persistence (state, holdings, instruments)
 # =============================================================================
 
 
-class TestMigrationDirectoryGuard:
-    def test_migration_skipped_when_dir_absent(self, tmp_path):
-        """_run_migration_if_needed must not call store when directory doesn't exist."""
-        plugin = ConcreteTestPlugin("guard_plugin")
-        plugin._base_path = tmp_path / "nonexistent_dir"
-        plugin._migration_done = False
+class TestPluginBaseFilePersistence:
+    """Tests for file-based state, holdings, and instrument persistence."""
 
-        mock_store = Mock()
-        plugin._store = mock_store
+    def test_save_state_writes_state_json(self, tmp_path):
+        """save_state writes state.json to plugin_dir."""
+        plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
+        plugin.save_state({"value": 42})
+        state_file = plugin.plugin_dir / "state.json"
+        assert state_file.exists()
+        import json
+        data = json.loads(state_file.read_text())
+        assert data["state"]["value"] == 42
 
-        plugin._run_migration_if_needed()
+    def test_load_state_reads_state_json(self, tmp_path):
+        """load_state reads from state.json."""
+        plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
+        plugin.save_state({"key": "hello"})
+        loaded = plugin.load_state()
+        assert loaded == {"key": "hello"}
 
-        assert plugin._migration_done is True
-        mock_store.migrate_from_json.assert_not_called()
-        mock_store.migrate_instruments_from_json.assert_not_called()
+    def test_load_state_returns_empty_when_file_missing(self, tmp_path):
+        """load_state returns {} when state.json does not exist."""
+        plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
+        assert plugin.load_state() == {}
 
-    def test_migration_runs_when_dir_exists(self, tmp_path):
-        """_run_migration_if_needed must call store methods when directory exists."""
-        plugin_dir = tmp_path / "my_plugin"
-        plugin_dir.mkdir()
+    def test_clear_state_deletes_state_json(self, tmp_path):
+        """clear_state removes state.json."""
+        plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
+        plugin.save_state({"x": 1})
+        assert (plugin.plugin_dir / "state.json").exists()
+        result = plugin.clear_state()
+        assert result is True
+        assert not (plugin.plugin_dir / "state.json").exists()
 
-        plugin = ConcreteTestPlugin("dir_plugin")
-        plugin._base_path = plugin_dir
-        plugin._migration_done = False
+    def test_clear_state_when_no_file_returns_true(self, tmp_path):
+        """clear_state succeeds even when state.json does not exist."""
+        plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
+        assert plugin.clear_state() is True
 
-        mock_store = Mock()
-        plugin._store = mock_store
+    def test_save_instruments_writes_instruments_json(self, tmp_path):
+        """save_instruments writes instruments.json to plugin_dir."""
+        plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
+        plugin._instruments["SPY"] = PluginInstrument("SPY", "S&P 500")
+        plugin.save_instruments()
+        instruments_file = plugin.plugin_dir / "instruments.json"
+        assert instruments_file.exists()
+        import json
+        data = json.loads(instruments_file.read_text())
+        assert len(data["instruments"]) == 1
+        assert data["instruments"][0]["symbol"] == "SPY"
 
-        plugin._run_migration_if_needed()
+    def test_load_instruments_roundtrip(self, tmp_path):
+        """_load_instruments reads back what save_instruments wrote."""
+        plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
+        plugin._instruments["QQQ"] = PluginInstrument("QQQ", "Nasdaq")
+        plugin.save_instruments()
+        # Clear in-memory, then reload
+        plugin._instruments.clear()
+        plugin._load_instruments()
+        assert "QQQ" in plugin._instruments
+        assert plugin._instruments["QQQ"].name == "Nasdaq"
 
-        assert plugin._migration_done is True
-        mock_store.migrate_from_json.assert_called_once_with("dir_plugin", plugin_dir)
-        mock_store.migrate_instruments_from_json.assert_called_once_with(
-            "dir_plugin", plugin_dir
+    def test_load_instruments_missing_file_no_error(self, tmp_path):
+        """_load_instruments does nothing when instruments.json is absent."""
+        plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
+        plugin._load_instruments()  # should not raise
+        assert len(plugin._instruments) == 0
+
+    def test_save_holdings_writes_holdings_json(self, tmp_path):
+        """save_holdings writes holdings.json to plugin_dir."""
+        plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
+        plugin._holdings = Holdings(
+            plugin_name="fp_plugin",
+            initial_cash=5000.0,
+            current_cash=4500.0,
+            created_at=datetime.now(),
         )
+        plugin.save_holdings()
+        holdings_file = plugin.plugin_dir / "holdings.json"
+        assert holdings_file.exists()
+        import json
+        data = json.loads(holdings_file.read_text())
+        assert data["initial_funding"]["cash"] == 5000.0
+        assert data["current_holdings"]["cash"] == 4500.0
 
-    def test_migration_runs_only_once(self, tmp_path):
-        """_run_migration_if_needed must be idempotent."""
-        plugin_dir = tmp_path / "once_plugin"
-        plugin_dir.mkdir()
+    def test_load_holdings_roundtrip(self, tmp_path):
+        """_load_holdings reads back what save_holdings wrote."""
+        plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
+        plugin._holdings = Holdings(
+            plugin_name="fp_plugin",
+            initial_cash=10000.0,
+            current_cash=9500.0,
+            created_at=datetime.now(),
+        )
+        plugin.save_holdings()
+        plugin._holdings = None
+        plugin._load_holdings()
+        assert plugin._holdings is not None
+        assert plugin._holdings.initial_cash == 10000.0
+        assert plugin._holdings.current_cash == 9500.0
 
-        plugin = ConcreteTestPlugin("once_plugin")
-        plugin._base_path = plugin_dir
-        plugin._migration_done = False
+    def test_load_holdings_missing_file_creates_fresh(self, tmp_path):
+        """_load_holdings creates a fresh Holdings when holdings.json is absent."""
+        plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
+        plugin._load_holdings()
+        assert plugin._holdings is not None
+        assert plugin._holdings.plugin_name == "fp_plugin"
+        assert plugin._holdings.initial_cash == 0.0
 
-        mock_store = Mock()
-        plugin._store = mock_store
-
-        plugin._run_migration_if_needed()
-        plugin._run_migration_if_needed()
-
-        assert mock_store.migrate_from_json.call_count == 1
-        assert mock_store.migrate_instruments_from_json.call_count == 1
-
-    def test_migration_skipped_when_base_path_is_none(self):
-        """If _base_path is None, no migration attempted."""
-        plugin = ConcreteTestPlugin("null_path_plugin")
-        plugin._base_path = None
-        plugin._migration_done = False
-
-        mock_store = Mock()
-        plugin._store = mock_store
-
-        plugin._run_migration_if_needed()
-
-        assert plugin._migration_done is True
-        mock_store.migrate_from_json.assert_not_called()
+    def test_plugin_dir_property_returns_base_path(self, tmp_path):
+        """plugin_dir property returns _base_path."""
+        plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
+        assert plugin.plugin_dir == tmp_path / "fp_plugin"
