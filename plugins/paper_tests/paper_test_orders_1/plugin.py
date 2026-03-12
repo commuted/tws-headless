@@ -1,12 +1,15 @@
 """
 paper_test_orders_1/plugin.py – Basic equity order types
 
-Tests: Market, Limit, Stop, Stop-Limit, Market-on-Close,
-       Market-on-Open, Market-to-Limit
+Tests: Market, Limit, Stop, Stop-Limit, Market-to-Limit
+
+MOC (Market-on-Close) and MOO (Market-on-Open) have been moved to
+paper_test_orders_close and paper_test_orders_open respectively, as
+they must be submitted within specific market-session windows.
 
 ETF pairs (one per order type):
   0 SPY / QQQ    1 IWM / XLF    2 XLK / XLE
-  3 IWM / XLF    4 SPY / QQQ    5 XLK / XLE    6 SPY / QQQ
+  3 IWM / XLF    6 SPY / QQQ
 """
 
 from decimal import Decimal
@@ -59,23 +62,6 @@ def _stop_limit(action: str, lmt: float, stp: float) -> Order:
     o.totalQuantity = TEST_QTY
     o.lmtPrice = round(lmt, 2)
     o.auxPrice = round(stp, 2)
-    return o
-
-
-def _moc(action: str) -> Order:
-    o = Order()
-    o.action = action
-    o.orderType = "MOC"
-    o.totalQuantity = TEST_QTY
-    return o
-
-
-def _moo(action: str) -> Order:
-    o = Order()
-    o.action = action
-    o.orderType = "MKT"
-    o.totalQuantity = TEST_QTY
-    o.tif = "OPG"
     return o
 
 
@@ -132,26 +118,6 @@ _CASES: List[OrderTestCase] = [
         notes="Stop triggers at ±0.5%; limit 0.5% beyond stop",
     ),
     OrderTestCase(
-        name="market_on_close",
-        order_type_label="MOC",
-        pair_index=4,
-        build_long=lambda p: _moc("BUY"),
-        build_short=lambda p: _moc("SELL"),
-        fill_timeout=30.0,
-        immediate=True,
-        notes="MOC executes at the closing auction; both sides fill at close",
-    ),
-    OrderTestCase(
-        name="market_on_open",
-        order_type_label="MOO",
-        pair_index=5,
-        build_long=lambda p: _moo("BUY"),
-        build_short=lambda p: _moo("SELL"),
-        fill_timeout=30.0,
-        immediate=True,
-        notes="MOO (MKT+OPG tif) executes at opening auction",
-    ),
-    OrderTestCase(
         name="market_to_limit",
         order_type_label="MTL",
         pair_index=6,
@@ -168,7 +134,8 @@ class PaperTestOrders1Plugin(OrderTestPluginBase):
     """
     Plugin 1 of 5: Basic equity order types.
 
-    Tests: Market, Limit, Stop, Stop-Limit, MOC, MOO, Market-to-Limit.
+    Tests: Market, Limit, Stop, Stop-Limit, Market-to-Limit.
+    (MOC/MOO moved to paper_test_orders_close / paper_test_orders_open)
     Run via: plugin request paper_test_orders_1 run_tests
     """
 
@@ -190,5 +157,5 @@ class PaperTestOrders1Plugin(OrderTestPluginBase):
     def description(self) -> str:
         return (
             "Paper Test Orders 1 – Basic order types: "
-            "Market, Limit, Stop, Stop-Limit, MOC, MOO, MTL"
+            "Market, Limit, Stop, Stop-Limit, MTL"
         )

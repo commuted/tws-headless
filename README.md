@@ -82,11 +82,6 @@ Sends commands to a running engine over the Unix socket.
 ./ibctl.py plugin help     my_plugin   # show plugin CLI help
 ./ibctl.py plugin unload   my_plugin
 
-# Portable export / import
-./ibctl.py plugin export my_plugin /tmp/my_plugin.json   # snapshot to file
-./ibctl.py plugin export my_plugin                       # inline JSON
-./ibctl.py plugin import /tmp/my_plugin.json             # restore (then load)
-
 # Internal bookkeeping transfers (no IB orders placed)
 ./ibctl.py transfer list     _unassigned
 ./ibctl.py transfer cash     _unassigned my_plugin 10000 --confirm
@@ -109,10 +104,14 @@ Plugins that were running when the engine last stopped are **automatically reloa
 ```
 plugins/
   my_strategy/
-    __init__.py   # re-exports the class
-    plugin.py     # PluginBase subclass
-    state.json    # legacy; now persisted to ~/.ib_plugin_store.db
+    __init__.py      # re-exports the class
+    plugin.py        # PluginBase subclass
+    state.json       # written/read by save_state / load_state
+    instruments.json # auto-managed instrument list
+    holdings.json    # auto-managed holdings tracking
 ```
+
+Each plugin owns its directory. To move or backup a plugin instance, tar its directory — everything it owns is there.
 
 ### Minimal plugin
 
@@ -154,7 +153,7 @@ class MyStrategyPlugin(PluginBase):
 ib/                     Core engine package
   trading_engine.py     Top-level engine (connects portfolio, data, plugins)
   plugin_executive.py   Plugin lifecycle, signal routing, order execution
-  plugin_store.py       SQLite persistence (state, holdings, registry, export/import)
+  plugin_store.py       SQLite registry (which plugins to auto-reload on engine restart)
   portfolio.py          IB connection, positions, account data
   data_feed.py          Real-time tick/bar streaming and aggregation
   command_server.py     Unix socket command server

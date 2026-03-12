@@ -350,14 +350,12 @@ def calculate_signals(self) -> List[TradeSignal]:
 
 ## 7. State Persistence
 
-State is saved to and loaded from `<base_path>/state.json`. The file is
-JSON. Any JSON-serializable value is accepted as the dict value.
+Each plugin owns its directory (`self.plugin_dir`). All persistent data
+lives there — the engine does not touch it between restarts.
 
 ### `save_state(state: Dict[str, Any]) -> bool`
 
-Overwrites the state file. The engine adds metadata automatically
-(`plugin_name`, `plugin_version`, `saved_at`). Call in `stop()` and
-`freeze()`.
+Writes `{plugin_dir}/state.json`. Call in `stop()` and `freeze()`.
 
 ```python
 self.save_state({
@@ -376,8 +374,28 @@ saved = self.load_state()
 self._bar_count = saved.get("bar_count", 0)
 ```
 
-The metadata keys `plugin_name`, `plugin_version`, and `saved_at` are
-present in the returned dict but should be ignored.
+### Custom storage
+
+You can drop any files, JSON documents, or SQLite databases into your
+plugin directory. The engine does not touch them.
+
+```python
+custom_file = self.plugin_dir / "my_data.json"
+```
+
+### Portability
+
+To move a plugin instance, tar its directory. Everything it owns is there:
+
+```bash
+tar czf my_plugin_backup.tgz plugins/my_strategy/
+```
+
+### Auto-managed files
+
+- `instruments.json` — written by `add_instrument` / `remove_instrument` / `save_instruments`
+- `holdings.json` — written by `save_holdings`; read on `load()`
+- `state.json` — written by `save_state`; read by `load_state()`
 
 ---
 

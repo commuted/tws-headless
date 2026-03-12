@@ -13,12 +13,18 @@ Usage:
     ./run_paper_tests.py --all                # feeds + historical + all order plugins + orders6
     ./run_paper_tests.py --only 1 3 5         # specific order plugins
     ./run_paper_tests.py --orders6            # round-trip lifecycle tests (orders 6)
+    ./run_paper_tests.py --open               # market-open order types (MOO, LOO, Auction)
+    ./run_paper_tests.py --close              # market-close order types (MOC, LOC)
     ./run_paper_tests.py --interface          # interface validation tests only
     ./run_paper_tests.py --socket /tmp/x.sock # custom socket
     ./run_paper_tests.py --timeout 3600       # per-plugin timeout (seconds)
     ./run_paper_tests.py --dry-run            # show plan, don't execute
     ./run_paper_tests.py --restart-engine     # graceful shutdown + fresh start first
     ./run_paper_tests.py --restart-engine --engine-port 4002  # use gateway port
+
+Session-specific plugins (run at the appropriate market time):
+    --open   Submit before 9:25 AM ET  — MOO, LOO, At-Auction
+    --close  Submit before 3:50 PM ET  — MOC, LOC
 """
 
 import argparse
@@ -111,6 +117,21 @@ ORDERS_6_PLUGIN = {
     "module": "plugins.paper_tests.paper_test_orders_6",
     "label": "Orders 6 — Round-trip lifecycle: IOC/GTC/FOK, Adaptive algo, Iceberg",
     "timeout": 2700.0,
+}
+
+# Session-specific plugins — must run at the right time of day
+OPEN_PLUGIN = {
+    "name": "paper_test_orders_open",
+    "module": "plugins.paper_tests.paper_test_orders_open",
+    "label": "Orders Open — MOO (MKT+OPG), LOO (LMT+OPG), At-Auction (MTL+AUC)  [submit before 9:25 AM ET]",
+    "timeout": 300.0,
+}
+
+CLOSE_PLUGIN = {
+    "name": "paper_test_orders_close",
+    "module": "plugins.paper_tests.paper_test_orders_close",
+    "label": "Orders Close — MOC, LOC  [submit before 3:50 PM ET]",
+    "timeout": 300.0,
 }
 
 
@@ -647,6 +668,22 @@ def main():
         help="Run the paper_test_orders_6 plugin (round-trip lifecycle tests)",
     )
     parser.add_argument(
+        "--open",
+        action="store_true",
+        help=(
+            "Run market-open order types (MOO, LOO, At-Auction); "
+            "submit before 9:25 AM ET"
+        ),
+    )
+    parser.add_argument(
+        "--close",
+        action="store_true",
+        help=(
+            "Run market-close order types (MOC, LOC); "
+            "submit before 3:50 PM ET"
+        ),
+    )
+    parser.add_argument(
         "--all",
         action="store_true",
         dest="run_all",
@@ -716,6 +753,10 @@ def main():
         plugins_to_run = [INTERFACE_PLUGIN]
     elif args.orders6:
         plugins_to_run = [ORDERS_6_PLUGIN]
+    elif args.open:
+        plugins_to_run = [OPEN_PLUGIN]
+    elif args.close:
+        plugins_to_run = [CLOSE_PLUGIN]
     elif args.feeds:
         plugins_to_run = [FEED_PLUGIN]
     elif args.historical:

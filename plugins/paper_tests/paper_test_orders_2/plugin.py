@@ -1,8 +1,11 @@
 """
 paper_test_orders_2/plugin.py – Limit-variant equity order types
 
-Tests: Limit-on-Close, Limit-on-Open, Market-if-Touched,
-       Limit-if-Touched, Midprice, Discretionary, Trailing Stop
+Tests: Market-if-Touched, Limit-if-Touched, Midprice, Discretionary, Trailing Stop
+
+LOC (Limit-on-Close) and LOO (Limit-on-Open) have been moved to
+paper_test_orders_close and paper_test_orders_open respectively, as
+they must be submitted within specific market-session windows.
 """
 
 from decimal import Decimal
@@ -19,27 +22,6 @@ from plugins.paper_tests.order_test_base import (
     OrderTestPluginBase,
     TradeSignal,
 )
-
-
-def _loc(action: str, price: float) -> Order:
-    """Limit-on-Close."""
-    o = Order()
-    o.action = action
-    o.orderType = "LOC"
-    o.totalQuantity = TEST_QTY
-    o.lmtPrice = round(price, 2)
-    return o
-
-
-def _loo(action: str, price: float) -> Order:
-    """Limit-on-Open (LMT + OPG tif)."""
-    o = Order()
-    o.action = action
-    o.orderType = "LMT"
-    o.totalQuantity = TEST_QTY
-    o.lmtPrice = round(price, 2)
-    o.tif = "OPG"
-    return o
 
 
 def _mit(action: str, trigger: float) -> Order:
@@ -95,24 +77,6 @@ def _trail(action: str, trail_pct: float) -> Order:
 
 
 _CASES: List[OrderTestCase] = [
-    OrderTestCase(
-        name="limit_on_close",
-        order_type_label="LOC",
-        pair_index=0,
-        build_long=lambda p: _loc("BUY",  p * OFFSET_BELOW),
-        build_short=lambda p: _loc("SELL", p * OFFSET_ABOVE),
-        fill_timeout=30.0,
-        notes="LOC executes at closing auction at or better than limit",
-    ),
-    OrderTestCase(
-        name="limit_on_open",
-        order_type_label="LOO",
-        pair_index=1,
-        build_long=lambda p: _loo("BUY",  p * OFFSET_BELOW),
-        build_short=lambda p: _loo("SELL", p * OFFSET_ABOVE),
-        fill_timeout=30.0,
-        notes="LOO executes at opening auction at or better than limit",
-    ),
     OrderTestCase(
         name="market_if_touched",
         order_type_label="MIT",
@@ -179,7 +143,8 @@ class PaperTestOrders2Plugin(OrderTestPluginBase):
     """
     Plugin 2 of 5: Limit-variant equity order types.
 
-    Tests: LOC, LOO, MIT, LIT, Midprice, Discretionary, Trailing Stop.
+    Tests: MIT, LIT, Midprice, Discretionary, Trailing Stop.
+    (LOC/LOO moved to paper_test_orders_close / paper_test_orders_open)
     Run via: plugin request paper_test_orders_2 run_tests
     """
 
@@ -201,5 +166,5 @@ class PaperTestOrders2Plugin(OrderTestPluginBase):
     def description(self) -> str:
         return (
             "Paper Test Orders 2 – Limit variants: "
-            "LOC, LOO, MIT, LIT, Midprice, Discretionary, Trailing Stop"
+            "MIT, LIT, Midprice, Discretionary, Trailing Stop"
         )
