@@ -537,15 +537,15 @@ class TestOrderFactoryModifiers:
     def test_set_good_till_date(self):
         """Test good till date modifier"""
         order = OrderFactory.limit("BUY", Decimal("100"), 150.0)
-        OrderFactory.set_good_till_date(order, "20251231 16:00:00")
+        OrderFactory.set_good_till_date(order, "20251231-21:00:00")  # 4 PM ET in UTC
         assert order.tif == "GTD"
-        assert order.goodTillDate == "20251231 16:00:00"
+        assert order.goodTillDate == "20251231-21:00:00"
 
     def test_set_good_after_time(self):
         """Test good after time modifier"""
         order = OrderFactory.limit("BUY", Decimal("100"), 150.0)
-        OrderFactory.set_good_after_time(order, "20251215 09:30:00")
-        assert order.goodAfterTime == "20251215 09:30:00"
+        OrderFactory.set_good_after_time(order, "20251215-14:30:00")  # 9:30 AM ET in UTC
+        assert order.goodAfterTime == "20251215-14:30:00"
 
     def test_set_outside_rth(self):
         """Test outside regular trading hours modifier"""

@@ -970,6 +970,7 @@ class Portfolio(IBClient):
         use_rth: bool = True,
         on_bar: Optional[Callable] = None,
         on_end: Optional[Callable] = None,
+        keep_up_to_date: bool = False,
     ) -> int:
         """
         Request historical bar data from IB.
@@ -979,7 +980,9 @@ class Portfolio(IBClient):
 
         Args:
             contract:         IB Contract to fetch data for
-            end_date_time:    End of the requested period ("" = now)
+            end_date_time:    End of the requested period ("" = now, or
+                              "YYYYMMDD-HH:MM:SS" in UTC — e.g.
+                              "20260318-21:00:00" for 4 PM ET / 9 PM UTC)
             duration_str:     How far back to go, e.g. "1 W", "3 M", "1 Y"
             bar_size_setting: Bar width, e.g. "1 day", "1 hour", "5 mins"
             what_to_show:     TRADES, MIDPOINT, BID, ASK, etc.
@@ -1006,7 +1009,7 @@ class Portfolio(IBClient):
             what_to_show,
             1 if use_rth else 0,
             1,      # formatDate=1 → human-readable date strings
-            False,  # keepUpToDate=False → one-shot historical fetch
+            keep_up_to_date,
             [],
         )
         return req_id
@@ -1754,6 +1757,15 @@ class Portfolio(IBClient):
     # EWrapper Callbacks for Historical Data
     # =========================================================================
 
+    def error(self, reqId: int, errorTime: int, errorCode: int, errorString: str,
+              advancedOrderRejectJson: str = "") -> None:
+        """Override to release any waiting historical data requests on fatal errors."""
+        super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
+        # Error 162: no data available.  historicalDataEnd won't fire, so we
+        # must release the waiting thread ourselves to avoid a 60-second hang.
+        if errorCode in (162, 321, 354) and reqId in self._historical_requests:
+            self.historicalDataEnd(reqId, "", "")
+
     def historicalData(self, reqId: int, bar) -> None:
         """IB callback: one bar of historical data has arrived."""
         entry = self._historical_requests.get(reqId)
@@ -1768,8 +1780,14 @@ class Portfolio(IBClient):
                 logger.error(f"Error in historicalData on_bar callback: {e}")
 
     def historicalDataEnd(self, reqId: int, start: str, end: str) -> None:
-        """IB callback: historical data request is complete."""
-        entry = self._historical_requests.pop(reqId, None)
+        """IB callback: initial historical batch is complete.
+
+        For keep_up_to_date=True requests the subscription stays open and new
+        bars continue to arrive via historicalDataUpdate.  The entry is kept in
+        _historical_requests so the on_bar callback keeps firing.
+        For one-shot requests the entry is removed and on_end is called.
+        """
+        entry = self._historical_requests.get(reqId)
         if entry is None:
             return
         _on_bar, on_end, bars = entry
@@ -1782,6 +1800,23 @@ class Portfolio(IBClient):
                 on_end(bars, start, end)
             except Exception as e:
                 logger.error(f"Error in historicalDataEnd on_end callback: {e}")
+        # Remove one-shot requests; keep_up_to_date requests stay registered
+        # so historicalDataUpdate can route back to on_bar.
+        if on_end is not None:
+            self._historical_requests.pop(reqId, None)
+
+    def historicalDataUpdate(self, reqId: int, bar) -> None:
+        """IB callback: a new bar has arrived for a keep_up_to_date subscription."""
+        entry = self._historical_requests.get(reqId)
+        if entry is None:
+            return
+        on_bar, _on_end, bars = entry
+        bars.append(bar)
+        if on_bar:
+            try:
+                on_bar(bar)
+            except Exception as e:
+                logger.error(f"Error in historicalDataUpdate on_bar callback: {e}")
 
     # =========================================================================
     # EWrapper Callbacks for Contract Details

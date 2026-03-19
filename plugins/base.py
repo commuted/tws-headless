@@ -810,7 +810,8 @@ class PluginBase(ABC):
 
         Args:
             contract:         IB Contract (use ContractBuilder helpers)
-            end_date_time:    End of period as "YYYYMMDD HH:MM:SS [tz]",
+            end_date_time:    End of period as "YYYYMMDD-HH:MM:SS" in UTC
+                              (e.g. "20260318-21:00:00" for 4 PM ET),
                               or "" for now
             duration_str:     How far back: "1 D", "1 W", "1 M", "1 Y", etc.
             bar_size_setting: Bar width: "1 day", "1 hour", "5 mins", etc.
@@ -862,6 +863,65 @@ class PluginBase(ABC):
             return None
 
         return result.get("bars", [])
+
+    def subscribe_live_bars(
+        self,
+        contract,
+        on_bar: Callable,
+        duration_str: str = "1 D",
+        bar_size_setting: str = "5 mins",
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+    ) -> Optional[int]:
+        """
+        Subscribe to live bar updates using reqHistoricalData(keepUpToDate=True).
+
+        Unlike reqRealTimeBars this works without a live market data subscription
+        — it uses the historical data feed which is available on paper accounts.
+
+        IB delivers bars via:
+          historicalData     — initial backfill bars (already-completed bars)
+          historicalDataUpdate — each new bar as it completes going forward
+
+        Both call on_bar(bar) with ibapi BarData objects (date, open, high,
+        low, close, volume, wap, barCount).
+
+        Args:
+            contract:         IB Contract (use ContractBuilder helpers)
+            on_bar:           Callback(bar) called for each bar (backfill + live)
+            duration_str:     How far back to seed: "1 D", "2 D", etc.
+            bar_size_setting: Bar width: "5 mins", "1 hour", "1 day", etc.
+            what_to_show:     TRADES, MIDPOINT, BID, ASK
+            use_rth:          Regular trading hours only
+
+        Returns:
+            req_id to pass to cancel_live_bars(), or None on error.
+        """
+        if not self.portfolio:
+            logger.warning(f"Plugin '{self.name}': no portfolio for live bars")
+            return None
+
+        req_id = self.portfolio.request_historical_data(
+            contract=contract,
+            duration_str=duration_str,
+            bar_size_setting=bar_size_setting,
+            what_to_show=what_to_show,
+            use_rth=use_rth,
+            on_bar=on_bar,
+            on_end=None,          # no on_end — keeps subscription alive
+            keep_up_to_date=True,
+        )
+        logger.info(
+            f"Plugin '{self.name}': live bar subscription req_id={req_id} "
+            f"({bar_size_setting}, keepUpToDate=True)"
+        )
+        return req_id
+
+    def cancel_live_bars(self, req_id: int) -> None:
+        """Cancel a live bar subscription started with subscribe_live_bars."""
+        if self.portfolio and req_id is not None:
+            self.portfolio.cancel_historical_data(req_id)
+            logger.info(f"Plugin '{self.name}': cancelled live bars req_id={req_id}")
 
     def get_contract_details(
         self,

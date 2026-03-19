@@ -708,7 +708,7 @@ calls from different plugins never share data.
 ```python
 bars = self.get_historical_data(
     contract=ContractBuilder.us_stock("AAPL", primary_exchange="NASDAQ"),
-    end_date_time="",           # "" = now; or "YYYYMMDD HH:MM:SS [tz]"
+    end_date_time="",           # "" = now; or "YYYYMMDD-HH:MM:SS" in UTC
     duration_str="1 W",         # "N S|D|W|M|Y"  (Seconds/Days/Weeks/Months/Years)
     bar_size_setting="1 day",   # see Bar Size table below
     what_to_show="TRADES",      # TRADES | MIDPOINT | BID | ASK | ADJUSTED_LAST | etc.
