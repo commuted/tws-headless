@@ -48,7 +48,9 @@ Usage:
     ./ibctl.py plugin message NAME_OR_ID JSON  # Send arbitrary message to plugin
     ./ibctl.py pause                           # Pause execution
     ./ibctl.py resume                          # Resume execution
-    ./ibctl.py stop                            # Shutdown the server
+    ./ibctl.py ping                            # Test server connectivity
+    ./ibctl.py stop                            # Shutdown the server gracefully
+    ./ibctl.py shutdown                        # Shutdown the server (alias for stop)
 """
 
 import argparse
@@ -334,7 +336,9 @@ Commands:
   reconcile            Sync plugin holdings with IB account
   pause                Pause algorithm/plugin execution
   resume               Resume algorithm/plugin execution
+  ping                 Test server connectivity
   stop                 Shutdown the server gracefully
+  shutdown             Shutdown the server gracefully (alias for stop)
 
 Examples:
   ./ibctl.py status

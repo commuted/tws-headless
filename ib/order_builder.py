@@ -593,14 +593,14 @@ class OrderFactory:
 
     @staticmethod
     def set_good_till_date(order: Order, gtd: str) -> Order:
-        """Set good-till-date on an order (format: YYYYMMDD HH:mm:ss timezone)."""
+        """Set good-till-date on an order (format: YYYYMMDD-HH:MM:SS in UTC)."""
         order.goodTillDate = gtd
         order.tif = "GTD"
         return order
 
     @staticmethod
     def set_good_after_time(order: Order, gat: str) -> Order:
-        """Set good-after-time on an order (format: YYYYMMDD HH:mm:ss timezone)."""
+        """Set good-after-time on an order (format: YYYYMMDD-HH:MM:SS in UTC)."""
         order.goodAfterTime = gat
         return order
 
