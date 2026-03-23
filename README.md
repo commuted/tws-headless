@@ -2,7 +2,7 @@
 
 A headless, plugin-based algorithmic trading engine for Interactive Brokers. Connects to TWS or IB Gateway over the IB API, streams real-time market data, routes it to plugins, executes trade signals, and exposes a Unix socket command interface for external control.
 
-📖 **[Wiki](https://github.com/commuted/tws-headless/wiki)** — [Theory of Operation](https://github.com/commuted/tws-headless/wiki/Theory-of-Operation) · [CLI Task Guide](https://github.com/commuted/tws-headless/wiki/CLI) · [Plugin Design](https://github.com/commuted/tws-headless/wiki/Plugin-Design) · [Plugin Manual](https://github.com/commuted/tws-headless/wiki/Plugin-Manual)
+📖 **[Wiki](https://github.com/commuted/tws-headless/wiki)** — [Theory of Operation](https://github.com/commuted/tws-headless/wiki/Theory-of-Operation) · [CLI Task Guide](https://github.com/commuted/tws-headless/wiki/CLI) · [Plugin Design](https://github.com/commuted/tws-headless/wiki/Plugin-Design) · [Plugin Manual](https://github.com/commuted/tws-headless/wiki/Plugin-Manual) · [Bar Store](https://github.com/commuted/tws-headless/wiki/Bar-Store)
 
 ## Requirements
 
@@ -87,6 +87,16 @@ Sends commands to a running engine over the Unix socket.
 ./ibctl.py transfer cash     _unassigned my_plugin 10000 --confirm
 ./ibctl.py transfer position _unassigned my_plugin SPY 50 --confirm
 
+# Historical bar data — always saved to historical/bars.db (default)
+./ibctl.py historical fetch GLD                                        # 1 W daily bars
+./ibctl.py historical fetch GLD --bar-size "5 mins" --duration "2 D"  # 5-min bars
+./ibctl.py historical fetch EUR --type forex --what MIDPOINT --no-rth
+./ibctl.py historical coverage                  # what is cached
+./ibctl.py historical coverage --symbol GLD
+./ibctl.py historical purge --symbol GLD --bar-size "5 mins"
+./ibctl.py historical get-db                    # show current DB path
+./ibctl.py historical set-db /data/bars.db      # change DB path (persisted)
+
 # Engine control
 ./ibctl.py pause
 ./ibctl.py resume
@@ -160,6 +170,7 @@ ib/                     Core engine package
   order_reconciler.py   Nets signals from multiple plugins before placing orders
   message_bus.py        Pub/sub broker for inter-plugin communication
   execution_db.py       SQLite trade/execution log
+  bar_store.py          SQLite historical bar cache with coverage tracking and gap detection
   rate_limiter.py       Token-bucket rate limiting (10 orders/sec default)
   contract_builder.py   Contract construction (stocks, options, futures, forex…)
   order_builder.py      Order type construction
@@ -201,12 +212,15 @@ The test suite mocks the `ibapi` package so no IB connection is required.
 
 ## Paper Trading Tests
 
-`plugins/paper_tests/paper_test_orders_6/` is a round-trip integration test suite that places real orders on a paper account and verifies fills, cancellations, and order type behaviour. Run manually:
+End-to-end integration tests run against a live paper account. Each test plugin is loaded, started, and asked to `run_tests`; results are saved and reported. Use `run_paper_tests.py` to drive them:
 
 ```bash
-./ibctl.py plugin load  plugins.paper_tests.paper_test_orders_6
-./ibctl.py plugin start paper_test_orders_6
-./ibctl.py plugin request paper_test_orders_6 run_tests --timeout 1800
+python run_paper_tests.py              # order tests 1–5
+python run_paper_tests.py --historical # historical data API tests
+python run_paper_tests.py --bar-store  # BarStore cache end-to-end tests
+python run_paper_tests.py --all        # everything
 ```
+
+`--bar-store` runs `plugins/paper_tests/paper_test_bar_store/` against a live paper account, verifying cold fetch, cache hits, gap fill, force refetch, coverage tracking, purge, multi-symbol isolation, and OHLC validity (9 tests).
 
 Or schedule at market open via `run_paper_tests.sh` (requires TWS/Gateway to be running).

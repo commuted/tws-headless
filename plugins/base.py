@@ -302,6 +302,9 @@ class PluginResult:
         return [s for s in self.signals if s.is_actionable]
 
 
+# Default path to the shared BarStore database
+_DEFAULT_HIST_DB = Path(__file__).parent.parent / "historical" / "bars.db"
+
 # =============================================================================
 # Base Plugin Class
 # =============================================================================
@@ -412,6 +415,7 @@ class PluginBase(ABC):
         self._instruments_file = self._base_path / "instruments.json"
         self._holdings_file = self._base_path / "holdings.json"
         self._state_file = self._base_path / "state.json"
+        self._account_id: str = ""
 
         # Data stores
         self._instruments: Dict[str, PluginInstrument] = {}
@@ -427,6 +431,26 @@ class PluginBase(ABC):
 
         # PluginExecutive reference (set on registration)
         self._executive = None
+
+    def set_account(self, account_id: str) -> None:
+        """Re-root _base_path to include account subfolder. Call before load()."""
+        self._account_id = account_id
+        plugin_dir = Path(os.environ.get("IB_PLUGIN_DIR", Path(__file__).parent))
+        self._base_path        = plugin_dir / self.slot / account_id
+        self._instruments_file = self._base_path / "instruments.json"
+        self._holdings_file    = self._base_path / "holdings.json"
+        self._state_file       = self._base_path / "state.json"
+
+    @property
+    def _bar_store(self):
+        if not hasattr(self, "_bar_store_instance"):
+            try:
+                from ib.bar_store import BarStore
+                db = Path(os.environ.get("IB_HIST_DB", str(_DEFAULT_HIST_DB)))
+                self._bar_store_instance = BarStore(db)
+            except Exception:
+                self._bar_store_instance = None
+        return self._bar_store_instance
 
     # =========================================================================
     # Lifecycle State Property
@@ -901,13 +925,24 @@ class PluginBase(ABC):
             logger.warning(f"Plugin '{self.name}': no portfolio for live bars")
             return None
 
+        symbol = contract.symbol
+        store  = self._bar_store
+
+        def _caching_on_bar(bar):
+            on_bar(bar)          # user callback first — never block live trading
+            if store:
+                try:
+                    store.insert_bar(symbol, bar_size_setting, what_to_show, use_rth, bar)
+                except Exception:
+                    pass
+
         req_id = self.portfolio.request_historical_data(
             contract=contract,
             duration_str=duration_str,
             bar_size_setting=bar_size_setting,
             what_to_show=what_to_show,
             use_rth=use_rth,
-            on_bar=on_bar,
+            on_bar=_caching_on_bar,
             on_end=None,          # no on_end — keeps subscription alive
             keep_up_to_date=True,
         )
@@ -922,6 +957,50 @@ class PluginBase(ABC):
         if self.portfolio and req_id is not None:
             self.portfolio.cancel_historical_data(req_id)
             logger.info(f"Plugin '{self.name}': cancelled live bars req_id={req_id}")
+
+    def get_bars_cached(
+        self,
+        contract,
+        start_dt: datetime,
+        end_dt: datetime,
+        bar_size_setting: str = "5 mins",
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+        force: bool = False,
+    ) -> list:
+        """Like get_historical_data but backed by BarStore (no re-fetch if cached)."""
+        from ib.bar_store import duration_str as _dur_str
+        store = self._bar_store
+        if store is None:
+            return self.get_historical_data(
+                contract=contract,
+                end_date_time=end_dt.strftime("%Y%m%d-%H:%M:%S"),
+                duration_str=_dur_str(start_dt, end_dt),
+                bar_size_setting=bar_size_setting,
+                what_to_show=what_to_show,
+                use_rth=use_rth,
+            ) or []
+
+        def fetch_fn(s, e):
+            return self.get_historical_data(
+                contract=contract,
+                end_date_time=e.strftime("%Y%m%d-%H:%M:%S"),
+                duration_str=_dur_str(s, e),
+                bar_size_setting=bar_size_setting,
+                what_to_show=what_to_show,
+                use_rth=use_rth,
+            ) or []
+
+        return store.get_bars(
+            symbol=contract.symbol,
+            bar_size=bar_size_setting,
+            what_to_show=what_to_show,
+            use_rth=use_rth,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            fetch_fn=fetch_fn,
+            force=force,
+        )
 
     def get_contract_details(
         self,

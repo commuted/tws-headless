@@ -188,3 +188,10 @@ def get_plugin_store() -> PluginStore:
     if _plugin_store is None:
         _plugin_store = PluginStore()
     return _plugin_store
+
+
+def configure_plugin_store(account_id: str) -> None:
+    """Re-initialise the global PluginStore singleton keyed to account_id."""
+    global _plugin_store
+    db_path = Path.home() / f".ib_plugin_store_{account_id}.db"
+    _plugin_store = PluginStore(db_path)

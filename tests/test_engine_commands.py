@@ -86,11 +86,19 @@ class MockPluginExecutive:
             return None
         p = self._plugins[name]
         return {
+            "name": name,
+            "slot": name,
             "state": p.state,
             "is_system_plugin": getattr(p, "is_system_plugin", False),
             "enabled": p.enabled,
             "run_count": p.run_count,
         }
+
+    def _resolve_plugin(self, name_or_id: str):
+        if name_or_id in self._plugins:
+            config = self._plugins[name_or_id]
+            return name_or_id, config
+        return None, None
 
     def get_holdings_summary(self) -> Dict[str, Any]:
         return {
@@ -162,6 +170,8 @@ class MockEngine:
         self.plugin_executive: Optional[MockPluginExecutive] = None
         self._paused = False
         self._stopped = False
+        self._loop = None           # no running loop in tests
+        self._shutdown_event = Mock()  # fallback path in handle_stop
 
     def get_status(self) -> Dict[str, Any]:
         return {
@@ -558,11 +568,11 @@ class TestEngineCommandHandlerStop:
         self.handler = EngineCommandHandler(self.engine)
 
     def test_stop(self):
-        """Test stop command"""
+        """Test stop command — no live event loop, so fallback sets shutdown event."""
         result = self.handler.handle_stop([])
         assert result.status == CommandStatus.SUCCESS
         assert "Shutdown" in result.message
-        assert self.engine._stopped == True
+        self.engine._shutdown_event.set.assert_called_once()
 
 
 class TestEngineCommandHandlerPlugin:
@@ -829,6 +839,8 @@ class TestEnginePluginDump:
 
         # Set up plugin objects with get_effective_holdings
         mock_plugin = Mock()
+        mock_plugin.name = "momentum_5day"
+        mock_plugin.slot = "momentum_5day"
         mock_plugin.get_effective_holdings.return_value = {
             "plugin": "momentum_5day",
             "cash": 5000.0,
@@ -849,6 +861,8 @@ class TestEnginePluginDump:
         )
 
         mock_plugin2 = Mock()
+        mock_plugin2.name = "mean_reversion"
+        mock_plugin2.slot = "mean_reversion"
         mock_plugin2.get_effective_holdings.return_value = {
             "plugin": "mean_reversion",
             "cash": 3000.0,

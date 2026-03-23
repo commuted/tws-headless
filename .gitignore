@@ -44,3 +44,7 @@ env_claude
 plugins/*/state.json
 plugins/*/holdings.json
 plugins/_unassigned/
+
+# Historical bar data (runtime cache, not source)
+historical/*.db
+historical/config.json
