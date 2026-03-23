@@ -230,6 +230,16 @@ def main():
     # Callbacks
     def on_started():
         logger.info("Engine started successfully")
+
+        # Configure per-account state before reconciliation and auto-reload
+        if engine.portfolio and engine.portfolio.managed_accounts:
+            account_id = engine.portfolio.managed_accounts[0]
+            logger.info(f"Active account: {account_id}")
+            from .plugin_store import configure_plugin_store
+            configure_plugin_store(account_id)
+            if engine.plugin_executive:
+                engine.plugin_executive.set_account(account_id)
+
         if command_server:
             if command_server.start():
                 logger.info(f"Command server listening on {args.socket}")
@@ -322,6 +332,7 @@ class EngineCommandHandler:
         server.register_handler("order", self.handle_order)
         server.register_handler("transfer", self.handle_transfer)
         server.register_handler("reconcile", self.handle_reconcile)
+        server.register_handler("historical", self.handle_historical)
 
         server.register_handler("plugin", self.handle_plugin)
 
@@ -1255,6 +1266,153 @@ class EngineCommandHandler:
                 message=f"Reconciliation failed: {e}",
             )
 
+    def handle_historical(self, args: List[str]):
+        """
+        Handle 'historical' command — fetch bar data from IB and return as JSON.
+
+        Usage:
+            historical fetch SYMBOL [options]
+
+        Options:
+            --bar-size X     Bar width with spaces replaced by _: 5_mins, 1_hour,
+                             1_day (default: 1_day)
+            --duration X     How far back: 1_D, 1_W, 1_M, 1_Y (default: 1_W)
+            --end DATETIME   End date as YYYYMMDD-HH:MM:SS UTC (default: now)
+            --what X         TRADES, MIDPOINT, BID, ASK (default: TRADES)
+            --no-rth         Include extended-hours bars
+            --type X         Contract type: etf (default), stock, forex
+
+        Returns bars as JSON with keys:
+            symbol, bar_size, duration, what_to_show, use_rth,
+            fetch_start_utc, fetch_end_utc, bars (list of dicts), count
+        """
+        import threading
+        from datetime import datetime, timezone, timedelta
+        from .command_server import CommandResult, CommandStatus
+
+        if not args or args[0].lower() != "fetch":
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=(
+                    "Usage: historical fetch SYMBOL [--bar-size X] [--duration X] "
+                    "[--end DATETIME] [--what X] [--no-rth] [--type etf|stock|forex]"
+                ),
+            )
+
+        if len(args) < 2:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="historical fetch requires a SYMBOL argument",
+            )
+
+        symbol = args[1].upper()
+
+        # Parse flags
+        bar_size       = "1 day"
+        duration       = "1 W"
+        end_date_time  = ""
+        what_to_show   = "TRADES"
+        use_rth        = True
+        contract_type  = "etf"
+
+        i = 2
+        while i < len(args):
+            a = args[i]
+            if a == "--bar-size" and i + 1 < len(args):
+                bar_size = args[i + 1].replace("_", " ")
+                i += 2
+            elif a == "--duration" and i + 1 < len(args):
+                duration = args[i + 1].replace("_", " ")
+                i += 2
+            elif a == "--end" and i + 1 < len(args):
+                end_date_time = args[i + 1]
+                i += 2
+            elif a == "--what" and i + 1 < len(args):
+                what_to_show = args[i + 1]
+                i += 2
+            elif a == "--no-rth":
+                use_rth = False
+                i += 1
+            elif a == "--type" and i + 1 < len(args):
+                contract_type = args[i + 1].lower()
+                i += 2
+            else:
+                i += 1
+
+        portfolio = self.engine.portfolio
+        if not portfolio or not portfolio.connected:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Not connected to IB",
+            )
+
+        # Build contract
+        from .contract_builder import ContractBuilder
+        if contract_type == "stock":
+            contract = ContractBuilder.us_stock(symbol)
+        elif contract_type == "forex":
+            contract = ContractBuilder.forex(symbol)
+        else:
+            contract = ContractBuilder.etf(symbol)
+
+        # Blocking fetch
+        done   = threading.Event()
+        holder: dict = {}
+
+        def on_end(bars, start, end):
+            holder["bars"] = bars
+            done.set()
+
+        fetch_start_utc = datetime.now(timezone.utc)
+        portfolio.request_historical_data(
+            contract=contract,
+            end_date_time=end_date_time,
+            duration_str=duration,
+            bar_size_setting=bar_size,
+            what_to_show=what_to_show,
+            use_rth=use_rth,
+            on_end=on_end,
+        )
+
+        if not done.wait(120.0):
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Timeout waiting for historical data (120s)",
+            )
+
+        fetch_end_utc = datetime.now(timezone.utc)
+        bars = holder.get("bars") or []
+
+        bar_dicts = [
+            {
+                "date":      str(b.date),
+                "open":      float(b.open),
+                "high":      float(b.high),
+                "low":       float(b.low),
+                "close":     float(b.close),
+                "volume":    int(b.volume),
+                "wap":       float(getattr(b, "wap",      0.0)),
+                "bar_count": int(getattr(b, "barCount",   0)),
+            }
+            for b in bars
+        ]
+
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"Fetched {len(bar_dicts)} bars for {symbol} ({bar_size}, {duration})",
+            data={
+                "symbol":          symbol,
+                "bar_size":        bar_size,
+                "duration":        duration,
+                "what_to_show":    what_to_show,
+                "use_rth":         use_rth,
+                "fetch_start_utc": fetch_start_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+                "fetch_end_utc":   fetch_end_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+                "bars":            bar_dicts,
+                "count":           len(bar_dicts),
+            },
+        )
+
     def handle_pause(self, args: List[str]):
         """Handle 'pause' command - pause algorithm/plugin execution"""
         from .command_server import CommandResult, CommandStatus
@@ -1277,10 +1435,16 @@ class EngineCommandHandler:
 
     def handle_stop(self, args: List[str]):
         """Handle 'stop' or 'shutdown' command"""
+        import asyncio
         from .command_server import CommandResult, CommandStatus
 
         logger.info("Shutdown requested via command")
-        self.engine.stop()
+        loop = getattr(self.engine, "_loop", None)
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self.engine.stop(), loop)
+        else:
+            # Fallback: set shutdown event directly if loop isn't captured yet
+            self.engine._shutdown_event.set()
 
         return CommandResult(
             status=CommandStatus.SUCCESS,
@@ -1308,24 +1472,32 @@ class EngineCommandHandler:
         pe = self.engine.plugin_executive
 
         if subcommand == "list":
-            plugin_names = pe.plugins  # List of plugin names
+            plugin_names = pe.plugins  # List of plugin instance IDs
             status_list = {}
             lines = []
-            for name in sorted(plugin_names):
-                status = pe.get_plugin_status(name)
+            for iid in sorted(plugin_names):
+                status = pe.get_plugin_status(iid)
                 if status:
                     is_system = status.get("is_system_plugin", False)
                     state = status["state"]
                     enabled = status["enabled"]
+                    plugin_name = status["name"]
+                    slot = status["slot"]
+                    short_id = iid[:8]
 
-                    # Format: name [STATE] (system) enabled/disabled
-                    parts = [f"  {name:<20} [{state}]"]
+                    # Display label: "name" or "name:slot" if slot differs
+                    label = plugin_name if slot == plugin_name else f"{plugin_name}:{slot}"
+
+                    # Format: label  short-uuid  [STATE] (system) enabled/disabled
+                    parts = [f"  {label:<24} {short_id}  [{state}]"]
                     if is_system:
                         parts.append("(system)")
                     parts.append("enabled" if enabled else "disabled")
                     lines.append(" ".join(parts))
 
-                    status_list[name] = {
+                    status_list[iid] = {
+                        "name": plugin_name,
+                        "slot": slot,
                         "state": state,
                         "is_system_plugin": is_system,
                         "enabled": enabled,
@@ -1431,20 +1603,25 @@ class EngineCommandHandler:
                 message=f"Plugin '{subargs[0]}' not found",
             )
 
-        elif subcommand == "dump" and subargs:
-            name = subargs[0]
-            if name not in pe._plugins:
+        elif subcommand == "dump":
+            if not subargs:
                 return CommandResult(
                     status=CommandStatus.ERROR,
-                    message=f"Plugin '{name}' not found",
+                    message="Usage: plugin dump NAME_OR_ID",
+                )
+            iid, config = pe._resolve_plugin(subargs[0])
+            if not config:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Plugin '{subargs[0]}' not found",
                 )
 
-            plugin = pe._plugins[name].plugin
+            plugin = config.plugin
             holdings = plugin.get_effective_holdings()
 
             open_orders = []
             for oid, po in pe._pending_orders.items():
-                if po.plugin_name == name:
+                if po.plugin_name == plugin.name:
                     open_orders.append({
                         "order_id": oid,
                         "symbol": po.signal.symbol,
@@ -1454,6 +1631,7 @@ class EngineCommandHandler:
                         "created_at": po.created_at.isoformat(),
                     })
 
+            name = plugin.slot
             data = {
                 "plugin": name,
                 "cash": holdings.get("cash", 0.0),

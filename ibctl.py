@@ -36,6 +36,16 @@ Usage:
     ./ibctl.py transfer cash _unassigned momentum_5day 10000 --confirm
     ./ibctl.py transfer position _unassigned momentum_5day SPY 50 --confirm
 
+    # Historical bar data — always saved to the configured BarStore DB
+    ./ibctl.py historical fetch GLD            # Fetch 1 week of daily bars
+    ./ibctl.py historical fetch GLD --bar-size "5 mins" --duration "2 D"
+    ./ibctl.py historical fetch EUR --type forex --what MIDPOINT --no-rth
+    ./ibctl.py historical coverage             # what is cached
+    ./ibctl.py historical coverage --symbol GLD
+    ./ibctl.py historical purge --symbol GLD --bar-size "5 mins"
+    ./ibctl.py historical set-db /data/bars.db # change the DB path (persisted)
+    ./ibctl.py historical get-db               # show current DB path
+
     # Plugin/algorithm management
     ./ibctl.py plugin list                     # List all plugins
     ./ibctl.py plugin load PATH                # Load plugin from file
@@ -55,6 +65,7 @@ Usage:
 
 import argparse
 import json
+import os
 import socket
 import sys
 from dataclasses import dataclass, field
@@ -263,6 +274,239 @@ def format_result(result: CommandResult, verbose: bool = False):
                           f"${p['pnl']:>10,.2f} {p['allocation']:>7.1f}%")
 
 
+# =============================================================================
+# Historical data helpers
+# =============================================================================
+
+_IBCTL_DIR     = os.path.dirname(os.path.abspath(__file__))
+_HIST_CONFIG   = os.path.join(_IBCTL_DIR, "historical", "config.json")
+_HIST_DB_DEFAULT = os.path.join(_IBCTL_DIR, "historical", "bars.db")
+
+
+def _historical_db_path() -> str:
+    """Return the configured BarStore DB path, falling back to the default."""
+    if os.path.exists(_HIST_CONFIG):
+        try:
+            with open(_HIST_CONFIG) as f:
+                return json.load(f).get("db_path", _HIST_DB_DEFAULT)
+        except Exception:
+            pass
+    return _HIST_DB_DEFAULT
+
+
+def _historical_set_db(subargs: list) -> None:
+    """Persist a new DB path to historical/config.json."""
+    if not subargs:
+        print("Usage: historical set-db PATH")
+        sys.exit(1)
+    path = os.path.abspath(subargs[0])
+    os.makedirs(os.path.dirname(_HIST_CONFIG), exist_ok=True)
+    with open(_HIST_CONFIG, "w") as f:
+        json.dump({"db_path": path}, f, indent=2)
+    print(f"[OK] Historical DB path set to: {path}")
+
+
+def _historical_fetch(subargs: list, socket_path: str, timeout: float) -> None:
+    """Fetch bars from IB, print them, and save to the configured BarStore DB."""
+    symbol        = None
+    bar_size      = "1 day"
+    duration      = "1 W"
+    end           = ""
+    what          = "TRADES"
+    use_rth       = True
+    contract_type = "etf"
+
+    i = 0
+    while i < len(subargs):
+        a = subargs[i]
+        if a == "--bar-size" and i + 1 < len(subargs):
+            bar_size = subargs[i + 1];              i += 2
+        elif a == "--duration" and i + 1 < len(subargs):
+            duration = subargs[i + 1];              i += 2
+        elif a == "--end" and i + 1 < len(subargs):
+            end = subargs[i + 1];                   i += 2
+        elif a == "--what" and i + 1 < len(subargs):
+            what = subargs[i + 1];                  i += 2
+        elif a == "--type" and i + 1 < len(subargs):
+            contract_type = subargs[i + 1].lower(); i += 2
+        elif a == "--no-rth":
+            use_rth = False;                        i += 1
+        elif not a.startswith("-") and symbol is None:
+            symbol = a.upper();                     i += 1
+        else:
+            i += 1
+
+    if symbol is None:
+        print("Usage: historical fetch SYMBOL [--bar-size X] [--duration X]")
+        print("       [--end YYYYMMDD-HH:MM:SS] [--what TRADES|MIDPOINT|BID|ASK]")
+        print("       [--type etf|stock|forex] [--no-rth]")
+        sys.exit(1)
+
+    db_path = _historical_db_path()
+
+    # Build engine command — spaces in bar_size/duration become _ on the wire
+    engine_parts = [
+        "historical", "fetch", symbol,
+        "--bar-size", bar_size.replace(" ", "_"),
+        "--duration", duration.replace(" ", "_"),
+        "--what",     what,
+        "--type",     contract_type,
+    ]
+    if end:
+        engine_parts += ["--end", end]
+    if not use_rth:
+        engine_parts.append("--no-rth")
+
+    result = send_command(
+        " ".join(engine_parts),
+        socket_path=socket_path,
+        timeout=max(timeout, 120.0),
+    )
+
+    if result.status != CommandStatus.SUCCESS:
+        print(f"[ERROR] {result.message}")
+        sys.exit(1)
+
+    bars = result.data.get("bars", [])
+    print(f"[OK] {result.message}")
+
+    if bars:
+        col = "  {:<22} {:>9} {:>9} {:>9} {:>9} {:>11}"
+        print()
+        print(col.format("Date", "Open", "High", "Low", "Close", "Volume"))
+        print("  " + "-" * 72)
+        show = bars if len(bars) <= 12 else bars[:6] + [None] + bars[-6:]
+        for b in show:
+            if b is None:
+                print("  ...")
+                continue
+            print(col.format(
+                b["date"][:22],
+                f"{b['open']:.2f}",
+                f"{b['high']:.2f}",
+                f"{b['low']:.2f}",
+                f"{b['close']:.2f}",
+                f"{b['volume']:,}",
+            ))
+        print()
+
+    # ── Persist to BarStore ──────────────────────────────────────────────────
+    sys.path.insert(0, _IBCTL_DIR)
+    from ib.bar_store import BarStore, SeriesKey
+    from datetime import datetime, timezone
+    UTC = timezone.utc
+
+    class _Bar:
+        __slots__ = ("date", "open", "high", "low", "close", "volume", "wap", "barCount")
+        def __init__(self, d: dict):
+            self.date     = d["date"]
+            self.open     = d["open"]
+            self.high     = d["high"]
+            self.low      = d["low"]
+            self.close    = d["close"]
+            self.volume   = d["volume"]
+            self.wap      = d.get("wap", 0.0)
+            self.barCount = d.get("bar_count", 0)
+
+    start_iso = result.data.get("fetch_start_utc", "")
+    end_iso   = result.data.get("fetch_end_utc",   "")
+    start_dt  = (
+        datetime.strptime(start_iso, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+        if start_iso else datetime.now(UTC)
+    )
+    end_dt = (
+        datetime.strptime(end_iso, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+        if end_iso else datetime.now(UTC)
+    )
+
+    store = BarStore(db_path)
+    key   = SeriesKey(symbol, bar_size, what, int(use_rth))
+    proxy = [_Bar(d) for d in bars]
+
+    with store._write_lock:
+        n = store._store_bars(key, proxy, start_dt, end_dt)
+        store._update_coverage(key, start_dt, end_dt)
+
+    print(f"[DB] Saved {n} bar(s) to {db_path}  [{symbol} / {bar_size} / {what}]")
+
+
+def _historical_coverage(subargs: list) -> None:
+    """Print coverage summary for the configured BarStore DB."""
+    symbol = None
+    i = 0
+    while i < len(subargs):
+        if subargs[i] == "--symbol" and i + 1 < len(subargs):
+            symbol = subargs[i + 1].upper(); i += 2
+        else:
+            i += 1
+
+    db_path = _historical_db_path()
+    sys.path.insert(0, _IBCTL_DIR)
+    from ib.bar_store import BarStore
+
+    if not os.path.exists(db_path):
+        print(f"No DB yet at {db_path}")
+        return
+
+    entries = BarStore(db_path).coverage_summary(symbol=symbol)
+    print(f"DB: {db_path}")
+    if not entries:
+        print("No coverage found.")
+        return
+
+    col = "{:<8} {:<10} {:<10} {:<5} {:>6}  {}"
+    print(col.format("Symbol", "BarSize", "What", "RTH", "Bars", "Intervals"))
+    print("-" * 80)
+    for e in entries:
+        ivs = ", ".join(f"{s}..{en}" for s, en in e["intervals"])
+        print(col.format(
+            e["symbol"][:8],
+            e["bar_size"][:10],
+            e["what_to_show"][:10],
+            "Y" if e["use_rth"] else "N",
+            e["total_bars"],
+            ivs[:60],
+        ))
+
+
+def _historical_purge(subargs: list) -> None:
+    """Purge a series from the configured BarStore DB."""
+    symbol   = None
+    bar_size = "1 day"
+    what     = "TRADES"
+    use_rth  = True
+    i = 0
+    while i < len(subargs):
+        a = subargs[i]
+        if a == "--symbol" and i + 1 < len(subargs):
+            symbol = subargs[i + 1].upper(); i += 2
+        elif a == "--bar-size" and i + 1 < len(subargs):
+            bar_size = subargs[i + 1];       i += 2
+        elif a == "--what" and i + 1 < len(subargs):
+            what = subargs[i + 1];           i += 2
+        elif a == "--no-rth":
+            use_rth = False;                 i += 1
+        else:
+            i += 1
+
+    if not symbol:
+        print("Usage: historical purge --symbol SYMBOL [--bar-size X] [--what X] [--no-rth]")
+        sys.exit(1)
+
+    db_path = _historical_db_path()
+    if not os.path.exists(db_path):
+        print(f"[ERROR] DB not found: {db_path}")
+        sys.exit(1)
+
+    sys.path.insert(0, _IBCTL_DIR)
+    from ib.bar_store import BarStore
+
+    deleted = BarStore(db_path).purge(
+        symbol=symbol, bar_size=bar_size, what_to_show=what, use_rth=use_rth,
+    )
+    print(f"[OK] Purged {deleted} bar(s) for {symbol} / {bar_size} / {what} from {db_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Command-line client for TWS Headless",
@@ -332,6 +576,20 @@ Commands:
   algo enable NAME     Enable algorithm
   algo disable NAME    Disable algorithm
   algo trigger NAME    Manually trigger algorithm
+
+  historical fetch SYMBOL [--bar-size X] [--duration X] [--end DATETIME]
+                       [--what TRADES|MIDPOINT|BID|ASK] [--type etf|stock|forex]
+                       [--no-rth]
+                       Fetch bars from IB, print a bar table, and save to the
+                       configured BarStore DB (default: historical/bars.db).
+                       Shell-quote multi-word values: --bar-size "5 mins"
+  historical coverage [--symbol SYMBOL]
+                       Show coverage intervals and bar counts in the DB.
+  historical purge --symbol SYMBOL [--bar-size X] [--what X] [--no-rth]
+                       Delete a series from the DB.
+  historical set-db PATH
+                       Persist a new DB path (stored in historical/config.json).
+  historical get-db    Show the current DB path.
 
   reconcile            Sync plugin holdings with IB account
   pause                Pause algorithm/plugin execution
@@ -406,11 +664,37 @@ Examples:
         help="Request token for tracking/deduplication",
     )
 
-    args = parser.parse_args()
+    args, extra = parser.parse_known_args()
+    # Flags not recognised by the top-level parser (e.g. --bar-size, --db)
+    # are treated as part of the subcommand's argument list.
+    args.command = list(args.command) + extra
 
     if not args.command:
         parser.print_help()
         sys.exit(0)
+        return
+
+    # Historical subcommand — handled locally (coverage/purge) or via engine (fetch)
+    if args.command[0].lower() == "historical":
+        subargs = args.command[1:]
+        if not subargs:
+            print("Usage: historical <fetch|coverage|purge> ...")
+            sys.exit(1)
+        sub = subargs[0].lower()
+        if sub == "fetch":
+            _historical_fetch(subargs[1:], args.socket, args.timeout)
+        elif sub == "coverage":
+            _historical_coverage(subargs[1:])
+        elif sub == "purge":
+            _historical_purge(subargs[1:])
+        elif sub == "set-db":
+            _historical_set_db(subargs[1:])
+        elif sub == "get-db":
+            print(_historical_db_path())
+        else:
+            print(f"Unknown historical subcommand '{sub}'. Use fetch, coverage, purge, set-db, or get-db.")
+            sys.exit(1)
+        return
 
     # Build command string
     command_str = " ".join(args.command)

@@ -765,6 +765,10 @@ class TradingEngine:
             signal.signal(signal.SIGINT, signal_handler)
             signal.signal(signal.SIGTERM, signal_handler)
 
+        # Capture the running loop so handle_stop (which runs in a thread via
+        # asyncio.to_thread) can schedule stop() back onto it.
+        self._loop = asyncio.get_running_loop()
+
         try:
             # Block until shutdown
             while not self._shutdown_event.is_set():

@@ -20,6 +20,7 @@ Complete reference for writing plugins for TWS Headless.
    - 8.4 [Cancelling streams](#84-cancelling-streams)
    - 8.5 [Buffered data accessors](#85-buffered-data-accessors)
 9. [Historical Data](#9-historical-data)
+   - 9.1 [BarStore — persistent bar cache](#91-barstore--persistent-bar-cache)
 10. [MessageBus — Publish / Subscribe](#10-messagebus--publish--subscribe)
 11. [Request Handling](#11-request-handling)
 12. [Trade Signals](#12-trade-signals)
@@ -763,6 +764,84 @@ if bars is None:
 for b in bars:
     logger.info(f"{b.date}  O:{b.open}  H:{b.high}  L:{b.low}  C:{b.close}")
 ```
+
+---
+
+### 9.1 BarStore — persistent bar cache
+
+`ib.bar_store.BarStore` is a SQLite-backed cache that eliminates redundant IB
+requests. It tracks which date ranges have already been fetched (*coverage*),
+computes *gaps*, and only calls IB for the uncovered portions.
+
+**When to use it:**
+- Plugins that need days or weeks of intraday bars at startup — one IB call
+  on first run; instant cache hit on every subsequent restart.
+- Back-testing pipelines that replay stored bars without a live connection.
+- Any workflow where IB pacing limits (60 historical requests/10 min) matter.
+
+**Basic usage inside a plugin:**
+
+```python
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
+from ib.bar_store import BarStore, duration_str
+from ib.contract_builder import ContractBuilder
+
+UTC = ZoneInfo("UTC")
+
+class MyPlugin(PluginBase):
+    def start(self) -> bool:
+        db = self._base_path / "bars.db"          # per-plugin SQLite file
+        self._store = BarStore(db)
+        return True
+
+    def _load_bars(self):
+        end_dt   = datetime.now(UTC)
+        start_dt = end_dt - timedelta(days=30)
+
+        def fetch_fn(s, e):
+            return self.get_historical_data(
+                contract=ContractBuilder.etf("GLD"),
+                end_date_time=e.strftime("%Y%m%d-%H:%M:%S"),
+                duration_str=duration_str(s, e),
+                bar_size_setting="5 mins",
+                what_to_show="TRADES",
+                use_rth=True,
+            ) or []
+
+        bars = self._store.get_bars(
+            symbol="GLD", bar_size="5 mins",
+            what_to_show="TRADES", use_rth=True,
+            start_dt=start_dt, end_dt=end_dt,
+            fetch_fn=fetch_fn,
+        )
+        return bars   # list of BarRecord namedtuples
+```
+
+**`BarStore` API summary:**
+
+| Method | Description |
+|--------|-------------|
+| `BarStore(db_path)` | Open (or create) the SQLite cache at `db_path` |
+| `get_bars(symbol, bar_size, what_to_show, use_rth, start_dt, end_dt, fetch_fn, force=False)` | Return bars for the range; call `fetch_fn` only for uncovered gaps |
+| `coverage_summary(symbol=None)` | List cached series with interval ranges and bar counts |
+| `purge(symbol, bar_size, what_to_show, use_rth)` | Delete all bars and coverage for a series |
+
+**`BarRecord` fields:** `date`, `open`, `high`, `low`, `close`, `volume`, `wap`, `bar_count`
+
+**`duration_str(start_dt, end_dt) → str`** converts a datetime pair to an IB
+`durationStr` (`"N S|D|W|M|Y"`). Use it inside `fetch_fn` to build the correct
+`duration_str` argument for `get_historical_data`.
+
+**`force=True`** bypasses coverage and re-fetches the full range from IB,
+overwriting any cached bars. Use after a corporate action or data correction.
+
+**Chunking:** BarStore automatically splits large gaps into chunks that respect
+IB's per-bar-size maximum fetch window (e.g. 30 days for 5-min bars) so a
+single `get_bars` call spanning years works correctly without pacing errors.
+
+**Thread safety:** each thread gets its own SQLite connection; writes are
+serialised with a mutex.
 
 ---
 
@@ -1838,18 +1917,24 @@ live paper account. It is an operational tool, not a plugin itself.
 ### Usage
 
 ```bash
-# Run all order tests (plugins 1–5 run sequentially, one at a time)
-python run_paper_tests.py
-
-# Run only feed tests (dual-plugin concurrent feed validation)
-python run_paper_tests.py --feeds-only
-
-# Restart the engine between test suites for a clean slate
-python run_paper_tests.py --restart-engine
-
-# Combined: restart engine, then run all tests
-python run_paper_tests.py --restart-engine --all
+python run_paper_tests.py              # order tests 1–5 (default)
+python run_paper_tests.py --feeds      # feed / tick subscription tests
+python run_paper_tests.py --historical # historical data API tests
+python run_paper_tests.py --bar-store  # BarStore end-to-end tests
+python run_paper_tests.py --all        # feeds + historical + bar-store + orders 1–5 + orders 6
+python run_paper_tests.py --restart-engine        # graceful engine restart before running
+python run_paper_tests.py --restart-engine --all  # clean slate, then everything
 ```
+
+| Flag | Plugin(s) | What it tests |
+|------|-----------|---------------|
+| *(default)* | `paper_test_orders_1` … `_5` | Order placement and fill verification |
+| `--feeds` | `paper_test_feeds` | Real-time tick and bar subscriptions |
+| `--historical` | `paper_test_historical` | `get_historical_data()` across bar sizes |
+| `--bar-store` | `paper_test_bar_store` | BarStore cold fetch, cache hits, gap fill, force refetch, coverage, purge, multi-symbol, OHLC validity |
+| `--orders6` | `paper_test_orders_6` | Round-trip order lifecycle (IOC, GTC, Adaptive, Iceberg) |
+| `--open` | `paper_test_orders_open` | MOO / LOO / At-Auction — submit before 09:25 ET |
+| `--close` | `paper_test_orders_close` | MOC / LOC — submit before 15:50 ET |
 
 ### `--restart-engine`
 

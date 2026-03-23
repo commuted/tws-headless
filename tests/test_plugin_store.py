@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from ib.plugin_store import PluginStore, get_plugin_store
+from ib.plugin_store import PluginStore, get_plugin_store, configure_plugin_store
 
 
 # =============================================================================
@@ -193,3 +193,51 @@ class TestPluginRegistry:
                 "SELECT version FROM schema_versions WHERE component = 'plugin_store'"
             ).fetchone()
         assert row[0] == 3
+
+
+# =============================================================================
+# 6. configure_plugin_store — account-keyed singleton
+# =============================================================================
+
+
+class TestConfigurePluginStore:
+    def test_creates_account_keyed_db_path(self, tmp_path, monkeypatch):
+        """configure_plugin_store should use ~/.ib_plugin_store_{account}.db."""
+        import ib.plugin_store as ps
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        configure_plugin_store("DU1234567")
+        expected = tmp_path / ".ib_plugin_store_DU1234567.db"
+        assert ps._plugin_store.db_path == expected
+
+    def test_replaces_singleton(self, monkeypatch):
+        """After configure_plugin_store, get_plugin_store returns the new instance."""
+        import ib.plugin_store as ps
+        original = ps._plugin_store
+        configure_plugin_store("DU9999999")
+        new_store = ps._plugin_store
+        assert new_store is not original
+
+    def test_live_and_paper_get_different_stores(self, tmp_path, monkeypatch):
+        """Paper and live accounts must produce distinct DB paths."""
+        import ib.plugin_store as ps
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+        configure_plugin_store("DU1234567")
+        paper_path = ps._plugin_store.db_path
+
+        configure_plugin_store("U1234567")
+        live_path = ps._plugin_store.db_path
+
+        assert paper_path != live_path
+        assert "DU1234567" in str(paper_path)
+        assert "U1234567"  in str(live_path)
+
+    def test_new_store_is_functional(self, tmp_path, monkeypatch):
+        """The store created by configure_plugin_store should accept registry writes."""
+        import ib.plugin_store as ps
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        configure_plugin_store("DU0000001")
+        store = get_plugin_store()
+        ok = store.upsert_registry("myslot", "/plugins/foo.py", "1.0", "unloaded")
+        assert ok
+        assert store.get_registry_entry("myslot") is not None

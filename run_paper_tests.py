@@ -68,6 +68,13 @@ HISTORICAL_PLUGIN = {
     "timeout": 300.0,
 }
 
+BAR_STORE_PLUGIN = {
+    "name": "paper_test_bar_store",
+    "module": "plugins.paper_tests.paper_test_bar_store",
+    "label": "BarStore End-to-End Tests",
+    "timeout": 600.0,
+}
+
 # Pair run together to test StreamManager shared-subscription paths
 DUAL_FEED_PLUGINS = [
     FEED_PLUGIN,
@@ -391,6 +398,18 @@ def _fmt_historical_results(results: List[Dict]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_bar_store_results(results: List[Dict]) -> str:
+    lines = []
+    col = "{:<25} {:<6} {}"
+    lines.append(col.format("Test", "Pass?", "Notes / Error"))
+    lines.append("-" * 80)
+    for r in results:
+        passed = "PASS" if r.get("passed") else "FAIL"
+        detail = r.get("error_message") or r.get("notes", "")
+        lines.append(col.format(r.get("test_name", "?")[:25], passed, detail[:55]))
+    return "\n".join(lines)
+
+
 def _fmt_feed_results(results: List[Dict]) -> str:
     lines = []
     col = "{:<30} {:<8} {:<8} {:<8} {}"
@@ -610,6 +629,8 @@ def run_plugin(plugin_info: Dict, socket_path: str, timeout: float, dry_run: boo
             print(_fmt_historical_results(results))
         elif "category" in first:
             print(_fmt_interface_results(results))
+        elif "notes" in first and "feed_type" not in first:
+            print(_fmt_bar_store_results(results))
         else:
             print(_fmt_feed_results(results))
         print()
@@ -656,6 +677,12 @@ def main():
         "--historical",
         action="store_true",
         help="Run the paper_test_historical plugin",
+    )
+    parser.add_argument(
+        "--bar-store",
+        action="store_true",
+        dest="bar_store",
+        help="Run the paper_test_bar_store plugin",
     )
     parser.add_argument(
         "--interface",
@@ -745,7 +772,7 @@ def main():
 
     if args.run_all:
         plugins_to_run = (
-            [INTERFACE_PLUGIN, FEED_PLUGIN, HISTORICAL_PLUGIN]
+            [INTERFACE_PLUGIN, FEED_PLUGIN, HISTORICAL_PLUGIN, BAR_STORE_PLUGIN]
             + ORDER_PLUGINS
             + [ORDERS_6_PLUGIN]
         )
@@ -761,6 +788,8 @@ def main():
         plugins_to_run = [FEED_PLUGIN]
     elif args.historical:
         plugins_to_run = [HISTORICAL_PLUGIN]
+    elif args.bar_store:
+        plugins_to_run = [BAR_STORE_PLUGIN]
     elif args.only:
         for n in args.only:
             if 1 <= n <= len(ORDER_PLUGINS):

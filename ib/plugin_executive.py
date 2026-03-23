@@ -641,6 +641,9 @@ class PluginExecutive:
         # Auto-save tracking
         self._last_auto_save: Optional[datetime] = None
 
+        # Active account (set by run_engine after connect)
+        self._account: str = ""
+
         # Callbacks
         self.on_signal: Optional[Callable[[str, TradeSignal], None]] = None
         self.on_execution: Optional[Callable[[ExecutionResult], None]] = None
@@ -1787,6 +1790,10 @@ class PluginExecutive:
             # Set up MessageBus
             plugin.set_message_bus(self.message_bus)
 
+            # Root state paths under the active account before loading
+            if self._account:
+                plugin.set_account(self._account)
+
             # Load plugin data (instruments, holdings)
             if not plugin.load():
                 logger.error(f"Failed to load plugin data for {plugin.name}")
@@ -1978,6 +1985,8 @@ class PluginExecutive:
         """
         if not plugin.is_loaded:
             logger.warning(f"Plugin '{plugin.name}' not loaded, loading now...")
+            if self._account:
+                plugin.set_account(self._account)
             if not plugin.load():
                 logger.error(f"Failed to load plugin '{plugin.name}'")
                 return False
@@ -2011,6 +2020,10 @@ class PluginExecutive:
             f"mode={execution_mode.value}, timeframe={bar_timeframe.value})"
         )
         return True
+
+    def set_account(self, account_id: str) -> None:
+        """Set the active account. Future plugin loads will be rooted under this account."""
+        self._account = account_id
 
     def unregister_plugin(self, name: str) -> bool:
         """
