@@ -18,9 +18,11 @@ Complete reference for writing plugins for TWS Headless.
    - 8.2 [Tick-by-tick data](#82-tick-by-tick-data-reqtickbytick)
    - 8.3 [Market depth (L2)](#83-market-depth-l2-reqmktdepth)
    - 8.4 [Cancelling streams](#84-cancelling-streams)
-   - 8.5 [Buffered data accessors](#85-buffered-data-accessors)
+   - 8.5 [Live bar subscriptions with auto-caching](#85-live-bar-subscriptions-with-auto-caching-subscribe_live_bars)
+   - 8.6 [Buffered data accessors](#86-buffered-data-accessors)
 9. [Historical Data](#9-historical-data)
    - 9.1 [BarStore — persistent bar cache](#91-barstore--persistent-bar-cache)
+   - 9.2 [`get_bars_cached()` — BarStore-backed convenience method](#92-get_bars_cached--barstore-backed-convenience-method)
 10. [MessageBus — Publish / Subscribe](#10-messagebus--publish--subscribe)
 11. [Request Handling](#11-request-handling)
 12. [Trade Signals](#12-trade-signals)
@@ -231,6 +233,33 @@ log prefixes, file paths, MessageBus publisher identity.
 | `self._executive` | `PluginExecutive \| None` | Set by executive at load time |
 | `self._base_path` | `Path` | Directory for all plugin files |
 
+### Account-keyed storage
+
+When running against multiple IB accounts (paper + live), call
+`set_account(account_id)` **before** `load()` to isolate all plugin files
+under an account subfolder:
+
+```
+plugins/my_plugin/DU1234567/state.json       ← paper account
+plugins/my_plugin/U9876543/state.json        ← live account
+```
+
+```python
+plugin = MyPlugin()
+plugin.set_account("U9876543")   # re-roots _base_path to plugins/my_plugin/U9876543/
+plugin.load()
+```
+
+The engine does this automatically using the account reported by IB at
+connect time — you do not need to call it yourself. `self._account_id`
+holds the current value (`""` if not set).
+
+The per-account plugin registry (`~/.ib_plugin_store_<account_id>.db`) is
+also switched automatically, so paper and live accounts maintain independent
+auto-reload lists.
+
+---
+
 ### Slots — multiple instances of the same class
 
 `self.slot` is the key used for SQLite state/holdings and CLI addressing.
@@ -274,6 +303,9 @@ STOPPED
 UNLOADED
 ```
 
+> **CLI display note:** `STARTED` is displayed as `running` in `plugin list` and `plugin status` output.
+> `LOADED`, `FROZEN`, `STOPPED`, and `ERROR` are shown as-is.
+
 ### `start(self) -> bool`
 
 Called once after load. Set up streams, subscribe to MessageBus channels,
@@ -306,6 +338,10 @@ def stop(self) -> bool:
     self.save_state({"counter": self._counter})
     return True
 ```
+
+> **Idempotency:** `plugin stop` succeeds even if the plugin is already in
+> `loaded` or `stopped` state — it returns `[OK]` without calling `stop()`.
+> Only `started` and `frozen` plugins have their `stop()` method invoked.
 
 ### `freeze(self) -> bool`
 
@@ -668,7 +704,59 @@ cleanup.
 
 ---
 
-### 8.5 Buffered data accessors
+### 8.5 Live bar subscriptions with auto-caching (`subscribe_live_bars`)
+
+A hybrid stream that delivers both a historical backfill and ongoing live
+bar updates, while **automatically caching every bar** to the shared
+`historical/bars.db` BarStore. Ideal for paper accounts or strategies
+that need a rolling window of recent bars without re-fetching on each restart.
+
+```python
+def subscribe_live_bars(
+    self,
+    contract,
+    on_bar: Callable,
+    duration_str: str = "1 D",       # initial backfill window
+    bar_size_setting: str = "5 mins",
+    what_to_show: str = "TRADES",
+    use_rth: bool = True,
+) -> Optional[int]:
+```
+
+IB delivers the backfill bars immediately, then continues delivering bars
+as each new interval closes (`keepUpToDate=True`). Both backfill and live
+bars pass through `on_bar` and are inserted into BarStore automatically.
+
+```python
+class MyPlugin(PluginBase):
+    def start(self) -> bool:
+        self._req = self.subscribe_live_bars(
+            contract=ContractBuilder.etf("GLD"),
+            on_bar=self._on_bar,
+            duration_str="2 D",
+            bar_size_setting="5 mins",
+            what_to_show="MIDPOINT",   # no live subscription required
+            use_rth=True,
+        )
+        return True
+
+    def _on_bar(self, bar) -> None:
+        # bar is ibapi BarData — .date, .open, .high, .low, .close, .volume
+        # Already cached to BarStore before this callback fires
+        self._last_close = bar.close
+
+    def stop(self) -> bool:
+        if self._req is not None:
+            self.portfolio.cancel_historical_data(self._req)
+        return True
+```
+
+Returns the IB request ID (pass to `portfolio.cancel_historical_data()` in
+`stop()`), or `None` on error.
+
+---
+
+### 8.6 Buffered data accessors
 
 The `DataFeed` object (accessible via `self._executive.data_feed` when an
 executive is set) maintains circular buffers for all received data.
@@ -823,6 +911,7 @@ class MyPlugin(PluginBase):
 | Method | Description |
 |--------|-------------|
 | `BarStore(db_path)` | Open (or create) the SQLite cache at `db_path` |
+| `insert_bar(symbol, bar_size, what_to_show, use_rth, bar)` | Insert a single bar into the cache (called automatically by `subscribe_live_bars`) |
 | `get_bars(symbol, bar_size, what_to_show, use_rth, start_dt, end_dt, fetch_fn, force=False)` | Return bars for the range; call `fetch_fn` only for uncovered gaps |
 | `coverage_summary(symbol=None)` | List cached series with interval ranges and bar counts |
 | `purge(symbol, bar_size, what_to_show, use_rth)` | Delete all bars and coverage for a series |
@@ -842,6 +931,59 @@ single `get_bars` call spanning years works correctly without pacing errors.
 
 **Thread safety:** each thread gets its own SQLite connection; writes are
 serialised with a mutex.
+
+---
+
+### 9.2 `get_bars_cached()` — BarStore-backed convenience method
+
+A drop-in replacement for `get_historical_data` that routes through the
+shared BarStore. IB is only called for date ranges not already cached.
+
+```python
+def get_bars_cached(
+    self,
+    contract,
+    start_dt: datetime,
+    end_dt: datetime,
+    bar_size_setting: str = "5 mins",
+    what_to_show: str = "TRADES",
+    use_rth: bool = True,
+    force: bool = False,    # True → bypass cache, re-fetch from IB
+) -> list:
+```
+
+Returns a list of `BarRecord` namedtuples (same fields as `get_bars`).
+
+**When to use:**
+- Warm-up on `start()` — instant on restart if bars are already in cache
+- Any strategy that needs days of intraday history without repeated IB calls
+- Pairs naturally with `subscribe_live_bars`: warm-up fetches from cache,
+  live bars fill it going forward
+
+```python
+from datetime import datetime, timedelta, timezone
+
+UTC = timezone.utc
+
+class MyPlugin(PluginBase):
+    def start(self) -> bool:
+        end_dt   = datetime.now(UTC)
+        start_dt = end_dt - timedelta(days=5)
+
+        bars = self.get_bars_cached(
+            contract=ContractBuilder.etf("SPY"),
+            start_dt=start_dt,
+            end_dt=end_dt,
+            bar_size_setting="5 mins",
+            what_to_show="MIDPOINT",
+            use_rth=True,
+        )
+        logger.info(f"Loaded {len(bars)} bars from cache/IB")
+        return True
+```
+
+If the BarStore is unavailable (import error or DB failure), falls back
+silently to a direct `get_historical_data` call.
 
 ---
 
@@ -1468,11 +1610,12 @@ Plugins are controlled via the `ibctl.py` CLI (or the socket directly).
 # Load a plugin module (finds PluginBase subclass automatically)
 plugin load plugins.my_package.my_plugin
 
-# Lifecycle
+# Lifecycle (NAME_OR_ID accepts plugin name/slot or full instance UUID)
 plugin start  my_plugin
 plugin freeze my_plugin
 plugin resume my_plugin
 plugin stop   my_plugin
+plugin stop   a1b2c3d4-e5f6-7890-abcd-ef1234567890   # by UUID
 
 # Send a custom request
 plugin request my_plugin get_status
@@ -1480,6 +1623,13 @@ plugin request my_plugin set_period '{"period": 14}'
 
 # List all loaded plugins with state
 plugin list
+# Output:
+#   my_plugin   a1b2c3d4  [running] enabled
+#   other       e5f6a7b8  [loaded]  enabled
+
+# Get plugin status (includes full instance UUID)
+plugin status my_plugin
+# Output: Plugin 'my_plugin': running  (id: a1b2c3d4-e5f6-...)
 
 # Show positions and open orders held by a plugin
 plugin dump my_plugin

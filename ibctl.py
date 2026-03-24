@@ -52,6 +52,8 @@ Usage:
     ./ibctl.py plugin load PATH=SLOT           # Load with named instance slot
     ./ibctl.py plugin load PATH DESCRIPTOR     # Load with descriptor
     ./ibctl.py plugin unload NAME_OR_ID        # Unload a plugin
+    ./ibctl.py plugin start NAME_OR_ID         # Start a loaded plugin
+    ./ibctl.py plugin stop NAME_OR_ID          # Stop a running plugin
     ./ibctl.py plugin status NAME_OR_ID        # Get plugin status
     ./ibctl.py plugin dump NAME_OR_ID          # Dump positions & open orders
     ./ibctl.py plugin help NAME_OR_ID          # Show plugin CLI help
@@ -621,6 +623,7 @@ Examples:
   ./ibctl.py plugin help momentum_5day
   ./ibctl.py plugin message momentum_5day '{"action": "set_threshold", "value": 0.5}'
   ./ibctl.py plugin status momentum_5day
+  ./ibctl.py plugin start momentum_5day
   ./ibctl.py plugin stop 78b052d2-17e7-4ee5-ac03-282e0cd05c2b
   ./ibctl.py plugin instruments list spy_momentum
   ./ibctl.py plugin instruments add spy_momentum SPY --weight 1.0

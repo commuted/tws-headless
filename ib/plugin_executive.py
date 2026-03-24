@@ -2104,6 +2104,10 @@ class PluginExecutive:
 
         plugin = config.plugin
 
+        if plugin.state in (PluginState.LOADED, PluginState.STOPPED):
+            logger.info(f"Plugin '{name}' is already stopped (state: {plugin.state.value})")
+            return True
+
         if plugin.state not in (PluginState.STARTED, PluginState.FROZEN):
             logger.warning(
                 f"Plugin '{name}' cannot stop from state {plugin.state.value}"
