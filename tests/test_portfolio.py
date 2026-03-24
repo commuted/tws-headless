@@ -760,7 +760,7 @@ class TestPortfolioLoad:
              patch.object(portfolio_instance, '_calculate_allocations'), \
              patch.object(portfolio_instance, '_fetch_account_summary', new_callable=AsyncMock), \
              patch.object(portfolio_instance, 'request_executions', new_callable=AsyncMock):
-            await portfolio_instance.load()
+            await portfolio_instance.load(timeout=0.01)
 
         assert portfolio_instance._positions == {}
 
@@ -777,7 +777,7 @@ class TestPortfolioLoad:
              patch.object(portfolio_instance, '_calculate_allocations'), \
              patch.object(portfolio_instance, '_fetch_account_summary', new_callable=AsyncMock), \
              patch.object(portfolio_instance, 'request_executions', new_callable=AsyncMock):
-            await portfolio_instance.load()
+            await portfolio_instance.load(timeout=0.01)
 
         mock_req.assert_called_once()
 
@@ -798,7 +798,7 @@ class TestPortfolioLoad:
              patch.object(portfolio_instance, '_calculate_allocations'), \
              patch.object(portfolio_instance, '_fetch_account_summary', new_callable=AsyncMock), \
              patch.object(portfolio_instance, 'request_executions', new_callable=AsyncMock):
-            await portfolio_instance.load(fetch_prices=True)
+            await portfolio_instance.load(fetch_prices=True, timeout=0.01)
 
         mock_fetch.assert_called_once()
 
@@ -815,7 +815,7 @@ class TestPortfolioLoad:
              patch.object(portfolio_instance, '_calculate_allocations'), \
              patch.object(portfolio_instance, '_fetch_account_summary', new_callable=AsyncMock), \
              patch.object(portfolio_instance, 'request_executions', new_callable=AsyncMock):
-            await portfolio_instance.load(fetch_prices=False)
+            await portfolio_instance.load(fetch_prices=False, timeout=0.01)
 
         mock_fetch.assert_not_called()
 
@@ -831,7 +831,7 @@ class TestPortfolioLoad:
              patch.object(portfolio_instance, '_calculate_allocations'), \
              patch.object(portfolio_instance, '_fetch_account_summary', new_callable=AsyncMock) as mock_fetch, \
              patch.object(portfolio_instance, 'request_executions', new_callable=AsyncMock):
-            await portfolio_instance.load(fetch_prices=False, fetch_account=True)
+            await portfolio_instance.load(fetch_prices=False, fetch_account=True, timeout=0.01)
 
         mock_fetch.assert_called_once()
 

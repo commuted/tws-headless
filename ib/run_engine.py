@@ -1479,7 +1479,7 @@ class EngineCommandHandler:
                 status = pe.get_plugin_status(iid)
                 if status:
                     is_system = status.get("is_system_plugin", False)
-                    state = status["state"]
+                    state = "running" if status["state"] == "started" else status["state"]
                     enabled = status["enabled"]
                     plugin_name = status["name"]
                     slot = status["slot"]
@@ -1516,7 +1516,7 @@ class EngineCommandHandler:
             if status:
                 return CommandResult(
                     status=CommandStatus.SUCCESS,
-                    message=f"Plugin '{subargs[0]}': {status['state']}",
+                    message=f"Plugin '{subargs[0]}': {'running' if status['state'] == 'started' else status['state']}  (id: {status.get('instance_id', 'n/a')})",
                     data=status,
                 )
             return CommandResult(

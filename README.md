@@ -107,7 +107,7 @@ Sends commands to a running engine over the Unix socket.
 
 Plugins are Python classes that subclass `PluginBase`. They receive market data, publish signals, and interact with the MessageBus. See the **[Plugin Manual](https://github.com/commuted/tws-headless/wiki/Plugin-Manual)** for the full authoring reference.
 
-Plugins that were running when the engine last stopped are **automatically reloaded on the next start** — no manual `plugin load` / `plugin start` needed. The engine records each instance in `~/.ib_plugin_store.db` and replays their last lifecycle status (`started` → auto-start; `frozen` → load only).
+Plugins that were running when the engine last stopped are **automatically reloaded on the next start** — no manual `plugin load` / `plugin start` needed. The engine records each instance in `~/.ib_plugin_store.db` and replays their last lifecycle status (`running` → auto-start; `frozen` → load only).
 
 ### File layout
 
