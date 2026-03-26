@@ -1828,6 +1828,65 @@ class EngineCommandHandler:
                 message=f"Plugin '{name}' not found or could not be unloaded",
             )
 
+        elif subcommand == "export" and subargs:
+            import json as _json
+            name = subargs[0]
+            file_arg = subargs[1] if len(subargs) > 1 else None
+            data = pe.export_plugin(name)
+            if data is None:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Plugin '{name}' not found",
+                )
+            if file_arg:
+                try:
+                    from pathlib import Path as _Path
+                    _Path(file_arg).write_text(_json.dumps(data, indent=2, default=str))
+                    return CommandResult(
+                        status=CommandStatus.SUCCESS,
+                        message=f"Plugin '{name}' exported to {file_arg}",
+                        data={"file": file_arg, "slot": data["slot"]},
+                    )
+                except Exception as exc:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message=f"Failed to write export file: {exc}",
+                    )
+            # No file — return data inline
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=f"Plugin '{name}' exported",
+                data=data,
+            )
+
+        elif subcommand == "import" and subargs:
+            import json as _json
+            file_arg = subargs[0]
+            slot_override = subargs[1] if len(subargs) > 1 else None
+            try:
+                from pathlib import Path as _Path
+                raw = _Path(file_arg).read_text()
+                data = _json.loads(raw)
+            except Exception as exc:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Failed to read import file: {exc}",
+                )
+            result = pe.import_plugin(data, slot_override=slot_override)
+            if result is None:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Import failed — check engine log for details",
+                )
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=(
+                    f"Imported '{result['plugin_name']}' as slot '{result['slot']}' "
+                    f"({result['instance_id'][:8]})"
+                ),
+                data=result,
+            )
+
         elif subcommand == "instruments" and subargs:
             from plugins.base import PluginInstrument
             isub = subargs[0].lower()
