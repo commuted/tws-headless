@@ -164,12 +164,21 @@ class ConnectionManager:
 
         self.portfolio.register_callback("connectionClosed", on_connection_closed)
 
-        # Detect client-ID-in-use (error 326) so reconnect can rotate the ID
-        def on_ib_error(req_id: int, error_code: int, error_string: str):
+        # Detect error 326 (client ID in use) by patching portfolio.error() at
+        # the instance level.  The callbacks["error"] dict entry is overwritten
+        # by plugin_executive after __init__, so registering a callback there
+        # would be silently lost.  Instance-level patching sits above that dict
+        # and cannot be overwritten.
+        original_error = self.portfolio.error
+
+        def _patched_error(req_id, error_time, error_code, error_string,
+                           advanced_json=""):
+            original_error(req_id, error_time, error_code, error_string,
+                           advanced_json)
             if error_code == 326:
                 self._client_id_in_use = True
 
-        self.portfolio.register_callback("error", on_ib_error)
+        self.portfolio.error = _patched_error
 
         # Handle currentTime for keepalive
         def on_current_time(server_time: int):
