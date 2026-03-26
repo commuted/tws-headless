@@ -117,6 +117,7 @@ class ConnectionManager:
         self._last_connect_time: Optional[datetime] = None
         self._last_keepalive_time: Optional[datetime] = None
         self._keepalive_response_received = asyncio.Event()
+        self._client_id_in_use = False  # Set when IB returns error 326
 
         # Stream preservation
         self._saved_tick_streams: Dict[str, StreamSubscription] = {}
@@ -162,6 +163,13 @@ class ConnectionManager:
             self._handle_disconnection()
 
         self.portfolio.register_callback("connectionClosed", on_connection_closed)
+
+        # Detect client-ID-in-use (error 326) so reconnect can rotate the ID
+        def on_ib_error(req_id: int, error_code: int, error_string: str):
+            if error_code == 326:
+                self._client_id_in_use = True
+
+        self.portfolio.register_callback("error", on_ib_error)
 
         # Handle currentTime for keepalive
         def on_current_time(server_time: int):
@@ -425,9 +433,20 @@ class ConnectionManager:
             except Exception as e:
                 logger.error(f"Reconnection attempt failed: {e}")
 
-            # Increase delay (exponential backoff)
-            delay = min(delay * self.config.reconnect_delay_multiplier,
-                       self.config.reconnect_delay_max)
+            # Error 326: client ID already in use — increment and retry quickly.
+            # Retrying with the same ID will never succeed.
+            if self._client_id_in_use:
+                self._client_id_in_use = False
+                new_id = self.portfolio.client_id + 1
+                self.portfolio.client_id = new_id
+                logger.warning(
+                    f"Client ID in use — switching to client_id={new_id}"
+                )
+                delay = self.config.reconnect_delay_initial
+            else:
+                # Increase delay (exponential backoff)
+                delay = min(delay * self.config.reconnect_delay_multiplier,
+                           self.config.reconnect_delay_max)
 
     def _start_keepalive_task(self):
         """Start keepalive task"""

@@ -257,13 +257,22 @@ def main():
             else:
                 logger.info("Reconciliation complete: holdings match account")
 
-        # Auto-reload plugins from last session
+        # Auto-reload plugins from last session.
+        # Run in a thread so the asyncio event loop stays free for IB socket
+        # I/O — plugin.start() may call get_historical_data() which blocks on
+        # threading.Event.wait(), and AsyncIBTransport needs the loop to deliver
+        # those responses.
         if engine.plugin_executive:
-            result = engine.plugin_executive.reload_registered_plugins()
-            if result["reloaded"]:
-                logger.info(f"Auto-reloaded plugins: {result['reloaded']}")
-            if result["failed"]:
-                logger.warning(f"Failed to reload plugins: {result['failed']}")
+            pe = engine.plugin_executive
+
+            async def _reload_plugins():
+                result = await asyncio.to_thread(pe.reload_registered_plugins)
+                if result["reloaded"]:
+                    logger.info(f"Auto-reloaded plugins: {result['reloaded']}")
+                if result["failed"]:
+                    logger.warning(f"Failed to reload plugins: {result['failed']}")
+
+            asyncio.get_event_loop().create_task(_reload_plugins())
 
         logger.info("Streaming data - press Ctrl+C 3x to stop")
 
@@ -301,6 +310,13 @@ def main():
             return 1
 
     return asyncio.run(_run())
+
+
+_STATE_DISPLAY = {"started": "running", "loaded": "idle"}
+
+
+def _display_state(raw: str) -> str:
+    return _STATE_DISPLAY.get(raw, raw)
 
 
 class EngineCommandHandler:
@@ -1479,7 +1495,7 @@ class EngineCommandHandler:
                 status = pe.get_plugin_status(iid)
                 if status:
                     is_system = status.get("is_system_plugin", False)
-                    state = "running" if status["state"] == "started" else status["state"]
+                    state = _display_state(status["state"])
                     enabled = status["enabled"]
                     plugin_name = status["name"]
                     slot = status["slot"]
@@ -1488,11 +1504,10 @@ class EngineCommandHandler:
                     # Display label: "name" or "name:slot" if slot differs
                     label = plugin_name if slot == plugin_name else f"{plugin_name}:{slot}"
 
-                    # Format: label  short-uuid  [STATE] (system) enabled/disabled
+                    # Format: label  short-uuid  [STATE] (system)
                     parts = [f"  {label:<24} {short_id}  [{state}]"]
                     if is_system:
                         parts.append("(system)")
-                    parts.append("enabled" if enabled else "disabled")
                     lines.append(" ".join(parts))
 
                     status_list[iid] = {
@@ -1504,7 +1519,8 @@ class EngineCommandHandler:
                         "run_count": status["run_count"],
                     }
 
-            message = f"{len(plugin_names)} plugins:\n" + "\n".join(lines)
+            n = len(plugin_names)
+            message = f"{n} plugin{'s' if n != 1 else ''}:\n" + "\n".join(lines)
             return CommandResult(
                 status=CommandStatus.SUCCESS,
                 message=message,
@@ -1516,7 +1532,7 @@ class EngineCommandHandler:
             if status:
                 return CommandResult(
                     status=CommandStatus.SUCCESS,
-                    message=f"Plugin '{subargs[0]}': {'running' if status['state'] == 'started' else status['state']}  (id: {status.get('instance_id', 'n/a')})",
+                    message=f"Plugin '{subargs[0]}': {_display_state(status['state'])}  (id: {status.get('instance_id', 'n/a')})",
                     data=status,
                 )
             return CommandResult(
@@ -1768,11 +1784,21 @@ class EngineCommandHandler:
                 )
 
                 from .plugin_executive import ExecutionMode
+                from pathlib import Path as _Path2
                 pe.register_plugin(
                     plugin_instance,
                     execution_mode=ExecutionMode.MANUAL,
                     enabled=True,
                 )
+
+                # Record source_file so the registry can persist lifecycle status
+                cfg = pe._plugins.get(plugin_instance.instance_id)
+                if cfg and hasattr(module, "__file__") and module.__file__:
+                    src = _Path2(module.__file__)
+                    # Resolve plugin.py → its parent package directory
+                    if src.name == "plugin.py" or src.stem == src.parent.name:
+                        src = src.parent
+                    cfg.source_file = src
 
                 return CommandResult(
                     status=CommandStatus.SUCCESS,

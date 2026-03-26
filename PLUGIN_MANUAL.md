@@ -303,8 +303,8 @@ STOPPED
 UNLOADED
 ```
 
-> **CLI display note:** `STARTED` is displayed as `running` in `plugin list` and `plugin status` output.
-> `LOADED`, `FROZEN`, `STOPPED`, and `ERROR` are shown as-is.
+> **CLI display note:** Internal states are mapped to display labels: `STARTED` → `running`, `LOADED` → `idle`.
+> `FROZEN`, `STOPPED`, and `ERROR` are shown as-is.
 
 ### `start(self) -> bool`
 
@@ -340,8 +340,8 @@ def stop(self) -> bool:
 ```
 
 > **Idempotency:** `plugin stop` succeeds even if the plugin is already in
-> `loaded` or `stopped` state — it returns `[OK]` without calling `stop()`.
-> Only `started` and `frozen` plugins have their `stop()` method invoked.
+> `idle` or `stopped` state — it returns `[OK]` without calling `stop()`.
+> Only `running` and `frozen` plugins have their `stop()` method invoked.
 
 ### `freeze(self) -> bool`
 
@@ -1621,11 +1621,11 @@ plugin stop   a1b2c3d4-e5f6-7890-abcd-ef1234567890   # by UUID
 plugin request my_plugin get_status
 plugin request my_plugin set_period '{"period": 14}'
 
-# List all loaded plugins with state
+# List all plugins with state
 plugin list
 # Output:
-#   my_plugin   a1b2c3d4  [running] enabled
-#   other       e5f6a7b8  [loaded]  enabled
+#   my_plugin   a1b2c3d4  [running]
+#   other       e5f6a7b8  [idle]
 
 # Get plugin status (includes full instance UUID)
 plugin status my_plugin
