@@ -5,6 +5,7 @@ Tests for plugin_executive.py - Plugin lifecycle manager
 import asyncio
 import pytest
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import Mock
 
 from ib.plugin_executive import (
@@ -1231,23 +1232,10 @@ class TestExportImport:
         assert "exported_at" in data
         assert "plugin_version" in data
 
-    def _write_minimal_plugin(self, path: "Path") -> "Path":
-        """Write a self-contained plugin file loadable without package context."""
-        plugin_file = path / "minimal_plugin.py"
-        plugin_file.write_text(
-            "from plugins.base import PluginBase\n\n"
-            "class MinimalImportPlugin(PluginBase):\n"
-            "    description = 'Minimal plugin for import tests'\n"
-            "    def __init__(self, name='minimal_import', **kw): super().__init__(name, **kw)\n"
-            "    def start(self): return True\n"
-            "    def stop(self): return True\n"
-            "    def freeze(self): return True\n"
-            "    def resume(self): return True\n"
-            "    def calculate_signals(self): return []\n"
-            "    def handle_request(self, rtype, payload): return {'success': True}\n"
-            "    def get_state_for_save(self): return {}\n"
-        )
-        return plugin_file
+    # Path to the canonical test plugin shipped with the repo
+    _TEST_PLUGIN_FILE = str(
+        Path(__file__).parent.parent / "plugins" / "test_plugin" / "plugin.py"
+    )
 
     def test_import_restores_instruments(self, tmp_path, monkeypatch):
         executive, plugin = self._make_executive_with_plugin(tmp_path)
@@ -1259,8 +1247,7 @@ class TestExportImport:
         # New executive simulates a fresh engine start
         executive2 = PluginExecutive(None, None)
 
-        plugin_file = self._write_minimal_plugin(tmp_path)
-        data["class_path"] = str(plugin_file)
+        data["class_path"] = self._TEST_PLUGIN_FILE
         data["slot"] = "import_test"
 
         result = executive2.import_plugin(data)
@@ -1293,8 +1280,7 @@ class TestExportImport:
         executive, plugin = self._make_executive_with_plugin(tmp_path)
         data = executive.export_plugin("export_test")
 
-        plugin_file = self._write_minimal_plugin(tmp_path)
-        data["class_path"] = str(plugin_file)
+        data["class_path"] = self._TEST_PLUGIN_FILE
 
         result = executive.import_plugin(data, slot_override="cloned_slot")
 
@@ -1303,3 +1289,164 @@ class TestExportImport:
         # Both instances exist independently
         assert executive.get_plugin_instruments("export_test") is not None
         assert executive.get_plugin_instruments("cloned_slot") is not None
+
+
+class TestTestPlugin:
+    """Tests for plugins/test_plugin — the canonical loadable test plugin."""
+
+    def _make_plugin(self, tmp_path=None, name="test_plugin") -> "TestPlugin":
+        from plugins.test_plugin import TestPlugin
+        p = TestPlugin(name=name)
+        if tmp_path:
+            p._base_path = tmp_path / name
+            p._base_path.mkdir(parents=True, exist_ok=True)
+            p._instruments_file = p._base_path / "instruments.json"
+            p._holdings_file    = p._base_path / "holdings.json"
+            p._state_file       = p._base_path / "state.json"
+        return p
+
+    # --- loading ---
+
+    def test_load_from_file(self):
+        """PluginLoader.load_from_file() succeeds (absolute imports, no package ctx needed)."""
+        from pathlib import Path
+        from ib.plugin_loader import PluginLoader
+        path = Path(__file__).parent.parent / "plugins" / "test_plugin" / "plugin.py"
+        loader = PluginLoader()
+        plugin = loader.load_from_file(str(path))
+        assert plugin is not None
+        assert plugin.name == "test_plugin"
+
+    def test_package_import(self):
+        """Plugin is also importable as plugins.test_plugin."""
+        from plugins.test_plugin import TestPlugin
+        p = TestPlugin()
+        assert p.name == "test_plugin"
+        assert p.VERSION == "1.0.0"
+        assert p.INSTRUMENT_COMPLIANCE is True
+
+    # --- lifecycle ---
+
+    def test_start_stop(self, tmp_path):
+        p = self._make_plugin(tmp_path)
+        assert p.start() is True
+        assert "start" in p.lifecycle_log
+        assert p.stop() is True
+        assert "stop" in p.lifecycle_log
+
+    def test_freeze_resume(self, tmp_path):
+        p = self._make_plugin(tmp_path)
+        p.start()
+        assert p.freeze() is True
+        assert "freeze" in p.lifecycle_log
+        assert p.resume() is True
+        assert "resume" in p.lifecycle_log
+
+    def test_on_unload_returns_string(self, tmp_path):
+        p = self._make_plugin(tmp_path)
+        p.start()
+        msg = p.on_unload()
+        assert isinstance(msg, str)
+        assert "unloaded" in msg
+
+    # --- signals ---
+
+    def test_calculate_signals_returns_hold(self, tmp_path):
+        from plugins.base import PluginInstrument
+        p = self._make_plugin(tmp_path)
+        p._instruments["SPY"] = PluginInstrument("SPY", "S&P 500 ETF", weight=100.0)
+        p.start()
+        signals = p.calculate_signals()
+        assert len(signals) == 1
+        assert signals[0].symbol == "SPY"
+        assert signals[0].action == "HOLD"
+
+    def test_signals_suspended_returns_empty(self, tmp_path):
+        from plugins.base import PluginInstrument
+        p = self._make_plugin(tmp_path)
+        p._instruments["SPY"] = PluginInstrument("SPY", "S&P 500 ETF", weight=100.0)
+        p.start()
+        p._pstate.alerts_suspended = True
+        assert p.calculate_signals() == []
+
+    def test_signal_count_increments(self, tmp_path):
+        from plugins.base import PluginInstrument
+        p = self._make_plugin(tmp_path)
+        p._instruments["SPY"] = PluginInstrument("SPY", "S&P 500 ETF", weight=100.0)
+        p.start()
+        p.calculate_signals()
+        p.calculate_signals()
+        assert p._pstate.signal_count == 2
+
+    # --- state persistence ---
+
+    def test_state_round_trip(self, tmp_path):
+        from plugins.base import PluginInstrument
+        p = self._make_plugin(tmp_path)
+        p._instruments["SPY"] = PluginInstrument("SPY", "S&P 500 ETF", weight=100.0)
+        p.start()
+        p.calculate_signals()
+        p._pstate.custom_value = "hello"
+        p.stop()  # calls _save_full_state
+
+        p2 = self._make_plugin(tmp_path)
+        p2.start()  # restores state via load_state()
+        assert p2._pstate.signal_count == 1
+        assert p2._pstate.custom_value == "hello"
+
+    # --- custom requests ---
+
+    def test_handle_get_stats(self, tmp_path):
+        p = self._make_plugin(tmp_path)
+        p.start()
+        result = p.handle_request("get_stats", {})
+        assert result["success"] is True
+        assert "signal_count" in result
+        assert "fill_count" in result
+
+    def test_handle_set_custom_value(self, tmp_path):
+        p = self._make_plugin(tmp_path)
+        p.start()
+        result = p.handle_request("set_custom_value", {"value": "test123"})
+        assert result["success"] is True
+        assert p._pstate.custom_value == "test123"
+
+    def test_handle_reset(self, tmp_path):
+        from plugins.base import PluginInstrument
+        p = self._make_plugin(tmp_path)
+        p._instruments["SPY"] = PluginInstrument("SPY", "S&P 500 ETF", weight=100.0)
+        p.start()
+        p.calculate_signals()
+        assert p._pstate.signal_count == 1
+        p.handle_request("reset", {})
+        assert p._pstate.signal_count == 0
+
+    def test_handle_suspend_resume_alerts(self, tmp_path):
+        p = self._make_plugin(tmp_path)
+        p.start()
+        p.handle_request("suspend_alerts", {})
+        assert p._pstate.alerts_suspended is True
+        p.handle_request("resume_alerts", {})
+        assert p._pstate.alerts_suspended is False
+
+    def test_handle_unknown_request(self, tmp_path):
+        p = self._make_plugin(tmp_path)
+        p.start()
+        result = p.handle_request("no_such_request", {})
+        assert result["success"] is False
+
+    # --- fill hooks ---
+
+    def test_on_order_fill_increments_count(self, tmp_path):
+        p = self._make_plugin(tmp_path)
+        p.start()
+        p.on_order_fill(req_id=1, symbol="SPY", filled=10.0, avg_price=500.0, remaining=0.0)
+        assert p._pstate.fill_count == 1
+
+    # --- cli_help ---
+
+    def test_cli_help_returns_string(self, tmp_path):
+        p = self._make_plugin(tmp_path)
+        help_text = p.cli_help()
+        assert isinstance(help_text, str)
+        assert len(help_text) > 0
