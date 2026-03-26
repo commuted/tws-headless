@@ -1828,6 +1828,137 @@ class EngineCommandHandler:
                 message=f"Plugin '{name}' not found or could not be unloaded",
             )
 
+        elif subcommand == "instruments" and subargs:
+            from plugins.base import PluginInstrument
+            isub = subargs[0].lower()
+            iargs = subargs[1:]
+
+            if isub == "list" and iargs:
+                name = iargs[0]
+                instruments = pe.get_plugin_instruments(name)
+                if instruments is None:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message=f"Plugin '{name}' not found",
+                    )
+                _, config = pe._resolve_plugin(name)
+                compliance = getattr(config.plugin, "INSTRUMENT_COMPLIANCE", False) if config else False
+                return CommandResult(
+                    status=CommandStatus.SUCCESS,
+                    message=f"{len(instruments)} instrument(s) for '{name}'",
+                    data={
+                        "instruments": [i.to_dict() for i in instruments],
+                        "compliance": compliance,
+                    },
+                )
+
+            elif isub == "add" and len(iargs) >= 2:
+                name, symbol = iargs[0], iargs[1].upper()
+                flags = iargs[2:]
+                # Parse optional flags
+                inst_name = symbol
+                weight = 0.0
+                min_weight = 0.0
+                max_weight = 100.0
+                exchange = "SMART"
+                currency = "USD"
+                sec_type = "STK"
+                enabled = True
+                i = 0
+                while i < len(flags):
+                    f = flags[i]
+                    if f == "--name" and i + 1 < len(flags):
+                        inst_name = flags[i + 1]; i += 2
+                    elif f == "--weight" and i + 1 < len(flags):
+                        weight = float(flags[i + 1]); i += 2
+                    elif f == "--min-weight" and i + 1 < len(flags):
+                        min_weight = float(flags[i + 1]); i += 2
+                    elif f == "--max-weight" and i + 1 < len(flags):
+                        max_weight = float(flags[i + 1]); i += 2
+                    elif f == "--exchange" and i + 1 < len(flags):
+                        exchange = flags[i + 1]; i += 2
+                    elif f == "--currency" and i + 1 < len(flags):
+                        currency = flags[i + 1]; i += 2
+                    elif f == "--sec-type" and i + 1 < len(flags):
+                        sec_type = flags[i + 1]; i += 2
+                    elif f == "--disabled":
+                        enabled = False; i += 1
+                    else:
+                        i += 1
+                inst = PluginInstrument(
+                    symbol=symbol, name=inst_name,
+                    weight=weight, min_weight=min_weight, max_weight=max_weight,
+                    enabled=enabled, exchange=exchange, currency=currency,
+                    sec_type=sec_type,
+                )
+                if pe.add_plugin_instrument(name, inst):
+                    return CommandResult(
+                        status=CommandStatus.SUCCESS,
+                        message=f"Instrument '{symbol}' added to '{name}'",
+                    )
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Plugin '{name}' not found",
+                )
+
+            elif isub == "remove" and len(iargs) >= 2:
+                name, symbol = iargs[0], iargs[1].upper()
+                if pe.remove_plugin_instrument(name, symbol):
+                    return CommandResult(
+                        status=CommandStatus.SUCCESS,
+                        message=f"Instrument '{symbol}' removed from '{name}'",
+                    )
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Plugin '{name}' not found or symbol '{symbol}' not registered",
+                )
+
+            elif isub in ("enable", "disable") and len(iargs) >= 2:
+                name, symbol = iargs[0], iargs[1].upper()
+                enabled = (isub == "enable")
+                if pe.set_plugin_instrument_enabled(name, symbol, enabled):
+                    state = "enabled" if enabled else "disabled"
+                    return CommandResult(
+                        status=CommandStatus.SUCCESS,
+                        message=f"Instrument '{symbol}' {state} in '{name}'",
+                    )
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Plugin '{name}' not found or symbol '{symbol}' not registered",
+                )
+
+            elif isub == "clear" and iargs:
+                name = iargs[0]
+                if pe.clear_plugin_instruments(name):
+                    return CommandResult(
+                        status=CommandStatus.SUCCESS,
+                        message=f"All instruments cleared from '{name}'",
+                    )
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Plugin '{name}' not found",
+                )
+
+            elif isub == "reload" and iargs:
+                name = iargs[0]
+                count = pe.reload_plugin_instruments(name)
+                if count is not None:
+                    return CommandResult(
+                        status=CommandStatus.SUCCESS,
+                        message=f"Reloaded {count} instrument(s) for '{name}'",
+                    )
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Plugin '{name}' not found",
+                )
+
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=(
+                    "Usage: plugin instruments list|add|remove|enable|disable|clear|reload NAME [SYM] [flags]"
+                ),
+            )
+
         return CommandResult(
             status=CommandStatus.ERROR,
             message=f"Unknown plugin subcommand: {subcommand}",
