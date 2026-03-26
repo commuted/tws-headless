@@ -708,10 +708,12 @@ class TestPluginListCommand:
         assert "[STOPPED]" in result.message
 
     def test_plugin_list_shows_enabled_disabled(self):
-        """Test plugin list shows enabled/disabled status"""
+        """Test plugin list flags disabled plugins"""
         result = self.handler.handle_plugin(["list"])
-        assert "enabled" in result.message
-        assert "disabled" in result.message
+        # mean_reversion is disabled — should be flagged in the output
+        assert "[disabled]" in result.message
+        # momentum_5day is enabled — no flag expected
+        assert result.data["plugins"]["momentum_5day"]["enabled"] is True
 
     def test_plugin_list_shows_system_flag(self):
         """Test plugin list shows (system) for system plugins"""

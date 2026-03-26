@@ -66,6 +66,9 @@ class MockPlugin(PluginBase):
     def calculate_signals(self) -> list:
         return [TradeSignal("SPY", "HOLD", reason="Mock signal")]
 
+    def get_state_for_save(self) -> dict:
+        return {"mock_key": "mock_value"}
+
 
 class TestCircuitBreaker:
     """Tests for CircuitBreaker dataclass"""
@@ -1170,3 +1173,128 @@ class TestPluginRegistryTracking:
 
         assert "already_loaded" in result["skipped"]
         assert "already_loaded" not in result["reloaded"]
+
+
+class TestExportImport:
+    """Tests for export_plugin / import_plugin."""
+
+    def _make_executive_with_plugin(self, tmp_path):
+        """Return (executive, plugin) with instruments and holdings loaded."""
+        executive = PluginExecutive(None, None)
+        plugin = MockPlugin("export_test")
+        plugin._base_path = tmp_path / "export_test"
+        plugin._base_path.mkdir(parents=True)
+        plugin._instruments_file = plugin._base_path / "instruments.json"
+        plugin._holdings_file   = plugin._base_path / "holdings.json"
+        plugin._state_file      = plugin._base_path / "state.json"
+
+        inst = PluginInstrument("SPY", "S&P 500 ETF", weight=60.0, min_weight=10.0, max_weight=100.0)
+        plugin._instruments["SPY"] = inst
+
+        executive.register_plugin(plugin)
+
+        # Set holdings AFTER load() so they aren't reset by load()
+        from plugins.base import Holdings, HoldingPosition
+        plugin._holdings = Holdings(
+            plugin_name="export_test",
+            initial_cash=50000.0,
+            current_cash=30000.0,
+            current_positions=[
+                HoldingPosition(symbol="SPY", quantity=50.0, cost_basis=450.0)
+            ],
+        )
+
+        cfg = executive._plugins[plugin.instance_id]
+        cfg.source_file = tmp_path / "export_test"  # stand-in for class path
+        return executive, plugin
+
+    def test_export_returns_dict(self, tmp_path):
+        executive, plugin = self._make_executive_with_plugin(tmp_path)
+        data = executive.export_plugin("export_test")
+
+        assert data is not None
+        assert data["slot"] == "export_test"
+        assert data["export_version"] == "1.0"
+        assert len(data["instruments"]) == 1
+        assert data["instruments"][0]["symbol"] == "SPY"
+        assert data["holdings"]["current_holdings"]["cash"] == 30000.0
+
+    def test_export_unknown_plugin_returns_none(self, tmp_path):
+        executive = PluginExecutive(None, None)
+        assert executive.export_plugin("no_such_plugin") is None
+
+    def test_export_contains_state(self, tmp_path):
+        executive, plugin = self._make_executive_with_plugin(tmp_path)
+        data = executive.export_plugin("export_test")
+
+        assert "state" in data
+        assert "exported_at" in data
+        assert "plugin_version" in data
+
+    def _write_minimal_plugin(self, path: "Path") -> "Path":
+        """Write a self-contained plugin file loadable without package context."""
+        plugin_file = path / "minimal_plugin.py"
+        plugin_file.write_text(
+            "from plugins.base import PluginBase\n\n"
+            "class MinimalImportPlugin(PluginBase):\n"
+            "    description = 'Minimal plugin for import tests'\n"
+            "    def __init__(self, name='minimal_import', **kw): super().__init__(name, **kw)\n"
+            "    def start(self): return True\n"
+            "    def stop(self): return True\n"
+            "    def freeze(self): return True\n"
+            "    def resume(self): return True\n"
+            "    def calculate_signals(self): return []\n"
+            "    def handle_request(self, rtype, payload): return {'success': True}\n"
+            "    def get_state_for_save(self): return {}\n"
+        )
+        return plugin_file
+
+    def test_import_restores_instruments(self, tmp_path):
+        executive, plugin = self._make_executive_with_plugin(tmp_path)
+        data = executive.export_plugin("export_test")
+
+        # New executive simulates a fresh engine start
+        executive2 = PluginExecutive(None, None)
+
+        plugin_file = self._write_minimal_plugin(tmp_path)
+        data["class_path"] = str(plugin_file)
+        data["slot"] = "import_test"
+
+        result = executive2.import_plugin(data)
+
+        assert result is not None
+        assert result["slot"] == "import_test"
+
+        instruments = executive2.get_plugin_instruments("import_test")
+        assert instruments is not None
+        assert any(i.symbol == "SPY" for i in instruments)
+
+    def test_import_missing_class_path_fails(self, tmp_path):
+        executive2 = PluginExecutive(None, None)
+        data = {
+            "export_version": "1.0",
+            "class_path": str(tmp_path / "nonexistent.py"),
+            "slot": "bad_import",
+            "account_id": "",
+            "instruments": [],
+            "holdings": None,
+            "state": {},
+        }
+        result = executive2.import_plugin(data)
+        assert result is None
+
+    def test_export_import_roundtrip_slot_override(self, tmp_path):
+        """Slot override lets the same export create independent instances."""
+        executive, plugin = self._make_executive_with_plugin(tmp_path)
+        data = executive.export_plugin("export_test")
+
+        plugin_file = self._write_minimal_plugin(tmp_path)
+        data["class_path"] = str(plugin_file)
+
+        result = executive.import_plugin(data, slot_override="cloned_slot")
+
+        assert result is not None
+        assert result["slot"] == "cloned_slot"
+        # Both instances exist independently
+        assert executive.get_plugin_instruments("export_test") is not None
+        assert executive.get_plugin_instruments("cloned_slot") is not None
