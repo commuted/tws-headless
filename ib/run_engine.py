@@ -1504,10 +1504,12 @@ class EngineCommandHandler:
                     # Display label: "name" or "name:slot" if slot differs
                     label = plugin_name if slot == plugin_name else f"{plugin_name}:{slot}"
 
-                    # Format: label  short-uuid  [STATE] (system)
+                    # Format: label  short-uuid  [STATE] (system) [disabled]
                     parts = [f"  {label:<24} {short_id}  [{state}]"]
                     if is_system:
                         parts.append("(system)")
+                    if not enabled:
+                        parts.append("[disabled]")
                     lines.append(" ".join(parts))
 
                     status_list[iid] = {
