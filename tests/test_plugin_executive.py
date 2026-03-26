@@ -1249,9 +1249,12 @@ class TestExportImport:
         )
         return plugin_file
 
-    def test_import_restores_instruments(self, tmp_path):
+    def test_import_restores_instruments(self, tmp_path, monkeypatch):
         executive, plugin = self._make_executive_with_plugin(tmp_path)
         data = executive.export_plugin("export_test")
+
+        # Redirect IB_PLUGIN_DIR so import_plugin writes into tmp_path, not plugins/
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path))
 
         # New executive simulates a fresh engine start
         executive2 = PluginExecutive(None, None)
@@ -1283,8 +1286,10 @@ class TestExportImport:
         result = executive2.import_plugin(data)
         assert result is None
 
-    def test_export_import_roundtrip_slot_override(self, tmp_path):
+    def test_export_import_roundtrip_slot_override(self, tmp_path, monkeypatch):
         """Slot override lets the same export create independent instances."""
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path))
+
         executive, plugin = self._make_executive_with_plugin(tmp_path)
         data = executive.export_plugin("export_test")
 
