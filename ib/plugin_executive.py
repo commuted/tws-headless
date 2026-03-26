@@ -2342,6 +2342,134 @@ class PluginExecutive:
         return config.plugin.cli_help()
 
     # =========================================================================
+    # Export / Import
+    # =========================================================================
+
+    def export_plugin(self, name: str) -> Optional[Dict[str, Any]]:
+        """
+        Export a plugin instance to a portable dict.
+
+        Captures class path, slot, account, instruments, holdings, and current
+        in-memory state.  The result can be serialized to JSON and later
+        restored with import_plugin().
+
+        Returns:
+            Export dict, or None if the plugin is not found.
+        """
+        iid, config = self._resolve_plugin(name)
+        if not config:
+            return None
+        plugin = config.plugin
+        return {
+            "export_version": "1.0",
+            "exported_at": datetime.now().isoformat(),
+            "class_path": str(config.source_file) if config.source_file else None,
+            "slot": plugin.slot,
+            "account_id": plugin._account_id,
+            "plugin_version": plugin.VERSION,
+            "descriptor": plugin.descriptor,
+            "instruments": [i.to_dict() for i in plugin.instruments],
+            "holdings": plugin._holdings.to_dict() if plugin._holdings else None,
+            "state": plugin.get_state_for_save(),
+        }
+
+    def import_plugin(
+        self,
+        data: Dict[str, Any],
+        slot_override: Optional[str] = None,
+        account_override: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Load a plugin instance from an export dict.
+
+        Writes instrument, holdings, and state files into place before calling
+        load() so the plugin starts with the exported data intact.
+
+        Args:
+            data:             Dict produced by export_plugin() / loaded from JSON.
+            slot_override:    Use a different slot name than the one in the export.
+            account_override: Use a different account than the one in the export.
+
+        Returns:
+            Dict with plugin_name, slot, instance_id on success, None on failure.
+        """
+        import json as _json
+        from pathlib import Path as _Path
+        from .plugin_loader import PluginLoader
+
+        class_path = data.get("class_path")
+        if not class_path or not _Path(class_path).exists():
+            logger.error(f"import_plugin: class_path not found: {class_path!r}")
+            return None
+
+        slot = slot_override or data.get("slot")
+        account_id = account_override or data.get("account_id") or self._account
+
+        try:
+            loader = PluginLoader()
+            plugin = loader.load_from_file(class_path)
+            if not plugin:
+                logger.error(f"import_plugin: failed to load class from {class_path}")
+                return None
+
+            if slot:
+                plugin.slot = slot
+            if plugin.descriptor is None and data.get("descriptor") is not None:
+                plugin.descriptor = data["descriptor"]
+
+            plugin.set_message_bus(self.message_bus)
+
+            if account_id:
+                plugin.set_account(account_id)
+            elif self._account:
+                plugin.set_account(self._account)
+
+            # Write exported files before load() so they are picked up
+            plugin._base_path.mkdir(parents=True, exist_ok=True)
+
+            instruments = data.get("instruments", [])
+            if instruments:
+                plugin._instruments_file.write_text(
+                    _json.dumps({"instruments": instruments}, default=str)
+                )
+
+            holdings = data.get("holdings")
+            if holdings:
+                plugin._holdings_file.write_text(
+                    _json.dumps(holdings, default=str)
+                )
+
+            if not plugin.load():
+                logger.error(f"import_plugin: load() failed for '{plugin.name}'")
+                return None
+
+            # Restore state after load() so start() picks it up via load_state()
+            state = data.get("state")
+            if state:
+                plugin.save_state(state)
+
+            if not self.register_plugin(plugin, execution_mode=ExecutionMode.MANUAL, enabled=True):
+                return None
+
+            self._plugins[plugin.instance_id].source_file = _Path(class_path)
+            self._update_registry_status(plugin, "unloaded")
+
+            logger.info(
+                f"Imported plugin '{plugin.name}' (slot='{plugin.slot}', "
+                f"instance_id={plugin.instance_id[:8]}) from export"
+            )
+            return {
+                "plugin_name": plugin.name,
+                "slot": plugin.slot,
+                "instance_id": plugin.instance_id,
+            }
+
+        except Exception as e:
+            logger.error(f"import_plugin: {e}")
+            logger.debug(traceback.format_exc())
+            return None
+
+    # =========================================================================
     # Enable/Disable (for continuous execution)
     # =========================================================================
 
