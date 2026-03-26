@@ -573,12 +573,6 @@ Commands:
   plugin export SLOT [FILE]            Export instance to portable JSON
   plugin import FILE                   Import instance from JSON
 
-  algo list            List all algorithms
-  algo status NAME     Get algorithm status
-  algo enable NAME     Enable algorithm
-  algo disable NAME    Disable algorithm
-  algo trigger NAME    Manually trigger algorithm
-
   historical fetch SYMBOL [--bar-size X] [--duration X] [--end DATETIME]
                        [--what TRADES|MIDPOINT|BID|ASK] [--type etf|stock|forex]
                        [--no-rth]
