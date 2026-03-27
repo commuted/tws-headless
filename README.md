@@ -1,3 +1,5 @@
+# This is not functional, Claude hmmm. Please stand by
+
 # TWS Headless
 
 A headless, plugin-based algorithmic trading engine for Interactive Brokers. Connects to TWS or IB Gateway over the IB API, streams real-time market data, routes it to plugins, executes trade signals, and exposes a Unix socket command interface for external control.
