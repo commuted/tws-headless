@@ -22,8 +22,8 @@ from .auth import TokenStore, Authenticator
 logger = logging.getLogger(__name__)
 
 
-# Default socket path
-DEFAULT_SOCKET_PATH = "/tmp/tws_headless.sock"
+# Default socket path — user home dir prevents pre-creation by other local users
+DEFAULT_SOCKET_PATH = str(Path.home() / ".tws_headless.sock")
 
 
 class CommandStatus(Enum):

@@ -30,6 +30,7 @@ from .rebalancer import (
     create_equal_weight_targets,
 )
 from .models import TargetAllocation, AssetType, RebalanceStrategy, Bar, OrderAction
+from .contract_builder import ContractBuilder
 from .command_server import (
     CommandServer,
     CommandResult,
@@ -482,16 +483,14 @@ class CommandHandler:
                 message=f"Invalid quantity: {args[1]}",
             )
 
-        # Get contract from existing position or create new one
+        # Get contract from existing position, or build a generic US stock contract
         pos = self.portfolio.get_position(symbol)
         if pos and pos.contract:
             contract = pos.contract
             est_price = pos.current_price
         else:
-            return CommandResult(
-                status=CommandStatus.ERROR,
-                message=f"No existing position for {symbol}. Cannot determine contract.",
-            )
+            contract = ContractBuilder.us_stock(symbol)
+            est_price = 0.0
 
         est_value = quantity * est_price
 
@@ -949,7 +948,7 @@ class CommandHandler:
                         return flags[i + 1]
                 return default
 
-            from plugins.base import PluginInstrument
+            from .plugins.base import PluginInstrument
             inst = PluginInstrument(
                 symbol=symbol,
                 name=_flag("--name", symbol),
@@ -1911,7 +1910,7 @@ class CommandHandler:
         try:
             all_status = self.plugin_executive.get_all_plugin_status()
             for name, status in all_status.items():
-                plugin_config = self.plugin_executive._plugins.get(name)
+                plugin_config = self.plugin_executive._plugins.get(status["instance_id"])
                 if plugin_config and plugin_config.plugin:
                     plugin = plugin_config.plugin
                     effective_holdings = plugin.get_effective_holdings()
@@ -1930,17 +1929,13 @@ class CommandHandler:
     def handle_stop(self, args: List[str]) -> CommandResult:
         """Handle 'stop' or 'shutdown' command - initiate graceful shutdown"""
         logger.info("Shutdown requested via command")
-        self.shutdown_mgr._shutdown_event.set()
-        self.shutdown_mgr._cleanup()
+        self.shutdown_mgr._initiate_shutdown()
 
         return CommandResult(
             status=CommandStatus.SUCCESS,
             message="Shutdown initiated",
         )
 
-
-# Global command server instance
-command_server: Optional[CommandServer] = None
 
 
 # =============================================================================
@@ -2242,10 +2237,6 @@ Examples:
         help="Minimum trade value in dollars (default: 100)"
     )
     parser.add_argument(
-        "--dry-run", action="store_true", default=True,
-        help="Don't actually execute trades (default: True)"
-    )
-    parser.add_argument(
         "--live", action="store_true",
         help=f"Connect to live trading (port {DEFAULT_PORT_LIVE}) and execute real trades"
     )
@@ -2275,8 +2266,6 @@ Examples:
 
 def main():
     """Main entry point"""
-    global command_server
-
     args = parse_args()
 
     # Configure logging level

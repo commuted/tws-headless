@@ -75,8 +75,8 @@ from enum import Enum
 from typing import Dict, Any, Optional
 
 
-# Default socket path - must match command_server.py
-DEFAULT_SOCKET_PATH = "/tmp/tws_headless.sock"
+# Default socket path - must match command_server.py DEFAULT_SOCKET_PATH
+DEFAULT_SOCKET_PATH = os.path.expanduser("~/.tws_headless.sock")
 
 
 class CommandStatus(Enum):

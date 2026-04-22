@@ -39,7 +39,7 @@ python3 -m ib.run_engine [options]
 | `--host` | `127.0.0.1` | IB host |
 | `--client-id` | `1` | IB client ID (must be unique per session) |
 | `--market-data-type` | auto | `1`=live, `2`=frozen, `3`=delayed, `4`=delayed-frozen. Auto-detected if omitted. |
-| `--socket` | `/tmp/tws_headless.sock` | Unix socket path for `ibctl.py` commands |
+| `--socket` | `~/.tws_headless.sock` | Unix socket path for `ibctl.py` commands |
 | `--no-server` | — | Disable socket command server |
 | `--plugin-dir` | `plugins/` | Plugin search directory |
 | `--verbose` / `--quiet` | — | Logging verbosity |

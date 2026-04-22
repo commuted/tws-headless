@@ -21,6 +21,7 @@ import logging
 import os
 import secrets
 import hmac
+import tempfile
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
@@ -133,11 +134,20 @@ class TokenStore:
             # Ensure parent directory exists
             self.token_file.parent.mkdir(parents=True, exist_ok=True)
 
-            # Write token
-            self.token_file.write_text(token + "\n")
-
-            # Set secure permissions
-            os.chmod(self.token_file, self.file_mode)
+            # Write to a temp file, set permissions, then atomically rename
+            # so the token is never world-readable even briefly.
+            fd, tmp_path = tempfile.mkstemp(dir=self.token_file.parent)
+            try:
+                os.write(fd, (token + "\n").encode())
+                os.close(fd)
+                fd = -1
+                os.chmod(tmp_path, self.file_mode)
+                Path(tmp_path).rename(self.token_file)
+            except Exception:
+                if fd >= 0:
+                    os.close(fd)
+                Path(tmp_path).unlink(missing_ok=True)
+                raise
 
             self._cached_token = token
             logger.info(f"Token saved to {self.token_file}")

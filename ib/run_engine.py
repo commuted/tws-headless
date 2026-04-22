@@ -27,6 +27,7 @@ import sys
 import os
 from pathlib import Path
 from typing import Optional, List
+from .command_server import DEFAULT_SOCKET_PATH
 
 # Setup logging
 logging.basicConfig(
@@ -92,8 +93,8 @@ Examples:
 
     # Command server options
     parser.add_argument(
-        "--socket", default="/tmp/tws_headless.sock",
-        help="Unix socket path for commands (default: /tmp/tws_headless.sock)"
+        "--socket", default=DEFAULT_SOCKET_PATH,
+        help=f"Unix socket path for commands (default: {DEFAULT_SOCKET_PATH})"
     )
     parser.add_argument(
         "--no-server", action="store_true",
@@ -145,10 +146,10 @@ def main():
     logger.info("=" * 60)
 
     # Import components
-    from .trading_engine import TradingEngine, EngineConfig, EngineState
+    from .trading_engine import TradingEngine, EngineConfig
     from .plugin_executive import OrderExecutionMode
     from .data_feed import DataType
-    from .command_server import CommandServer, CommandResult, CommandStatus
+    from .command_server import CommandServer
 
     # Map mode string to enum
     mode_map = {
@@ -157,12 +158,20 @@ def main():
         "queued": OrderExecutionMode.QUEUED,
     }
 
+    valid_modes = list(mode_map)
+    if mode not in mode_map:
+        logger.error(
+            f"Invalid MODE '{mode}'. Valid values: {', '.join(valid_modes)}. "
+            "Set MODE env var or use --mode flag."
+        )
+        sys.exit(1)
+
     # Create engine config
     config = EngineConfig(
         host=args.host,
         port=port,
         client_id=args.client_id,
-        order_mode=mode_map.get(mode, OrderExecutionMode.DRY_RUN),
+        order_mode=mode_map[mode],
         enable_message_bus=True,
         market_data_type=market_data_type,
     )
@@ -185,7 +194,7 @@ def main():
 
         orders_plugin = OrdersPlugin(
             portfolio=engine.portfolio,
-            message_bus=engine.message_bus if hasattr(engine, 'message_bus') else None,
+            message_bus=engine.message_bus,
         )
         if engine.plugin_executive:
             engine.plugin_executive.register_plugin(
@@ -215,7 +224,7 @@ def main():
 
         paper_test_feeds = PaperTestFeedsPlugin(
             portfolio=engine.portfolio,
-            message_bus=engine.message_bus if hasattr(engine, "message_bus") else None,
+            message_bus=engine.message_bus,
         )
         if engine.plugin_executive:
             engine.plugin_executive.register_plugin(
@@ -272,7 +281,13 @@ def main():
                 if result["failed"]:
                     logger.warning(f"Failed to reload plugins: {result['failed']}")
 
-            asyncio.get_event_loop().create_task(_reload_plugins())
+            _reload_task = asyncio.get_event_loop().create_task(_reload_plugins())
+
+            def _on_reload_done(t):
+                if not t.cancelled() and t.exception():
+                    logger.error(f"Plugin reload failed: {t.exception()}")
+
+            _reload_task.add_done_callback(_on_reload_done)
 
         logger.info("Streaming data - press Ctrl+C 3x to stop")
 
@@ -327,8 +342,10 @@ class EngineCommandHandler:
     """
 
     def __init__(self, engine):
+        import threading
         self.engine = engine
         self._liquidation_in_progress = False
+        self._liquidation_lock = threading.Lock()
 
     def register_commands(self, server: 'CommandServer'):
         """Register all command handlers with the server"""
@@ -528,11 +545,13 @@ class EngineCommandHandler:
         """Handle 'liquidate' command"""
         from .command_server import CommandResult, CommandStatus
 
-        if self._liquidation_in_progress:
-            return CommandResult(
-                status=CommandStatus.ERROR,
-                message="Liquidation already in progress",
-            )
+        with self._liquidation_lock:
+            if self._liquidation_in_progress:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message="Liquidation already in progress",
+                )
+            self._liquidation_in_progress = True
 
         confirm = "--confirm" in args
         symbols = [a for a in args if not a.startswith("--")]
@@ -541,6 +560,7 @@ class EngineCommandHandler:
         positions = portfolio.positions
 
         if not positions:
+            self._liquidation_in_progress = False
             return CommandResult(
                 status=CommandStatus.SUCCESS,
                 message="No positions to liquidate",
@@ -549,6 +569,7 @@ class EngineCommandHandler:
         if symbols:
             positions = [p for p in positions if p.symbol in symbols]
             if not positions:
+                self._liquidation_in_progress = False
                 return CommandResult(
                     status=CommandStatus.ERROR,
                     message=f"Symbol(s) not found: {', '.join(symbols)}",
@@ -558,6 +579,7 @@ class EngineCommandHandler:
         sell_list = [(p.symbol, p.quantity, p.market_value) for p in positions]
 
         if not confirm:
+            self._liquidation_in_progress = False
             sell_info = ", ".join(f"{s[0]}:{s[1]:.0f}" for s in sell_list)
             return CommandResult(
                 status=CommandStatus.SUCCESS,
@@ -569,24 +591,24 @@ class EngineCommandHandler:
                 },
             )
 
-        # Execute liquidation
-        self._liquidation_in_progress = True
+        # Execute liquidation (flag already set above)
         order_ids = []
         errors = []
 
-        for pos in positions:
-            if pos.contract and pos.quantity > 0:
-                order_id = portfolio.place_market_order(
-                    contract=pos.contract,
-                    action="SELL",
-                    quantity=pos.quantity,
-                )
-                if order_id:
-                    order_ids.append(order_id)
-                else:
-                    errors.append(f"Failed to place order for {pos.symbol}")
-
-        self._liquidation_in_progress = False
+        try:
+            for pos in positions:
+                if pos.contract and pos.quantity > 0:
+                    order_id = portfolio.place_market_order(
+                        contract=pos.contract,
+                        action="SELL",
+                        quantity=pos.quantity,
+                    )
+                    if order_id:
+                        order_ids.append(order_id)
+                    else:
+                        errors.append(f"Failed to place order for {pos.symbol}")
+        finally:
+            self._liquidation_in_progress = False
 
         if errors:
             return CommandResult(
@@ -828,19 +850,23 @@ class EngineCommandHandler:
             order sell QQQ 50 loc 380.00           # Limit on Close
         """
         from .command_server import CommandResult, CommandStatus
-        from plugins.orders import OrdersPlugin, OrderType, TimeInForce
 
         # Get orders plugin
         orders_plugin = None
         if self.engine.plugin_executive:
-            from plugins.orders.plugin import ORDERS_PLUGIN_NAME
-            config = self.engine.plugin_executive._plugins.get(ORDERS_PLUGIN_NAME)
-            if config:
-                orders_plugin = config.plugin
+            try:
+                from plugins.orders.plugin import ORDERS_PLUGIN_NAME
+                config = self.engine.plugin_executive._plugins.get(ORDERS_PLUGIN_NAME)
+                if config:
+                    orders_plugin = config.plugin
+            except ImportError:
+                pass
 
         if not orders_plugin:
             # Try to execute directly through portfolio if no plugin
             return self._handle_order_direct(args)
+
+        from plugins.orders import OrderType, TimeInForce
 
         # Parse arguments
         if len(args) < 3:
@@ -897,7 +923,10 @@ class EngineCommandHandler:
                             limit_price = float(remaining[i + 1])
                             i += 1
                         except ValueError:
-                            pass
+                            return CommandResult(
+                                status=CommandStatus.ERROR,
+                                message=f"Invalid limit price: {remaining[i + 1]!r}",
+                            )
 
                 elif order_type == OrderType.STOP:
                     if i + 1 < len(remaining):
@@ -905,7 +934,10 @@ class EngineCommandHandler:
                             stop_price = float(remaining[i + 1])
                             i += 1
                         except ValueError:
-                            pass
+                            return CommandResult(
+                                status=CommandStatus.ERROR,
+                                message=f"Invalid stop price: {remaining[i + 1]!r}",
+                            )
 
                 elif order_type == OrderType.STOP_LIMIT:
                     # Expects: stop-limit STOP_PRICE LIMIT_PRICE
@@ -914,8 +946,11 @@ class EngineCommandHandler:
                             stop_price = float(remaining[i + 1])
                             limit_price = float(remaining[i + 2])
                             i += 2
-                        except ValueError:
-                            pass
+                        except ValueError as e:
+                            return CommandResult(
+                                status=CommandStatus.ERROR,
+                                message=f"Invalid stop-limit prices: {e}",
+                            )
 
                 elif order_type in (OrderType.TRAILING_STOP, OrderType.TRAILING_STOP_LIMIT):
                     # Expects: trail AMOUNT or trail PERCENT%
@@ -925,12 +960,18 @@ class EngineCommandHandler:
                             try:
                                 trail_percent = float(trail_str[:-1])
                             except ValueError:
-                                pass
+                                return CommandResult(
+                                    status=CommandStatus.ERROR,
+                                    message=f"Invalid trail percent: {trail_str!r}",
+                                )
                         else:
                             try:
                                 trail_amount = float(trail_str)
                             except ValueError:
-                                pass
+                                return CommandResult(
+                                    status=CommandStatus.ERROR,
+                                    message=f"Invalid trail amount: {trail_str!r}",
+                                )
                         i += 1
                     # For trail limit, also get limit price
                     if order_type == OrderType.TRAILING_STOP_LIMIT and i + 1 < len(remaining):
@@ -938,7 +979,10 @@ class EngineCommandHandler:
                             limit_price = float(remaining[i + 1])
                             i += 1
                         except ValueError:
-                            pass
+                            return CommandResult(
+                                status=CommandStatus.ERROR,
+                                message=f"Invalid trail limit price: {remaining[i + 1]!r}",
+                            )
 
                 elif order_type in (OrderType.LIMIT_ON_CLOSE, OrderType.LIMIT_ON_OPEN):
                     if i + 1 < len(remaining):
@@ -946,7 +990,10 @@ class EngineCommandHandler:
                             limit_price = float(remaining[i + 1])
                             i += 1
                         except ValueError:
-                            pass
+                            return CommandResult(
+                                status=CommandStatus.ERROR,
+                                message=f"Invalid limit price: {remaining[i + 1]!r}",
+                            )
 
             i += 1
 
@@ -1778,11 +1825,7 @@ class EngineCommandHandler:
 
                 plugin_instance = plugin_class(
                     portfolio=self.engine.portfolio,
-                    message_bus=(
-                        self.engine.message_bus
-                        if hasattr(self.engine, "message_bus")
-                        else None
-                    ),
+                    message_bus=self.engine.message_bus,
                 )
 
                 from .plugin_executive import ExecutionMode
@@ -1807,7 +1850,7 @@ class EngineCommandHandler:
                     message=f"Loaded plugin '{plugin_instance.name}' from {module_name}",
                     data={
                         "plugin_name": plugin_instance.name,
-                        "instance_id": plugin_instance.name,
+                        "instance_id": plugin_instance.instance_id,
                         "module": module_name,
                     },
                 )
