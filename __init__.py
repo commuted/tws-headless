@@ -33,6 +33,7 @@ from .const import (
     DOUBLE_INFINITY,
     CUSTOMER,
     FIRM,
+    UNKNOWN,
     AUCTION_UNSET,
     AUCTION_MATCH,
     AUCTION_IMPROVEMENT,
@@ -99,6 +100,8 @@ from .command_server import (
     CommandServer,
     CommandResult,
     CommandStatus,
+    RequestEntry,
+    RequestQueue,
     send_command,
     DEFAULT_SOCKET_PATH,
 )
@@ -186,6 +189,8 @@ from .rate_limiter import (
     OrderRateLimiter,
 )
 
+from .plugin_executive import DepartureEntry
+
 from .auth import (
     TokenStore,
     Authenticator,
@@ -208,6 +213,7 @@ __all__ = [
     "DOUBLE_INFINITY",
     "CUSTOMER",
     "FIRM",
+    "UNKNOWN",
     "AUCTION_UNSET",
     "AUCTION_MATCH",
     "AUCTION_IMPROVEMENT",
@@ -267,6 +273,8 @@ __all__ = [
     "CommandServer",
     "CommandResult",
     "CommandStatus",
+    "RequestEntry",
+    "RequestQueue",
     "send_command",
     "DEFAULT_SOCKET_PATH",
     # Enter/Exit
@@ -330,6 +338,9 @@ __all__ = [
     "RateLimiterConfig",
     "RateLimiterStats",
     "OrderRateLimiter",
+    # Authentication
+    # Plugin executive
+    "DepartureEntry",
     # Authentication
     "TokenStore",
     "Authenticator",

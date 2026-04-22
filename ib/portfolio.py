@@ -92,6 +92,16 @@ SIZE_TICK_TYPE_NAMES = {
 }
 
 
+def _parse_ib_exec_time(time_str: str) -> datetime:
+    """Parse IB execution.time string (e.g. '20231218  14:35:42') into a datetime."""
+    for fmt in ("%Y%m%d  %H:%M:%S", "%Y%m%d %H:%M:%S"):
+        try:
+            return datetime.strptime(time_str.strip(), fmt)
+        except (ValueError, AttributeError):
+            pass
+    return datetime.now()
+
+
 class Portfolio(IBClient):
     """
     Portfolio manager for Interactive Brokers.
@@ -180,9 +190,10 @@ class Portfolio(IBClient):
         self._on_tick_by_tick: Optional[Callable] = None
 
         # Market depth subscriptions and books
-        self._depth_subscriptions: Dict[int, str] = {}  # reqId -> symbol
-        self._depth_req_ids: Dict[str, int] = {}         # symbol -> reqId
-        self._depth_books: Dict[str, dict] = {}          # symbol -> {"bids": {pos: level}, "asks": {pos: level}}
+        self._depth_subscriptions: Dict[int, str] = {}       # reqId -> symbol
+        self._depth_req_ids: Dict[str, int] = {}              # symbol -> reqId
+        self._depth_books: Dict[str, dict] = {}               # symbol -> {"bids": {pos: level}, "asks": {pos: level}}
+        self._depth_is_smart: Dict[int, bool] = {}            # reqId -> isSmartDepth
         self._on_depth: Optional[Callable] = None
 
         # P&L subscriptions
@@ -296,6 +307,7 @@ class Portfolio(IBClient):
         Returns:
             Request ID used for this subscription
         """
+        self.cancel_pnl()
         req_id = self.get_next_req_id()
         self._pnl_req_id = req_id
         self.reqPnL(req_id, account, model_code)
@@ -325,6 +337,7 @@ class Portfolio(IBClient):
         Returns:
             Request ID used for this subscription
         """
+        self.cancel_pnl_single(symbol)
         con_id = 0
         pos = self._positions.get(symbol)
         if pos and pos.contract:
@@ -448,12 +461,13 @@ class Portfolio(IBClient):
         # Cancel market depth subscriptions
         for req_id, symbol in list(self._depth_subscriptions.items()):
             try:
-                self.cancelMktDepth(req_id, False)
+                self.cancelMktDepth(req_id, self._depth_is_smart.get(req_id, False))
             except Exception:
                 pass
         self._depth_subscriptions.clear()
         self._depth_req_ids.clear()
         self._depth_books.clear()
+        self._depth_is_smart.clear()
 
         # Cancel pending market data requests
         for req_id in list(self._market_data_requests.keys()):
@@ -517,6 +531,7 @@ class Portfolio(IBClient):
         self._forex_positions.clear()
         self._forex_cash.clear()
         self._forex_rates.clear()
+        self._account_summary.clear()
         self._positions_done.clear()
         self._account_updates_done.clear()
 
@@ -934,6 +949,7 @@ class Portfolio(IBClient):
         self._depth_subscriptions[req_id] = symbol
         self._depth_req_ids[symbol] = req_id
         self._depth_books[symbol] = {"bids": {}, "asks": {}}
+        self._depth_is_smart[req_id] = isSmartDepth
 
         self.reqMktDepth(req_id, contract, numRows, isSmartDepth, [])
         logger.debug(f"Started market depth for {symbol} (reqId={req_id})")
@@ -950,7 +966,7 @@ class Portfolio(IBClient):
         if req_id is None:
             return
 
-        is_smart = False  # we never set smart depth in request_market_depth default
+        is_smart = self._depth_is_smart.pop(req_id, False)
         self.cancelMktDepth(req_id, is_smart)
         self._depth_subscriptions.pop(req_id, None)
         self._depth_books.pop(symbol, None)
@@ -994,7 +1010,7 @@ class Portfolio(IBClient):
             Request ID (pass to cancel_historical_data() to abort early)
         """
         req_id = self.get_next_req_id()
-        self._historical_requests[req_id] = (on_bar, on_end, [])
+        self._historical_requests[req_id] = (on_bar, on_end, keep_up_to_date, [])
         logger.debug(
             f"reqHistoricalData req_id={req_id} "
             f"duration={duration_str} bar_size={bar_size_setting} "
@@ -1355,7 +1371,6 @@ class Portfolio(IBClient):
         """Fetch market data for all positions"""
         self._market_data_requests.clear()
         self._market_data_done.clear()
-        self._market_data_pending = len(self._positions)
         self._market_data_received = 0
 
         for symbol, pos in self._positions.items():
@@ -1364,6 +1379,10 @@ class Portfolio(IBClient):
                 self._market_data_requests[req_id] = symbol
                 # Market data type already set by the engine before load() is called
                 self.reqMktData(req_id, pos.contract, "", True, False, [])
+
+        self._market_data_pending = len(self._market_data_requests)
+        if self._market_data_pending == 0:
+            return
 
         try:
             await asyncio.wait_for(self._market_data_done.wait(), timeout=timeout)
@@ -1771,7 +1790,7 @@ class Portfolio(IBClient):
         entry = self._historical_requests.get(reqId)
         if entry is None:
             return
-        on_bar, _on_end, bars = entry
+        on_bar, _on_end, _keep_up_to_date, bars = entry
         bars.append(bar)
         if on_bar:
             try:
@@ -1790,7 +1809,7 @@ class Portfolio(IBClient):
         entry = self._historical_requests.get(reqId)
         if entry is None:
             return
-        _on_bar, on_end, bars = entry
+        _on_bar, on_end, keep_up_to_date, bars = entry
         logger.debug(
             f"historicalDataEnd req_id={reqId} bars={len(bars)} "
             f"start={start} end={end}"
@@ -1800,9 +1819,9 @@ class Portfolio(IBClient):
                 on_end(bars, start, end)
             except Exception as e:
                 logger.error(f"Error in historicalDataEnd on_end callback: {e}")
-        # Remove one-shot requests; keep_up_to_date requests stay registered
-        # so historicalDataUpdate can route back to on_bar.
-        if on_end is not None:
+        # Keep the entry alive for keep_up_to_date subscriptions so that
+        # historicalDataUpdate can continue routing bars to on_bar.
+        if not keep_up_to_date:
             self._historical_requests.pop(reqId, None)
 
     def historicalDataUpdate(self, reqId: int, bar) -> None:
@@ -1810,7 +1829,7 @@ class Portfolio(IBClient):
         entry = self._historical_requests.get(reqId)
         if entry is None:
             return
-        on_bar, _on_end, bars = entry
+        on_bar, _on_end, _keep_up_to_date, bars = entry
         bars.append(bar)
         if on_bar:
             try:
@@ -1971,8 +1990,11 @@ class Portfolio(IBClient):
     def _save_forex_cost_basis(self):
         """Save forex cost basis to ~/.ib_forex_cost_basis.json."""
         forex_file = Path.home() / ".ib_forex_cost_basis.json"
-        forex_file.write_text(json.dumps(self._forex_cost_basis))
-        logger.debug(f"Saved forex cost basis: {self._forex_cost_basis}")
+        try:
+            forex_file.write_text(json.dumps(self._forex_cost_basis))
+            logger.debug(f"Saved forex cost basis: {self._forex_cost_basis}")
+        except Exception as e:
+            logger.error(f"Failed to save forex cost basis: {e}")
 
     def _update_forex_positions(self):
         """
@@ -2134,7 +2156,7 @@ class Portfolio(IBClient):
                 avg_price=execution.avgPrice,
                 side=execution.side,  # BOT or SLD
                 account=execution.acctNumber or "",
-                timestamp=datetime.now(),  # IB's execution.time is a string, use now()
+                timestamp=_parse_ib_exec_time(execution.time),
             )
 
             db = get_execution_db()
@@ -2224,7 +2246,7 @@ class Portfolio(IBClient):
             execId=exec_id,
             commissionAndFees=commission,
             currency=currency,
-            realizedPNL=realized_pnl,
+            realizedPNL=realized_pnl_db if realized_pnl_db is not None else 0.0,
             yield_=getattr(commissionAndFeesReport, "yield_", 0.0),
             yieldRedemptionDate=getattr(commissionAndFeesReport, "yieldRedemptionDate", 0),
         )

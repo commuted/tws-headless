@@ -19,7 +19,6 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import OrderedDict
-from queue import Empty
 from pathlib import Path
 import time
 import traceback
@@ -313,14 +312,14 @@ class StreamManager:
             for symbol in self._data_feed.subscriptions:
                 sub = self._data_feed._subscriptions.get(symbol)
                 if sub:
-                        feed_subs[symbol] = {
-                            "active": sub.active,
-                            "subscriber_count": len(sub.subscribers),
-                            "subscribers": list(sub.subscribers),
-                            "data_types": [d.value for d in sub.data_types],
-                            "what_to_show": sub.what_to_show,
-                            "use_rth": sub.use_rth,
-                        }
+                    feed_subs[symbol] = {
+                        "active": sub.active,
+                        "subscriber_count": len(sub.subscribers),
+                        "subscribers": list(sub.subscribers),
+                        "data_types": [d.value for d in sub.data_types],
+                        "what_to_show": sub.what_to_show,
+                        "use_rth": sub.use_rth,
+                    }
 
         return {
             "plugin_streams": plugin_streams,
@@ -845,318 +844,6 @@ class PluginExecutive:
 
         return total
 
-    def reconcile_with_account(self) -> Dict[str, Any]:
-        """
-        Reconcile plugin holdings with actual IB account positions and cash.
-
-        Compares what plugins claim to hold against real account state,
-        identifies discrepancies, and adjusts holdings to match reality.
-
-        Returns:
-            Report dict with timestamp, discrepancies, adjustments, and summary.
-        """
-        timestamp = datetime.now().isoformat()
-        report: Dict[str, Any] = {
-            "timestamp": timestamp,
-            "discrepancies": [],
-            "adjustments": [],
-            "summary": {
-                "account_positions": 0,
-                "plugin_positions": 0,
-                "positions_added_to_unassigned": 0,
-                "positions_removed_from_plugins": 0,
-                "quantity_adjustments": 0,
-                "cash_adjustment": 0.0,
-            },
-        }
-
-        if self.portfolio is None:
-            report["error"] = "No portfolio connected"
-            return report
-
-        # Build account positions map
-        account_positions: Dict[str, Dict[str, Any]] = {}
-        for pos in self.portfolio.positions:
-            account_positions[pos.symbol] = {
-                "quantity": pos.quantity,
-                "avg_cost": pos.avg_cost,
-                "current_price": pos.current_price,
-                "market_value": pos.market_value,
-            }
-
-        # Build plugin claims map (non-system plugins only)
-        plugin_claims: Dict[str, float] = {}  # symbol -> total claimed qty
-        plugin_claimants: Dict[str, List[Tuple[str, Any, float]]] = {}  # symbol -> [(name, plugin, qty)]
-
-        for iid, config in self._plugins.items():
-            plugin = config.plugin
-            if plugin.is_system_plugin:
-                continue
-            holdings = plugin.get_effective_holdings()
-            for pos in holdings.get("positions", []):
-                sym = pos["symbol"]
-                qty = pos["quantity"]
-                plugin_claims[sym] = plugin_claims.get(sym, 0) + qty
-                if sym not in plugin_claimants:
-                    plugin_claimants[sym] = []
-                plugin_claimants[sym].append((plugin.name, plugin, qty))
-
-        # Count positions
-        plugin_position_count = len(plugin_claims)
-        report["summary"]["account_positions"] = len(account_positions)
-        report["summary"]["plugin_positions"] = plugin_position_count
-
-        # Get all symbols
-        all_symbols = set(account_positions.keys()) | set(plugin_claims.keys())
-
-        # Get unassigned plugin
-        unassigned = self._unassigned_plugin
-        modified_plugins: set = set()
-
-        # Compare positions
-        for symbol in sorted(all_symbols):
-            account_qty = account_positions.get(symbol, {}).get("quantity", 0)
-            claimed_qty = plugin_claims.get(symbol, 0)
-
-            if symbol in account_positions and symbol not in plugin_claims:
-                # Unclaimed position
-                report["discrepancies"].append({
-                    "type": "unclaimed_position",
-                    "symbol": symbol,
-                    "account_quantity": account_qty,
-                    "claimed_quantity": 0,
-                    "difference": account_qty,
-                })
-                if unassigned:
-                    acct = account_positions[symbol]
-                    unassigned.holdings.add_position(
-                        symbol, account_qty,
-                        cost_basis=acct.get("avg_cost", 0.0),
-                        current_price=acct.get("current_price", 0.0),
-                    )
-                    modified_plugins.add(unassigned)
-                    report["adjustments"].append({
-                        "action": "added_to_unassigned",
-                        "symbol": symbol,
-                        "quantity": account_qty,
-                    })
-                    report["summary"]["positions_added_to_unassigned"] += 1
-
-            elif symbol in account_positions and symbol in plugin_claims:
-                if claimed_qty < account_qty:
-                    # Under-claimed
-                    diff = account_qty - claimed_qty
-                    report["discrepancies"].append({
-                        "type": "under_claimed",
-                        "symbol": symbol,
-                        "account_quantity": account_qty,
-                        "claimed_quantity": claimed_qty,
-                        "difference": diff,
-                    })
-                    if unassigned:
-                        acct = account_positions[symbol]
-                        unassigned.holdings.add_position(
-                            symbol, diff,
-                            cost_basis=acct.get("avg_cost", 0.0),
-                            current_price=acct.get("current_price", 0.0),
-                        )
-                        modified_plugins.add(unassigned)
-                        report["adjustments"].append({
-                            "action": "added_to_unassigned",
-                            "symbol": symbol,
-                            "quantity": diff,
-                        })
-                        report["summary"]["positions_added_to_unassigned"] += 1
-
-                elif claimed_qty > account_qty:
-                    # Over-claimed
-                    excess = claimed_qty - account_qty
-                    report["discrepancies"].append({
-                        "type": "over_claimed",
-                        "symbol": symbol,
-                        "account_quantity": account_qty,
-                        "claimed_quantity": claimed_qty,
-                        "difference": -(excess),
-                    })
-                    # Remove excess proportionally from claiming plugins
-                    remaining_excess = excess
-                    claimants = plugin_claimants.get(symbol, [])
-                    for pname, plugin, pqty in claimants:
-                        if remaining_excess <= 0:
-                            break
-                        # Proportional reduction
-                        proportion = pqty / claimed_qty
-                        remove_qty = min(round(excess * proportion), remaining_excess, pqty)
-                        if remove_qty > 0:
-                            plugin.holdings.remove_position(symbol, remove_qty)
-                            modified_plugins.add(plugin)
-                            remaining_excess -= remove_qty
-                            report["adjustments"].append({
-                                "action": "removed_from_plugin",
-                                "plugin": pname,
-                                "symbol": symbol,
-                                "quantity": remove_qty,
-                            })
-                            report["summary"]["positions_removed_from_plugins"] += 1
-                            report["summary"]["quantity_adjustments"] += 1
-
-            elif symbol not in account_positions and symbol in plugin_claims:
-                # Phantom position
-                report["discrepancies"].append({
-                    "type": "phantom_position",
-                    "symbol": symbol,
-                    "account_quantity": 0,
-                    "claimed_quantity": claimed_qty,
-                })
-                # Remove from all claiming plugins
-                claimants = plugin_claimants.get(symbol, [])
-                for pname, plugin, pqty in claimants:
-                    plugin.holdings.remove_position(symbol, pqty)
-                    modified_plugins.add(plugin)
-                    report["adjustments"].append({
-                        "action": "removed_phantom",
-                        "plugin": pname,
-                        "symbol": symbol,
-                        "quantity": pqty,
-                    })
-                    report["summary"]["positions_removed_from_plugins"] += 1
-
-        # Reconcile cash
-        account_summary = self.portfolio.get_account_summary()
-        account_cash = account_summary.available_funds if account_summary and account_summary.is_valid else 0.0
-
-        total_claimed_cash = 0.0
-        for name, config in self._plugins.items():
-            plugin = config.plugin
-            if plugin.is_system_plugin:
-                continue
-            if plugin.holdings:
-                total_claimed_cash += plugin.holdings.current_cash
-
-        expected_unassigned_cash = account_cash - total_claimed_cash
-        actual_unassigned_cash = unassigned.holdings.current_cash if unassigned else 0.0
-
-        if abs(expected_unassigned_cash - actual_unassigned_cash) > 0.01:
-            report["discrepancies"].append({
-                "type": "cash_mismatch",
-                "account_cash": account_cash,
-                "claimed_cash": total_claimed_cash,
-                "expected_unassigned": expected_unassigned_cash,
-                "actual_unassigned": actual_unassigned_cash,
-                "difference": expected_unassigned_cash - actual_unassigned_cash,
-            })
-            if unassigned:
-                old_cash = unassigned.holdings.current_cash
-                unassigned.holdings.current_cash = expected_unassigned_cash
-                modified_plugins.add(unassigned)
-                report["adjustments"].append({
-                    "action": "adjusted_unassigned_cash",
-                    "old_value": old_cash,
-                    "new_value": expected_unassigned_cash,
-                })
-                report["summary"]["cash_adjustment"] = expected_unassigned_cash - old_cash
-
-        # Save modified plugins
-        for plugin in modified_plugins:
-            try:
-                plugin.save_holdings()
-            except Exception as e:
-                logger.warning(f"Failed to save holdings for {getattr(plugin, 'name', '?')}: {e}")
-
-        # Publish notification
-        if hasattr(self, "message_bus") and self.message_bus:
-            try:
-                self.message_bus.publish(
-                    channel="account_sync",
-                    payload=report,
-                    publisher="plugin_executive",
-                    message_type="reconciliation",
-                )
-            except Exception as e:
-                logger.warning(f"Failed to publish reconciliation report: {e}")
-
-        return report
-
-    def format_reconciliation_report(self, report: Dict[str, Any]) -> str:
-        """
-        Format a reconciliation report dict into human-readable text.
-
-        Args:
-            report: Report dict from reconcile_with_account()
-
-        Returns:
-            Formatted string for display.
-        """
-        lines = []
-        lines.append("=== RECONCILIATION REPORT ===")
-        lines.append(f"Timestamp: {report.get('timestamp', 'N/A')}")
-        lines.append("")
-
-        summary = report.get("summary", {})
-        lines.append(f"Account positions: {summary.get('account_positions', 0)}")
-        lines.append(f"Plugin positions:  {summary.get('plugin_positions', 0)}")
-        lines.append("")
-
-        discrepancies = report.get("discrepancies", [])
-        if not discrepancies:
-            lines.append("No discrepancies found")
-        else:
-            lines.append("DISCREPANCIES:")
-            for d in discrepancies:
-                dtype = d.get("type", "unknown")
-                if dtype == "unclaimed_position":
-                    lines.append(
-                        f"  UNCLAIMED: {d['symbol']} - "
-                        f"account={d['account_quantity']}, claimed={d['claimed_quantity']}"
-                    )
-                elif dtype == "under_claimed":
-                    lines.append(
-                        f"  UNDER-CLAIMED: {d['symbol']} - "
-                        f"account={d['account_quantity']}, claimed={d['claimed_quantity']}, "
-                        f"diff={d['difference']}"
-                    )
-                elif dtype == "over_claimed":
-                    lines.append(
-                        f"  OVER-CLAIMED: {d['symbol']} - "
-                        f"account={d['account_quantity']}, claimed={d['claimed_quantity']}, "
-                        f"diff={d['difference']}"
-                    )
-                elif dtype == "phantom_position":
-                    lines.append(
-                        f"  PHANTOM: {d['symbol']} - "
-                        f"account={d['account_quantity']}, claimed={d['claimed_quantity']}"
-                    )
-                elif dtype == "cash_mismatch":
-                    lines.append(
-                        f"  CASH: account=${d['account_cash']:,.2f}, "
-                        f"claimed=${d['claimed_cash']:,.2f}, "
-                        f"diff=${d['difference']:,.2f}"
-                    )
-            lines.append("")
-
-        adjustments = report.get("adjustments", [])
-        if adjustments:
-            lines.append("ADJUSTMENTS:")
-            for a in adjustments:
-                action = a.get("action", "unknown")
-                if action == "added_to_unassigned":
-                    lines.append(f"  Added {a['quantity']} {a['symbol']} to unassigned")
-                elif action == "removed_from_plugin":
-                    lines.append(
-                        f"  Removed {a['quantity']} {a['symbol']} from {a['plugin']}"
-                    )
-                elif action == "removed_phantom":
-                    lines.append(
-                        f"  Removed phantom {a['quantity']} {a['symbol']} from {a['plugin']}"
-                    )
-                elif action == "adjusted_unassigned_cash":
-                    lines.append(
-                        f"  Adjusted unassigned cash: "
-                        f"${a['old_value']:,.2f} -> ${a['new_value']:,.2f}"
-                    )
-
-        return "\n".join(lines)
-
     def get_holdings_summary(self) -> Dict[str, Any]:
         """
         Get a summary of holdings across all plugins including cash.
@@ -1255,12 +942,14 @@ class PluginExecutive:
         elif hasattr(from_plugin_obj, '_cash_balance'):
             # For UnassignedPlugin
             from_plugin_obj._cash_balance -= amount
+            from_plugin_obj.save_holdings()
 
         if to_plugin_obj.holdings:
             to_plugin_obj.holdings.add_cash(amount)
             to_plugin_obj.save_holdings()
         elif hasattr(to_plugin_obj, '_cash_balance'):
             to_plugin_obj._cash_balance += amount
+            to_plugin_obj.save_holdings()
 
         logger.info(f"Transferred ${amount:,.2f} cash: {from_plugin} -> {to_plugin}")
         return True, f"Transferred ${amount:,.2f} from '{from_plugin}' to '{to_plugin}'"
@@ -1339,6 +1028,7 @@ class PluginExecutive:
             # UnassignedPlugin uses _holdings directly
             if not from_plugin_obj._holdings.remove_position(symbol, quantity):
                 return False, f"Failed to remove {quantity} {symbol} from '{from_plugin}'"
+            from_plugin_obj.save_holdings()
 
         # Add to destination
         if to_plugin_obj.holdings:
@@ -1356,6 +1046,7 @@ class PluginExecutive:
                 cost_basis=cost_basis,
                 current_price=price or 0.0,
             )
+            to_plugin_obj.save_holdings()
 
         value = quantity * (price or 0.0)
         logger.info(f"Transferred {quantity} {symbol} (${value:,.2f}): {from_plugin} -> {to_plugin}")
@@ -1377,7 +1068,7 @@ class PluginExecutive:
 
         return [
             {
-                "symbol": p.get("symbol", p.get("symbol")),
+                "symbol": p.get("symbol"),
                 "quantity": p.get("quantity", 0),
                 "value": p.get("market_value", p.get("quantity", 0) * p.get("current_price", 0)),
             }
@@ -1615,6 +1306,7 @@ class PluginExecutive:
 
                     if hasattr(unassigned_plugin, '_cash_balance'):
                         unassigned_plugin._cash_balance = unassigned_cash
+                        unassigned_plugin.save_holdings()
                     elif unassigned_plugin.holdings:
                         unassigned_plugin.holdings.current_cash = unassigned_cash
 
@@ -2899,13 +2591,13 @@ class PluginExecutive:
                 if self.on_circuit_breaker_trip:
                     try:
                         self.on_circuit_breaker_trip(name)
-                    except:
+                    except Exception:
                         pass
 
             if self.on_error:
                 try:
                     self.on_error(name, e)
-                except:
+                except Exception:
                     pass
 
             return PluginResult(
@@ -3260,7 +2952,7 @@ class PluginExecutive:
                         f"Discarding unexecuted order: "
                         f"{reconciled.action} {reconciled.net_quantity} {reconciled.symbol}"
                     )
-            except (Empty, asyncio.QueueEmpty):
+            except asyncio.QueueEmpty:
                 break
 
     # =========================================================================
@@ -3305,6 +2997,20 @@ class PluginExecutive:
             "parameters": dict(config.parameters),
             "subscribed_channels": plugin.subscribed_channels,
             "source_file": str(config.source_file) if config.source_file else None,
+        }
+
+    def get_all_plugin_status(self) -> Dict[str, Dict[str, Any]]:
+        """Return a name-keyed summary dict for every registered plugin."""
+        return {
+            config.plugin.name: {
+                "instance_id": iid,
+                "state": config.plugin.state.value,
+                "enabled": config.enabled,
+                "run_count": config.run_count,
+                "error_count": config.error_count,
+                "circuit_breaker_state": config.circuit_breaker.state,
+            }
+            for iid, config in self._plugins.items()
         }
 
     def get_status(self) -> Dict[str, Any]:
