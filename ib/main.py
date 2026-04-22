@@ -948,7 +948,7 @@ class CommandHandler:
                         return flags[i + 1]
                 return default
 
-            from .plugins.base import PluginInstrument
+            from plugins.base import PluginInstrument
             inst = PluginInstrument(
                 symbol=symbol,
                 name=_flag("--name", symbol),
@@ -1910,9 +1910,8 @@ class CommandHandler:
         try:
             all_status = self.plugin_executive.get_all_plugin_status()
             for name, status in all_status.items():
-                plugin_config = self.plugin_executive._plugins.get(status["instance_id"])
-                if plugin_config and plugin_config.plugin:
-                    plugin = plugin_config.plugin
+                plugin = self.plugin_executive.get_plugin_by_id(status["instance_id"])
+                if plugin:
                     effective_holdings = plugin.get_effective_holdings()
 
                     holdings[name] = {
