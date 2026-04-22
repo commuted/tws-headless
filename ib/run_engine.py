@@ -130,10 +130,28 @@ def main():
         os.environ["IB_PLUGIN_DIR"] = str(Path(__file__).parent.parent / "plugins")
 
     # Get config from environment, then override with command line
-    port = args.port or int(os.environ.get("PORT", "7497"))
+    _port_env = os.environ.get("PORT", "7497")
+    try:
+        port = args.port or int(_port_env)
+    except ValueError:
+        logger.error(f"Invalid PORT value '{_port_env}': must be an integer (e.g. PORT=7497)")
+        sys.exit(1)
+
     mode = args.mode or os.environ.get("MODE", "dry_run")
+
     mdt_env = os.environ.get("MARKET_DATA_TYPE")
-    market_data_type = args.market_data_type or (int(mdt_env) if mdt_env else None)
+    if mdt_env is not None:
+        try:
+            _mdt_int = int(mdt_env)
+        except ValueError:
+            logger.error(
+                f"Invalid MARKET_DATA_TYPE value '{mdt_env}': "
+                "must be 1 (live), 2 (frozen), 3 (delayed), or 4 (delayed-frozen)"
+            )
+            sys.exit(1)
+    else:
+        _mdt_int = None
+    market_data_type = args.market_data_type or _mdt_int
 
     logger.info("=" * 60)
     logger.info("IB Trading Engine")

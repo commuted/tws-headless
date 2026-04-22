@@ -710,6 +710,11 @@ class PluginExecutive:
         """Get list of registered plugin instance IDs"""
         return list(self._plugins.keys())
 
+    def get_plugin_by_id(self, instance_id: str) -> Optional[Any]:
+        """Return the plugin object for the given instance UUID, or None."""
+        config = self._plugins.get(instance_id)
+        return config.plugin if config else None
+
     @property
     def stats(self) -> Dict[str, Any]:
         """Get executive statistics"""
