@@ -1,4 +1,3 @@
-# This is not functional, Claude hmmm. Please stand by
 
 # TWS Headless
 
