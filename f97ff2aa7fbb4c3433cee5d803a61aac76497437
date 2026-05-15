@@ -1,0 +1,14 @@
+{"id":"51c75338-de4a-4269-8715-a5681f878676","ts":"2026-05-15T00:28:39.048Z","path":"/home/ron/bob/tws-headless/AGENTS.md","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"0f6a3bfa-37c7-43ca-9e72-761ea122253b","ts":"2026-05-15T00:33:11.158Z","path":"/home/ron/bob/tws-headless/AGENTS.md","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"8d6c6722-154a-4441-a394-cb812039b1f0","ts":"2026-05-15T01:24:31.606Z","path":"/home/ron/bob/tws-headless/fix_imports.py","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"97c3be2d-77e5-4c53-8fdf-b106a03ab75b","ts":"2026-05-15T01:27:16.626Z","path":"/home/ron/bob/tws-headless/fix_test_imports.py","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"7395389d-3909-4b90-a9da-7e2bdd23b1bc","ts":"2026-05-15T01:41:53.157Z","path":"/home/ron/bob/tws-headless/AGENTS.md","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"9b4d3793-e52a-4fa4-acb3-a38743df1880","ts":"2026-05-15T01:41:53.170Z","path":"/home/ron/bob/tws-headless/plugin_execution_log.py","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"c5fb985f-986a-4909-9b6c-9bf67bcb20d9","ts":"2026-05-15T01:41:53.182Z","path":"/home/ron/bob/tws-headless/portfolio.py","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"c718b7fb-e480-468f-8504-f1c81a951c1e","ts":"2026-05-15T01:41:53.190Z","path":"/home/ron/bob/tws-headless/plugin_executive.py","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"5ee8bbc3-a0f5-48d8-957d-d9d1ee33ce21","ts":"2026-05-15T01:41:53.198Z","path":"/home/ron/bob/tws-headless/tests/test_plugin_execution_log.py","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"66121619-4960-4aa3-8af3-f6abb3921d81","ts":"2026-05-15T01:41:53.207Z","path":"/home/ron/bob/tws-headless/tests/test_plugin_executive.py","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"6bff13c6-42bd-48f9-b163-af44ec714bf0","ts":"2026-05-15T01:41:53.215Z","path":"/home/ron/bob/tws-headless/algorithm_runner.py","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"2fbba76b-e22f-4ca0-9ad7-bc96549478b2","ts":"2026-05-15T01:41:53.223Z","path":"/home/ron/bob/tws-headless/order_reconciler.py","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"b45e0ead-3fb4-47f5-99c1-f9a10a753eb8","ts":"2026-05-15T01:41:53.231Z","path":"/home/ron/bob/tws-headless/plugin_loader.py","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
+{"id":"762fb552-a75d-4ec3-9ae2-ca548c64d788","ts":"2026-05-15T01:41:53.239Z","path":"/home/ron/bob/tws-headless/trading_engine.py","version":"1.0.0","taskID":"034a0579-9547-40e8-9570-d764edb5666b"}
