@@ -132,6 +132,7 @@ def portfolio_instance(mock_ibapi):
         portfolio._depth_subscriptions = {}
         portfolio._depth_req_ids = {}
         portfolio._depth_books = {}
+        portfolio._depth_is_smart = {}
         portfolio._on_depth = None
 
         # P&L subscriptions
