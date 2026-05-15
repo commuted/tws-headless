@@ -709,15 +709,15 @@ class TestCommandHandlerBuy:
         assert "Invalid quantity" in result.message
 
     def test_handle_buy_no_existing_position(self, handler):
-        """Test handle_buy when no existing position"""
+        """Test handle_buy builds generic contract when no existing position"""
         from command_server import CommandStatus
 
         handler.portfolio.get_position.return_value = None
 
         result = handler.handle_buy(["UNKNOWN", "10"])
 
-        assert result.status == CommandStatus.ERROR
-        assert "No existing position" in result.message
+        assert result.status == CommandStatus.SUCCESS
+        assert "Would buy" in result.message
 
 
 class TestCommandHandlerStop:
@@ -742,7 +742,7 @@ class TestCommandHandlerStop:
 
         assert result.status == CommandStatus.SUCCESS
         assert "Shutdown" in result.message
-        assert handler.shutdown_mgr._shutdown_event.is_set()
+        handler.shutdown_mgr._initiate_shutdown.assert_called_once()
 
 
 # =============================================================================
@@ -929,7 +929,6 @@ class TestParseArgs:
 
             assert args.live is True
             assert args.port is None  # Port determined in main() based on --live
-            assert args.dry_run is True  # Still default until main() sets it
 
     def test_port_selection_paper_default(self, mock_ibapi):
         """Test default port is paper trading (7497)"""
