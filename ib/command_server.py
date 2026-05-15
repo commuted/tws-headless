@@ -216,7 +216,7 @@ class CommandServer:
 
         try:
             self._running = True
-            self._serve_task = asyncio.get_event_loop().create_task(self._serve())
+            self._serve_task = asyncio.create_task(self._serve())
             logger.info(f"Command server starting on {self._address_str}")
             return True
         except Exception as e:

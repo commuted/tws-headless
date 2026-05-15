@@ -18,7 +18,7 @@ import signal
 import sys
 import time
 from datetime import datetime
-from threading import Event
+# threading.Event removed - using asyncio.Event instead
 from typing import Any, Dict, List, Optional
 
 from .portfolio import Portfolio
@@ -69,13 +69,14 @@ class ShutdownManager:
     RESET_TIMEOUT = 10.0  # seconds
 
     def __init__(self):
-        self._shutdown_event = Event()
+        self._shutdown_event = asyncio.Event()
         self._portfolio: Optional[Portfolio] = None
         self._original_sigint = None
         self._original_sigterm = None
         self._sigint_count = 0
         self._first_sigint_time: Optional[float] = None
         self._shutdown_initiated = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @property
     def should_shutdown(self) -> bool:
@@ -86,8 +87,14 @@ class ShutdownManager:
         """Register the portfolio instance for cleanup"""
         self._portfolio = portfolio
 
-    def install_handlers(self):
-        """Install signal handlers for SIGINT and SIGTERM"""
+    def install_handlers(self, loop: asyncio.AbstractEventLoop):
+        """
+        Install signal handlers for SIGINT and SIGTERM.
+        
+        Args:
+            loop: The event loop to use for scheduling shutdown
+        """
+        self._loop = loop
         self._original_sigint = signal.signal(signal.SIGINT, self._signal_handler)
         self._original_sigterm = signal.signal(signal.SIGTERM, self._signal_handler)
         atexit.register(self._cleanup)
@@ -149,7 +156,15 @@ class ShutdownManager:
             sys.exit(1)
 
         self._shutdown_initiated = True
-        self._shutdown_event.set()
+        
+        # Signal handlers run outside the event loop thread.
+        # Use call_soon_threadsafe to set the event from the correct thread.
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._shutdown_event.set)
+        else:
+            # Fallback if loop not available (shouldn't happen in normal operation)
+            self._shutdown_event.set()
+        
         self._cleanup()
 
     def _cleanup(self):
@@ -160,9 +175,9 @@ class ShutdownManager:
             except Exception as e:
                 logger.debug(f"Error during portfolio shutdown: {e}")
 
-    def wait(self, timeout: float = None) -> bool:
+    async def wait(self, timeout: float = None) -> bool:
         """
-        Wait for shutdown signal.
+        Wait for shutdown signal (async version).
 
         Args:
             timeout: Maximum time to wait (None = forever)
@@ -170,27 +185,33 @@ class ShutdownManager:
         Returns:
             True if shutdown was signaled, False if timeout
         """
-        return self._shutdown_event.wait(timeout=timeout)
+        if timeout is None:
+            await self._shutdown_event.wait()
+            return True
+        else:
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=timeout)
+                return True
+            except asyncio.TimeoutError:
+                return False
 
-    async def wait_interruptible(self, duration: float = 0, poll_interval: float = 0.1):
+    async def wait_interruptible(self, duration: float = 0):
         """
         Wait for specified duration or until shutdown.
 
         Args:
             duration: Time to wait in seconds (0 = until shutdown)
-            poll_interval: How often to check for shutdown
         """
         if duration > 0:
-            start = time.time()
-            while not self.should_shutdown:
-                elapsed = time.time() - start
-                if elapsed >= duration:
-                    break
-                remaining = min(poll_interval, duration - elapsed)
-                await asyncio.sleep(remaining)
+            # Wait for either the duration or shutdown event
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=duration)
+            except asyncio.TimeoutError:
+                # Duration elapsed without shutdown - this is normal
+                pass
         else:
-            while not self.should_shutdown:
-                await asyncio.sleep(poll_interval)
+            # Wait indefinitely for shutdown
+            await self._shutdown_event.wait()
 
 
 # Global shutdown manager instance
@@ -2263,7 +2284,7 @@ Examples:
     return parser.parse_args()
 
 
-def main():
+async def main():
     """Main entry point"""
     args = parse_args()
 
@@ -2273,8 +2294,9 @@ def main():
     elif args.quiet:
         logging.getLogger().setLevel(logging.WARNING)
 
-    # Install signal handlers for graceful shutdown
-    shutdown_manager.install_handlers()
+    # Get the running event loop and install signal handlers
+    loop = asyncio.get_running_loop()
+    shutdown_manager.install_handlers(loop)
 
     # Create rebalance config
     config = RebalanceConfig(
@@ -2302,66 +2324,63 @@ def main():
     # Register portfolio with shutdown manager for cleanup
     shutdown_manager.register_portfolio(portfolio)
 
-    async def _run():
-        command_server = None
-        if not await portfolio.connect():
-            logger.error("Failed to connect to IB")
-            sys.exit(1)
+    command_server = None
+    if not await portfolio.connect():
+        logger.error("Failed to connect to IB")
+        sys.exit(1)
 
-        try:
-            # Check for early shutdown
-            if shutdown_manager.should_shutdown:
-                return
+    try:
+        # Check for early shutdown
+        if shutdown_manager.should_shutdown:
+            return
 
-            # Load portfolio data
-            logger.info("Loading portfolio data...")
-            await portfolio.load(fetch_prices=True, fetch_account=True)
+        # Load portfolio data
+        logger.info("Loading portfolio data...")
+        await portfolio.load(fetch_prices=True, fetch_account=True)
 
-            # Check for early shutdown
-            if shutdown_manager.should_shutdown:
-                return
+        # Check for early shutdown
+        if shutdown_manager.should_shutdown:
+            return
 
-            # Start command server (unless disabled)
-            if not args.no_server:
-                command_server = CommandServer(socket_path=args.socket)
-                command_handler = CommandHandler(portfolio, shutdown_manager)
-                command_handler.register_commands(command_server)
-                if command_server.start():
-                    logger.info(f"Command server listening on {args.socket}")
-                else:
-                    logger.warning("Failed to start command server")
+        # Start command server (unless disabled)
+        if not args.no_server:
+            command_server = CommandServer(socket_path=args.socket)
+            command_handler = CommandHandler(portfolio, shutdown_manager)
+            command_handler.register_commands(command_server)
+            if command_server.start():
+                logger.info(f"Command server listening on {args.socket}")
+            else:
+                logger.warning("Failed to start command server")
 
-            # Show portfolio
-            show_portfolio(portfolio)
+        # Show portfolio
+        show_portfolio(portfolio)
 
-            # Streaming modes
-            if args.stream:
-                await stream_prices(portfolio, duration=args.duration)
+        # Streaming modes
+        if args.stream:
+            await stream_prices(portfolio, duration=args.duration)
 
-            elif args.bars:
-                await stream_bars(portfolio, duration=args.duration)
+        elif args.bars:
+            await stream_bars(portfolio, duration=args.duration)
 
-            # Rebalance actions
-            elif args.rebalance:
-                show_targets(DEFAULT_TARGETS)
+        # Rebalance actions
+        elif args.rebalance:
+            show_targets(DEFAULT_TARGETS)
 
-                if args.execute:
-                    execute_rebalance(portfolio, DEFAULT_TARGETS, config)
-                else:
-                    calculate_rebalance(portfolio, DEFAULT_TARGETS, config)
+            if args.execute:
+                execute_rebalance(portfolio, DEFAULT_TARGETS, config)
+            else:
+                calculate_rebalance(portfolio, DEFAULT_TARGETS, config)
 
-        except KeyboardInterrupt:
-            # This may happen if signal handler hasn't fully processed
-            logger.info("Interrupted")
-        finally:
-            # Stop command server
-            if command_server:
-                command_server.stop()
-            await portfolio.disconnect()
-            shutdown_manager.restore_handlers()
-
-    asyncio.run(_run())
+    except KeyboardInterrupt:
+        # This may happen if signal handler hasn't fully processed
+        logger.info("Interrupted")
+    finally:
+        # Stop command server
+        if command_server:
+            command_server.stop()
+        await portfolio.disconnect()
+        shutdown_manager.restore_handlers()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
