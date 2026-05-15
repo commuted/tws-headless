@@ -277,9 +277,9 @@ class ContractBuilder:
             Configured Contract object
         """
         contract = Contract()
+        contract.secType = "BOND"
         contract.secIdType = "CUSIP"
         contract.secId = cusip
-        contract.secType = "BOND"
         contract.exchange = exchange
         contract.currency = currency
         return contract
@@ -299,6 +299,7 @@ class ContractBuilder:
         contract = Contract()
         contract.secType = "BOND"
         contract.conId = con_id
+        contract.secType = "BOND"
         contract.exchange = exchange
         return contract
 

@@ -222,21 +222,14 @@ class ExecutionLogReader:
         end_date: date,
     ) -> List[PluginExecutionLog]:
         """Read all entries from a date range (inclusive)"""
+        from datetime import timedelta
+
         entries = []
         current = start_date
 
         while current <= end_date:
             entries.extend(self.read_date(current))
-            current = date(
-                current.year,
-                current.month,
-                current.day + 1 if current.day < 28 else 1,
-            )
-            # Simple date increment
-            from datetime import timedelta
-            current = start_date + timedelta(days=(current - start_date).days + 1)
-            if current > end_date:
-                break
+            current += timedelta(days=1)
 
         return entries
 
