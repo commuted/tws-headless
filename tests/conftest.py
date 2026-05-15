@@ -105,7 +105,7 @@ sys.modules['security_pool'] = security_pool
 sys.modules['plugin_executive'] = plugin_executive
 
 # ibctl is at root level only (not in inner ib/ package)
-from ib import ibctl
+import ibctl
 sys.modules['ibctl'] = ibctl
 
 

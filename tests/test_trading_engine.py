@@ -234,6 +234,9 @@ class TestStartStop:
         """Test stopping the engine"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
+            engine._runner = MagicMock()
+            engine._data_feed = MagicMock()
+            engine._connection_manager = MagicMock()
             engine._state = EngineState.RUNNING
             engine._plugin_executive = Mock()
             engine._plugin_executive.stop = AsyncMock()
@@ -277,6 +280,7 @@ class TestPauseResume:
         """Test pausing the engine"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
+            engine._runner = MagicMock()
             engine._state = EngineState.RUNNING
             engine._plugin_executive = Mock()
 
@@ -297,6 +301,7 @@ class TestPauseResume:
         """Test resuming the engine"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
+            engine._runner = MagicMock()
             engine._state = EngineState.PAUSED
             engine._plugin_executive = Mock()
 
@@ -368,6 +373,7 @@ class TestGetStatus:
         """Test getting engine status"""
         with patch('trading_engine.Portfolio') as MockPortfolio:
             engine = TradingEngine()
+            engine._connection_manager = MagicMock()
             engine._subscribed_symbols.add("SPY")
 
             # Replace components with mocks
@@ -593,6 +599,7 @@ class TestResubscribeInstruments:
         """Test instruments are resubscribed on reconnect"""
         with patch('trading_engine.Portfolio'):
             engine = TradingEngine()
+            engine._data_feed = MagicMock()
             engine._subscribed_symbols.add("SPY")
             engine._data_feed = Mock()
 

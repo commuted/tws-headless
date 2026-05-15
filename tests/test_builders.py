@@ -94,7 +94,7 @@ class TestContractBuilderOption:
 
     def test_option_by_local_symbol(self):
         """Test option by local symbol"""
-        contract = ContractBuilder.option_by_local_symbol("AAPL  251219C00150000")
+        contract = ContractBuilder.option_by_local_symbol("AAPL  251219C00150000", exchange="SMART")
         assert contract.localSymbol == "AAPL  251219C00150000"
         assert contract.secType == "OPT"
         assert contract.exchange == "SMART"
@@ -241,7 +241,7 @@ class TestContractBuilderCombo:
 
     def test_combo_leg_creation(self):
         """Test combo leg creation"""
-        leg = ContractBuilder.create_combo_leg(265598, "BUY", 1)
+        leg = ContractBuilder.create_combo_leg(265598, "BUY", 1, "SMART")
         assert leg.conId == 265598
         assert leg.action == "BUY"
         assert leg.ratio == 1
@@ -249,8 +249,8 @@ class TestContractBuilderCombo:
 
     def test_combo_contract(self):
         """Test combo contract creation"""
-        leg1 = ContractBuilder.create_combo_leg(265598, "BUY", 1)
-        leg2 = ContractBuilder.create_combo_leg(265599, "SELL", 1)
+        leg1 = ContractBuilder.create_combo_leg(265598, "BUY", 1, "SMART")
+        leg2 = ContractBuilder.create_combo_leg(265599, "SELL", 1, "SMART")
         contract = ContractBuilder.combo("SPY", [leg1, leg2])
         assert contract.symbol == "SPY"
         assert contract.secType == "BAG"
@@ -387,10 +387,10 @@ class TestOrderFactoryTrailing:
     """Tests for trailing stop order creation"""
 
     def test_trailing_stop_amount(self):
-        """Test trailing stop with amount"""
-        order = OrderFactory.trailing_stop("SELL", Decimal("100"), trail_amount=2.0)
+        """Test trailing stop with trailing percent"""
+        order = OrderFactory.trailing_stop("SELL", Decimal("100"), trail_percent=2.0)
         assert order.orderType == "TRAIL"
-        assert order.auxPrice == 2.0
+        assert order.trailingPercent == 2.0
         assert order.totalQuantity == Decimal("100")
         assert order.action == "SELL"
 
@@ -423,10 +423,10 @@ class TestOrderFactoryPegged:
 
     def test_pegged_to_midpoint(self):
         """Test pegged to midpoint order"""
-        order = OrderFactory.pegged_to_midpoint("BUY", Decimal("100"))
+        order = OrderFactory.pegged_to_midpoint("BUY", Decimal("100"), 0.05, 150.0)
         assert order.orderType == "PEG MID"
-        assert order.auxPrice == 0.0
-        assert order.lmtPrice == 0.0
+        assert order.auxPrice == 0.05
+        assert order.lmtPrice == 150.0
 
     def test_midprice(self):
         """Test midprice order"""
@@ -439,10 +439,10 @@ class TestOrderFactoryRelative:
 
     def test_relative(self):
         """Test relative order"""
-        order = OrderFactory.relative("BUY", Decimal("100"), 0.01)
+        order = OrderFactory.relative("BUY", Decimal("100"), 0.01, 150.0)
         assert order.orderType == "REL"
         assert order.auxPrice == 0.01
-        assert order.lmtPrice == 0.0
+        assert order.lmtPrice == 150.0
 
     def test_passive_relative(self):
         """Test passive relative order"""
