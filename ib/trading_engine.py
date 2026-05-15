@@ -760,7 +760,10 @@ class TradingEngine:
                     )
                 else:
                     logger.info("Shutdown confirmed, stopping engine...")
-                    asyncio.create_task(self.stop())
+                    # Signal handlers run outside the event loop thread.
+                    # Create the coroutine here (cheap), then let the loop
+                    # schedule it as a task via call_soon_threadsafe.
+                    self._loop.call_soon_threadsafe(self._loop.create_task, self.stop())
 
             signal.signal(signal.SIGINT, signal_handler)
             signal.signal(signal.SIGTERM, signal_handler)

@@ -115,8 +115,10 @@ class TestShutdownManagerSignalHandlers:
              patch('builtins.print'):
             # Return a mock handler
             mock_signal.return_value = MagicMock()
-
-            manager.install_handlers()
+            
+            # Create a mock event loop
+            mock_loop = MagicMock()
+            manager.install_handlers(mock_loop)
 
             # Check signal.signal was called for SIGINT and SIGTERM
             calls = mock_signal.call_args_list
@@ -126,6 +128,9 @@ class TestShutdownManagerSignalHandlers:
 
             # Check atexit was registered
             mock_atexit.assert_called_once()
+            
+            # Check loop was stored
+            assert manager._loop is mock_loop
 
     def test_restore_handlers(self, manager):
         """Test signal handlers are restored"""
@@ -286,37 +291,34 @@ class TestShutdownManagerWait:
         from main import ShutdownManager
         return ShutdownManager()
 
-    def test_wait_returns_true_when_set(self, manager):
+    async def test_wait_returns_true_when_set(self, manager):
         """Test wait returns True when shutdown is set"""
         manager._shutdown_event.set()
 
-        result = manager.wait(timeout=0.1)
+        result = await manager.wait(timeout=0.1)
 
         assert result is True
 
-    def test_wait_returns_false_on_timeout(self, manager):
+    async def test_wait_returns_false_on_timeout(self, manager):
         """Test wait returns False on timeout"""
-        result = manager.wait(timeout=0.01)
+        result = await manager.wait(timeout=0.01)
 
         assert result is False
 
     async def test_wait_interruptible_exits_on_shutdown(self, manager):
         """Test wait_interruptible exits when shutdown is set"""
-        import threading
-
-        # Set shutdown after a short delay
-        def set_shutdown():
-            time.sleep(0.05)
+        # Set shutdown after a short delay using asyncio
+        async def set_shutdown():
+            await asyncio.sleep(0.05)
             manager._shutdown_event.set()
 
-        thread = threading.Thread(target=set_shutdown)
-        thread.start()
+        task = asyncio.create_task(set_shutdown())
 
         start = time.time()
-        await manager.wait_interruptible(duration=0, poll_interval=0.01)
+        await manager.wait_interruptible(duration=0)
         elapsed = time.time() - start
 
-        thread.join()
+        await task
 
         # Should have exited shortly after shutdown was set
         assert elapsed < 0.5
@@ -324,7 +326,7 @@ class TestShutdownManagerWait:
     async def test_wait_interruptible_duration(self, manager):
         """Test wait_interruptible with duration"""
         start = time.time()
-        await manager.wait_interruptible(duration=0.1, poll_interval=0.01)
+        await manager.wait_interruptible(duration=0.1)
         elapsed = time.time() - start
 
         # Should have waited approximately the duration
@@ -1110,7 +1112,7 @@ class TestExecuteRebalance:
 class TestMainFunction:
     """Tests for main() function"""
 
-    def test_main_connection_failure(self, mock_ibapi):
+    async def test_main_connection_failure(self, mock_ibapi):
         """Test main exits on connection failure"""
         with patch('main.parse_args') as mock_args, \
              patch('main.Portfolio') as MockPortfolio, \
@@ -1136,11 +1138,11 @@ class TestMainFunction:
             mock_portfolio.disconnect = AsyncMock()
 
             from main import main
-            main()
+            await main()
 
             mock_exit.assert_called_once_with(1)
 
-    def test_main_shows_portfolio(self, mock_ibapi):
+    async def test_main_shows_portfolio(self, mock_ibapi):
         """Test main shows portfolio by default"""
         with patch('main.parse_args') as mock_args, \
              patch('main.Portfolio') as MockPortfolio, \
@@ -1169,7 +1171,7 @@ class TestMainFunction:
             mock_portfolio.disconnect = AsyncMock()
 
             from main import main
-            main()
+            await main()
 
             mock_show.assert_called_once()
 
