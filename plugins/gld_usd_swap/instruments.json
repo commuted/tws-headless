@@ -1,0 +1,6 @@
+{"instruments": [
+  {"symbol": "GLD",  "name": "Gold ETF",                    "weight": 100.0, "min_weight": 0.0, "max_weight": 100.0, "enabled": true,  "exchange": "SMART", "currency": "USD", "sec_type": "STK"},
+  {"symbol": "UUP",  "name": "USD Bull ETF (signal only)",  "weight": 0.0,   "min_weight": 0.0, "max_weight": 0.0,   "enabled": true,  "exchange": "SMART", "currency": "USD", "sec_type": "STK"},
+  {"symbol": "TLT",  "name": "20yr Treasury ETF (signal)",  "weight": 0.0,   "min_weight": 0.0, "max_weight": 0.0,   "enabled": true,  "exchange": "SMART", "currency": "USD", "sec_type": "STK"},
+  {"symbol": "RINF", "name": "Inflation Exp ETF (signal)",  "weight": 0.0,   "min_weight": 0.0, "max_weight": 0.0,   "enabled": true,  "exchange": "SMART", "currency": "USD", "sec_type": "STK"}
+]}
