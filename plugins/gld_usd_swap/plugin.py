@@ -68,10 +68,11 @@ Default parameters (tunable at runtime):
   allocation_dollars     = 10 000 USD
 """
 
+import bisect
 import logging
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from itertools import groupby
 from typing import Dict, List, Optional
 
 from ibapi.order import Order as IbOrder
@@ -151,20 +152,27 @@ class _InstrumentState:
 
     def __init__(self, init_derivative: float, maxlen_closes: int = 80,
                  maxlen_moves: int = 200):
-        self.smoother:    _StreamingTriangleTooth = _StreamingTriangleTooth(init_derivative)
-        self.derivative:  float = init_derivative
-        self.closes:      deque = deque(maxlen=maxlen_closes)
-        self.abs_moves:   deque = deque(maxlen=maxlen_moves)
-        self.prev_close:  float = 0.0
-        self.price:       float = 0.0
-        self.fast_sma:    float = 0.0
-        self.slow_sma:    float = 0.0
+        self.smoother:      _StreamingTriangleTooth = _StreamingTriangleTooth(init_derivative)
+        self.derivative:    float = init_derivative
+        self.closes:        deque = deque(maxlen=maxlen_closes)
+        self.abs_moves:     deque = deque(maxlen=maxlen_moves)
+        self._sorted_moves: list  = []   # sorted mirror of abs_moves for O(log n) percentile
+        self.prev_close:    float = 0.0
+        self.price:         float = 0.0
+        self.fast_sma:      float = 0.0
+        self.slow_sma:      float = 0.0
 
     def push(self, close: float, vol_window: int, percentile: int,
              fast: int, slow: int, change_thresh: float = 0.05) -> None:
         """Feed one bar. Updates closes, SMAs, and adapts derivative."""
         if self.prev_close > 0:
-            self.abs_moves.append(abs(close - self.prev_close))
+            move = abs(close - self.prev_close)
+            if len(self.abs_moves) == self.abs_moves.maxlen:
+                # Evict oldest before the deque drops it
+                evicted = self.abs_moves[0]
+                del self._sorted_moves[bisect.bisect_left(self._sorted_moves, evicted)]
+            self.abs_moves.append(move)
+            bisect.insort(self._sorted_moves, move)
             self._adapt(percentile, change_thresh)
         self.prev_close = close
         self.price      = close
@@ -181,12 +189,11 @@ class _InstrumentState:
         return len(self.closes) >= slow
 
     def _adapt(self, percentile: int, change_thresh: float) -> None:
-        moves = sorted(self.abs_moves)
-        n     = len(moves)
+        n = len(self._sorted_moves)
         if n < 5:
             return
         idx       = max(0, int(n * percentile / 100) - 1)
-        new_deriv = moves[idx]
+        new_deriv = self._sorted_moves[idx]
         if new_deriv <= 0:
             return
         if abs(new_deriv - self.derivative) / self.derivative > change_thresh:
@@ -251,8 +258,10 @@ class GldUsdSwapPlugin(PluginBase):
         self._gld_price:    float = 0.0
         self._holding_gld:  bool  = False
 
+        # --- pending order tracking (order_id → "BUY"/"SELL") ---
+        self._pending_order_actions: Dict[int, str] = {}
+
         # --- diagnostics ---
-        self._pending_signals:  List[TradeSignal] = []
         self._trade_count:      int               = 0
         self._overnight_holds:  int               = 0
         self._intraday_holds:   int               = 0
@@ -308,10 +317,39 @@ class GldUsdSwapPlugin(PluginBase):
                 self._holding_gld = False
 
         self._warm_up_from_history()
+        self._start_subscriptions()
 
-        # Subscribe to live 5-min bars via keepUpToDate=True.
-        # IB delivers backfill bars (historicalData) then live updates
-        # (historicalDataUpdate) through the same on_bar callback.
+        logger.info(
+            f"Started GLD/USD swap v{self.VERSION}: "
+            f"fast={self.fast_bars} slow={self.slow_bars}, "
+            f"meta={self.meta_fast_bars}/{self.meta_slow_bars}, "
+            f"alloc=${self.allocation_dollars:,.0f}, "
+            f"holding={self._holding_gld}, prior_regime={self._regime_at_prior_close}"
+        )
+        return True
+
+    def stop(self) -> bool:
+        self._cancel_subscriptions()
+        self._save_state()
+        return True
+
+    def freeze(self) -> bool:
+        self._save_state()
+        return True
+
+    def resume(self) -> bool:
+        # Cancel stale req_ids (no-op if the connection dropped) then
+        # re-subscribe so live bars are guaranteed after any freeze.
+        self._cancel_subscriptions()
+        self._start_subscriptions()
+        return True
+
+    def _start_subscriptions(self) -> None:
+        """Subscribe to live 5-min bars for all four symbols.
+
+        IB delivers backfill bars (historicalData) then live updates
+        (historicalDataUpdate) through the same on_bar callback.
+        """
         self._live_bar_req_ids: Dict[str, Optional[int]] = {}
         for symbol, cb in [
             ("GLD",  lambda b, s="GLD":  self._on_live_bar(s, b)),
@@ -325,29 +363,11 @@ class GldUsdSwapPlugin(PluginBase):
             )
             self._live_bar_req_ids[symbol] = req_id
 
-        logger.info(
-            f"Started GLD/USD swap v{self.VERSION}: "
-            f"fast={self.fast_bars} slow={self.slow_bars}, "
-            f"meta={self.meta_fast_bars}/{self.meta_slow_bars}, "
-            f"alloc=${self.allocation_dollars:,.0f}, "
-            f"holding={self._holding_gld}, prior_regime={self._regime_at_prior_close}"
-        )
-        return True
-
-    def stop(self) -> bool:
+    def _cancel_subscriptions(self) -> None:
         for req_id in getattr(self, "_live_bar_req_ids", {}).values():
             if req_id is not None:
                 self.cancel_live_bars(req_id)
-        self.unsubscribe_all()
-        self._save_state()
-        return True
-
-    def freeze(self) -> bool:
-        self._save_state()
-        return True
-
-    def resume(self) -> bool:
-        return True
+        self._live_bar_req_ids = {}
 
     def _save_state(self) -> None:
         self.save_state({
@@ -375,26 +395,30 @@ class GldUsdSwapPlugin(PluginBase):
 
     def _warm_up_from_history(self) -> None:
         """
-        Fetch 2 days of 5-min bars for UUP, TLT, and RINF (plus GLD for meta)
-        to seed all SMAs and derivative estimators on startup.
+        Fetch 2 days of 5-min bars for UUP, TLT, RINF, and GLD to seed all
+        SMAs and derivative estimators on startup.
 
-        Without warm-up the signal is dark for meta_slow_bars × 5 min = 300 min
-        (5 hours at defaults) after every restart.
+        Bars are replayed in chronological order across all symbols so that
+        _recompute_regime() sees a consistent multi-signal snapshot at each
+        bar time.  The regime at the last 15:45 bar is captured as the
+        prior-close regime.
         """
         if not self.portfolio:
             logger.info("Warm-up skipped — no portfolio (test mode)")
             return
 
-        last_close_regime = REGIME_UNKNOWN
         _UTC = timezone.utc
         _now = datetime.now(_UTC)
         _start = _now - timedelta(days=2)
 
-        for symbol, state, init_d in [
-            ("UUP",  self._uup,  _INIT_DERIV_UUP),
-            ("TLT",  self._tlt,  _INIT_DERIV_TLT),
-            ("RINF", self._rinf, _INIT_DERIV_RINF),
-        ]:
+        # --- fetch all symbols upfront ---
+        signal_configs = [
+            ("UUP",  self._uup),
+            ("TLT",  self._tlt),
+            ("RINF", self._rinf),
+        ]
+        bars_by_symbol: Dict[str, list] = {}
+        for symbol, _ in signal_configs + [("GLD", None)]:
             bars = self.get_bars_cached(
                 contract=ContractBuilder.etf(symbol),
                 start_dt=_start,
@@ -405,61 +429,55 @@ class GldUsdSwapPlugin(PluginBase):
             )
             if not bars:
                 logger.warning(f"Warm-up: no historical data for {symbol}")
-                continue
+            bars_by_symbol[symbol] = bars or []
 
+        # --- merge into a single chronological stream ---
+        merged: List[tuple] = []
+        for symbol, bars in bars_by_symbol.items():
             for b in bars:
-                state.push(
-                    float(b.close),
-                    self.vol_window,
-                    self.derivative_percentile,
-                    self.fast_bars,
-                    self.slow_bars,
+                merged.append((b.date, symbol, float(b.close)))
+        merged.sort(key=lambda x: x[0])
+
+        # --- replay in time order, capturing regime at each 15:45 bar ---
+        last_close_regime = REGIME_UNKNOWN
+        for ts_str, group in groupby(merged, key=lambda x: x[0]):
+            for _, symbol, close in group:
+                if symbol == "UUP":
+                    self._uup.push(close, self.vol_window, self.derivative_percentile,
+                                   self.fast_bars, self.slow_bars)
+                elif symbol == "TLT":
+                    self._tlt.push(close, self.vol_window, self.derivative_percentile,
+                                   self.fast_bars, self.slow_bars)
+                elif symbol == "RINF":
+                    self._rinf.push(close, self.vol_window, self.derivative_percentile,
+                                    self.fast_bars, self.slow_bars)
+                elif symbol == "GLD":
+                    self._push_gld_meta(close)
+                    self._gld_price = close
+
+            self._recompute_regime()
+
+            try:
+                ts = datetime.strptime(ts_str[:8] + " " + ts_str[9:17], "%Y%m%d %H:%M:%S")
+                if (ts.hour == _CLOSE_HOUR and ts.minute == _CLOSE_MIN
+                        and self._regime != REGIME_UNKNOWN):
+                    last_close_regime = self._regime
+            except (ValueError, AttributeError):
+                pass
+
+        # --- log per-symbol stats ---
+        for symbol, state in signal_configs:
+            bars = bars_by_symbol[symbol]
+            if bars:
+                logger.info(
+                    f"Warm-up {symbol}: {len(bars)} bars, "
+                    f"price={state.price:.4f}, deriv={state.derivative:.5f}, "
+                    f"fast={state.fast_sma:.4f}, slow={state.slow_sma:.4f}"
                 )
 
-            logger.info(
-                f"Warm-up {symbol}: {len(bars)} bars, "
-                f"price={state.price:.4f}, deriv={state.derivative:.5f}, "
-                f"fast={state.fast_sma:.4f}, slow={state.slow_sma:.4f}"
-            )
-
-        # GLD meta warm-up
-        gld_bars = self.get_bars_cached(
-            contract=ContractBuilder.etf("GLD"),
-            start_dt=_start,
-            end_dt=_now,
-            bar_size_setting="5 mins",
-            what_to_show="TRADES",
-            use_rth=True,
-        )
-        for b in gld_bars or []:
-            self._push_gld_meta(float(b.close))
-        if gld_bars:
-            self._gld_price = float(gld_bars[-1].close)
-
-        # Derive composite regime and detect last 15:45 bar regime
-        self._recompute_regime()
-
-        # Scan UUP bars for prior-close regime (if not already saved)
-        if self._regime_at_prior_close == REGIME_UNKNOWN:
-            uup_bars = self.get_bars_cached(
-                contract=ContractBuilder.etf("UUP"),
-                start_dt=_start,
-                end_dt=_now,
-                bar_size_setting="5 mins",
-                what_to_show="TRADES",
-                use_rth=True,
-            )
-            for b in uup_bars or []:
-                try:
-                    ts = datetime.strptime(b.date[:8] + " " + b.date[9:17], "%Y%m%d %H:%M:%S")
-                except (ValueError, AttributeError):
-                    continue
-                if ts.hour == _CLOSE_HOUR and ts.minute == _CLOSE_MIN:
-                    last_close_regime = self._regime  # regime at that 15:45 bar
-
-            if last_close_regime != REGIME_UNKNOWN:
-                self._regime_at_prior_close = last_close_regime
-                logger.info(f"Warm-up derived prior-close regime: {last_close_regime}")
+        if self._regime_at_prior_close == REGIME_UNKNOWN and last_close_regime != REGIME_UNKNOWN:
+            self._regime_at_prior_close = last_close_regime
+            logger.info(f"Warm-up derived prior-close regime: {last_close_regime}")
 
         logger.info(
             f"Warm-up complete: regime={self._regime}, "
@@ -593,7 +611,6 @@ class GldUsdSwapPlugin(PluginBase):
                         f"factors={self._last_factors}"
                     ),
                 )
-                self._holding_gld = False
         else:
             self._intraday_holds += 1
             logger.info(
@@ -607,7 +624,6 @@ class GldUsdSwapPlugin(PluginBase):
         Save current composite regime for tomorrow's open decision.
         Place MOC order to buy GLD overnight if not already long.
         """
-        self._recompute_regime()
         self._regime_at_prior_close = self._regime
 
         if not self._holding_gld:
@@ -620,8 +636,6 @@ class GldUsdSwapPlugin(PluginBase):
                         f"(tomorrow regime={self._regime}, factors={self._last_factors})"
                     ),
                 )
-                self._holding_gld  = True
-                self._overnight_holds += 1
         else:
             self._overnight_holds += 1
             logger.info(
@@ -635,7 +649,7 @@ class GldUsdSwapPlugin(PluginBase):
 
     def _place_moc_buy(self, shares: int, reason: str) -> None:
         self._trade_count    += 1
-        self._last_trade_time = datetime.now().isoformat()
+        self._last_trade_time = datetime.now(timezone.utc).isoformat()
 
         self.publish(
             "gld_usd_swap_signals",
@@ -664,22 +678,15 @@ class GldUsdSwapPlugin(PluginBase):
 
         oid = self.portfolio.place_order_custom(contract, order)
         if oid is not None:
+            self._pending_order_actions[oid] = "BUY"
             self.register_order(oid)
             logger.info(f"MOC BUY {shares} GLD (order_id={oid}) — {reason}")
         else:
             logger.error(f"Failed to place MOC BUY {shares} GLD — {reason}")
 
     def _emit_sell(self, qty: int, reason: str) -> None:
-        signal = TradeSignal(
-            symbol="GLD",
-            action="SELL",
-            quantity=Decimal(str(qty)),
-            reason=reason,
-            urgency="Urgent",
-        )
-        self._pending_signals.append(signal)
         self._trade_count    += 1
-        self._last_trade_time = datetime.now().isoformat()
+        self._last_trade_time = datetime.now(timezone.utc).isoformat()
 
         self.publish(
             "gld_usd_swap_signals",
@@ -694,7 +701,25 @@ class GldUsdSwapPlugin(PluginBase):
             },
             message_type="signal",
         )
-        logger.info(f"MKT SELL {qty} GLD @ ~${self._gld_price:.2f} — {reason}")
+
+        if not self.portfolio:
+            logger.info(f"[no portfolio] MKT SELL {qty} GLD — {reason}")
+            return
+
+        contract            = ContractBuilder.etf("GLD")
+        order               = IbOrder()
+        order.action        = "SELL"
+        order.totalQuantity = qty
+        order.orderType     = "MKT"
+        order.transmit      = True
+
+        oid = self.portfolio.place_order_custom(contract, order)
+        if oid is not None:
+            self._pending_order_actions[oid] = "SELL"
+            self.register_order(oid)
+            logger.info(f"MKT SELL {qty} GLD (order_id={oid}) — {reason}")
+        else:
+            logger.error(f"Failed to place MKT SELL {qty} GLD — {reason}")
 
     def _current_gld_shares(self) -> int:
         if self.portfolio:
@@ -708,8 +733,45 @@ class GldUsdSwapPlugin(PluginBase):
     # =========================================================================
 
     def calculate_signals(self) -> List[TradeSignal]:
-        signals, self._pending_signals = self._pending_signals[:], []
-        return signals
+        # Orders are placed directly; the signal queue is not used.
+        return []
+
+    # =========================================================================
+    # ORDER FILL / STATUS
+    # =========================================================================
+
+    def on_order_fill(self, order_record) -> None:
+        action = self._pending_order_actions.pop(order_record.order_id, None)
+        if action == "BUY":
+            self._holding_gld = True
+            self._overnight_holds += 1
+            logger.info(
+                f"MOC BUY filled: {order_record.filled_quantity:.0f} GLD "
+                f"@ ${order_record.avg_fill_price:.2f}"
+            )
+        elif action == "SELL":
+            self._holding_gld = False
+            logger.info(
+                f"MKT SELL filled: {order_record.filled_quantity:.0f} GLD "
+                f"@ ${order_record.avg_fill_price:.2f}"
+            )
+        if action:
+            self._save_state()
+
+    def on_order_status(self, order_record) -> None:
+        from ib.models import OrderStatus
+        if order_record.status not in (
+            OrderStatus.CANCELLED, OrderStatus.INACTIVE, OrderStatus.ERROR
+        ):
+            return
+        action = self._pending_order_actions.pop(order_record.order_id, None)
+        if action:
+            logger.error(
+                f"{action} order {order_record.order_id} "
+                f"{order_record.status.value} — "
+                f"holding_gld={self._holding_gld} unchanged; "
+                f"manual reconciliation may be needed"
+            )
 
     # =========================================================================
     # REQUESTS / CLI

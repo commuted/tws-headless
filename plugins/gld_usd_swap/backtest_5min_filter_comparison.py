@@ -23,14 +23,19 @@ Usage:
 
 import argparse
 import bisect
+import os
 import sys
 import threading
 import time
 from collections import deque, defaultdict
 from datetime import datetime
 
-sys.path.insert(0, "/home/ron/claude/pythonclient")
-sys.path.insert(0, "/home/ron/claude/volomom")
+# Allow overriding via environment variables; fall back to sibling directories
+# relative to this file so the script works without any configuration when the
+# repos are checked out next to each other.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.environ.get("IB_PKG_PARENT", os.path.join(_HERE, "..", "..", "..", "pythonclient")))
+sys.path.insert(0, os.environ.get("VOLOMOM_PATH",  os.path.join(_HERE, "..", "..", "..", "volomom")))
 
 from ibapi.client import EClient
 from ibapi.contract import Contract
