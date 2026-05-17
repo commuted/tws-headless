@@ -1,0 +1,5 @@
+{"instruments": [
+  {"symbol": "SPY",  "name": "S&P 500 ETF (US equity)",           "weight": 50.0, "min_weight": 0.0, "max_weight": 80.0, "enabled": true,  "exchange": "SMART", "currency": "USD", "sec_type": "STK"},
+  {"symbol": "VEA",  "name": "Developed Markets ex-US ETF (intl)", "weight": 30.0, "min_weight": 0.0, "max_weight": 50.0, "enabled": true,  "exchange": "SMART", "currency": "USD", "sec_type": "STK"},
+  {"symbol": "BND",  "name": "Total Bond Market ETF (fixed income)","weight": 20.0, "min_weight": 0.0, "max_weight": 40.0, "enabled": true,  "exchange": "SMART", "currency": "USD", "sec_type": "STK"}
+]}
