@@ -190,7 +190,7 @@ class PanicPlugin(PluginBase):
     def _handle_deposit(self, payload: Dict) -> Dict:
         """Validate and add positions to the liquidation queue."""
         positions = payload.get("positions")
-        if not positions or not isinstance(positions, list):
+        if not isinstance(positions, list):
             return {
                 "success": False,
                 "message": "Payload must contain 'positions' list",
