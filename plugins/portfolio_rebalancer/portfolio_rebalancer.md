@@ -1,6 +1,6 @@
 # Portfolio Rebalancer Plugin
 
-Full-account portfolio rebalancer. Manages the entire account against a set of target weights defined in `instruments.json`. Replaces the former standalone `ib/rebalancer.py` module with a proper plugin that integrates with the plugin lifecycle, message bus, and order-fill tracking.
+Portfolio rebalancer plugin. Like any other plugin it operates only on the capital explicitly transferred to it — it reads positions and total value from its own holdings, not from the full account. Fund it with `transfer cash` and `transfer position` from `_unassigned` to give it a slice of the account to manage.
 
 ## Strategy Overview
 
@@ -49,7 +49,7 @@ state.json (all parameters, last calendar date, rebalance/fill counts)
 
 ## Loading and Funding
 
-The rebalancer manages the **entire account** — it is not restricted to a subset of symbols. Load it, give the account to it, then configure your targets.
+The rebalancer only manages the capital transferred to it. It reads all positions and value from its own holdings (`self._holdings`), not from the full account. Transfer exactly the cash and positions you want it to control.
 
 ```bash
 # Load the plugin
@@ -58,11 +58,13 @@ The rebalancer manages the **entire account** — it is not restricted to a subs
 # Start (loads saved state, starts bar subscriptions, starts background thread if mode != manual)
 ./ibctl.py plugin start portfolio_rebalancer
 
-# Transfer the full unassigned pool to the rebalancer
+# See what is available to transfer
 ./ibctl.py transfer list _unassigned
+
+# Fund with cash
 ./ibctl.py transfer cash _unassigned portfolio_rebalancer 100000 --confirm
 
-# Transfer any existing positions you want it to manage
+# Transfer positions you want it to manage
 ./ibctl.py transfer position _unassigned portfolio_rebalancer SPY 200 --confirm
 ./ibctl.py transfer position _unassigned portfolio_rebalancer BND 100 --confirm
 ```

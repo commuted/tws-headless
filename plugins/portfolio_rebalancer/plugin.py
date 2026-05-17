@@ -1,8 +1,10 @@
 """
 plugins/portfolio_rebalancer/plugin.py
 
-Manages full-account portfolio rebalancing as a plugin, superseding the
-standalone ib/rebalancer.py module.
+Portfolio rebalancer plugin.  Like any other plugin it operates only on the
+capital explicitly transferred to it (via `transfer cash` / `transfer position`).
+It reads positions and total value from self._holdings, not from the full
+account portfolio.
 
 Target allocations are taken from instruments.json weight fields.  Weights
 must sum to ~100%.  An instrument with weight=0 that is currently held is
@@ -53,10 +55,11 @@ logger = logging.getLogger(__name__)
 
 class PortfolioRebalancerPlugin(PluginBase):
     """
-    Full-account portfolio rebalancer plugin.
+    Portfolio rebalancer plugin.
 
-    Replaces ib/rebalancer.py with a fully-implemented plugin that integrates
-    with the plugin lifecycle, message bus, and order-fill tracking.
+    Operates only on capital funded to this plugin via `transfer cash` and
+    `transfer position`.  All position reads and value calculations use
+    self._holdings — the plugin's own tracked holdings — not the full account.
 
     Three rebalancing strategies:
       threshold – trade only positions drifting beyond drift_threshold_pct
@@ -68,7 +71,7 @@ class PortfolioRebalancerPlugin(PluginBase):
     """
 
     VERSION = "1.0.0"
-    INSTRUMENT_COMPLIANCE = False   # manages full account, not a restricted symbol set
+    INSTRUMENT_COMPLIANCE = True    # only trades symbols registered in instruments.json
 
     MODES     = frozenset(("manual", "threshold", "calendar", "combined"))
     SCHEDULES = frozenset(("daily", "weekly", "monthly"))
@@ -453,16 +456,21 @@ class PortfolioRebalancerPlugin(PluginBase):
             logger.warning("No portfolio — skipping rebalance")
             return {"error": "no portfolio"}
 
+        if not self._holdings:
+            logger.warning("Plugin has no holdings — fund it first via 'transfer cash'")
+            return {"error": "no holdings — fund the plugin first"}
+
         total_value = self._portfolio_value()
         if total_value <= 0:
-            logger.warning("Portfolio value is zero — skipping rebalance")
-            return {"error": "zero portfolio value"}
+            logger.warning("Plugin holdings value is zero — skipping rebalance")
+            return {"error": "zero holdings value"}
 
         # Investable capital after the cash buffer reserve
         investable = total_value * (1.0 - self.cash_buffer_pct / 100.0)
 
+        # Build positions map from plugin holdings only (not the full account)
         positions_map: Dict[str, Any] = {
-            p.symbol: p for p in self.portfolio.positions
+            p.symbol: p for p in self._holdings.current_positions
         }
 
         # Build target-weight map from enabled instruments
@@ -480,11 +488,11 @@ class PortfolioRebalancerPlugin(PluginBase):
             )
             target_weights = {s: w / total_weight * 100.0 for s, w in target_weights.items()}
 
-        # Optionally include positions not in instruments.json as zero-weight targets
+        # Optionally sell holdings positions absent from instruments.json
         if self.manage_untracked:
-            for sym in positions_map:
-                if sym not in target_weights:
-                    target_weights[sym] = 0.0
+            for pos in self._holdings.current_positions:
+                if pos.symbol not in target_weights:
+                    target_weights[pos.symbol] = 0.0
 
         # Choose strategy based on current mode (calendar always uses exact targets)
         if self.mode == "calendar":
@@ -681,15 +689,15 @@ class PortfolioRebalancerPlugin(PluginBase):
 
     def _should_threshold_rebalance(self) -> bool:
         """Return True if any instrument drifts beyond drift_threshold_pct."""
-        if not self.portfolio or not self._instruments:
+        if not self._holdings or not self._instruments:
             return False
-        total = self._portfolio_value()
+        total = self._holdings.total_value
         if total <= 0:
             return False
         for sym, inst in self._instruments.items():
             if not inst.enabled:
                 continue
-            pos = self.portfolio.get_position(sym)
+            pos = self._holdings.get_position(sym)
             current_pct = ((pos.market_value / total * 100.0) if pos else 0.0)
             if abs(current_pct - inst.weight) >= self.drift_threshold_pct:
                 return True
@@ -732,15 +740,10 @@ class PortfolioRebalancerPlugin(PluginBase):
         return float(cached) if cached > 0 else None
 
     def _portfolio_value(self) -> float:
-        """Net liquidation value from account summary, or sum of position market values."""
-        if not self.portfolio:
+        """Total value of this plugin's holdings: cash + position market values."""
+        if not self._holdings:
             return 0.0
-        summary = self.portfolio.get_account_summary()
-        if summary:
-            nlv = getattr(summary, "net_liquidation", 0.0)
-            if nlv and nlv > 0:
-                return float(nlv)
-        return float(self.portfolio.total_value)
+        return float(self._holdings.total_value)
 
     # =========================================================================
     # Live bar subscriptions (price cache)
@@ -818,6 +821,8 @@ class PortfolioRebalancerPlugin(PluginBase):
             "calendar_schedule":  self.calendar_schedule,
             "manage_untracked":   self.manage_untracked,
             "instruments":        len(self._instruments),
+            "holdings_value":     self._portfolio_value(),
+            "holdings_cash":      (self._holdings.current_cash if self._holdings else 0.0),
             "cached_prices":      len(self._price_cache),
             "live_subscriptions": len(self._live_bar_req_ids),
             "last_check_time":    (
@@ -835,16 +840,24 @@ class PortfolioRebalancerPlugin(PluginBase):
         total_weight = sum(
             i.weight for i in self._instruments.values() if i.enabled
         )
+        total_value = self._portfolio_value()
+        rows = []
+        for sym, inst in self._instruments.items():
+            pos = self._holdings.get_position(sym) if self._holdings else None
+            current_value = pos.market_value if pos else 0.0
+            current_pct   = (current_value / total_value * 100.0) if total_value > 0 else 0.0
+            rows.append({
+                "symbol":        sym,
+                "name":          inst.name,
+                "target_pct":    inst.weight,
+                "current_pct":   round(current_pct, 2),
+                "drift":         round(current_pct - inst.weight, 2),
+                "current_value": round(current_value, 2),
+                "enabled":       inst.enabled,
+                "cached_price":  self._price_cache.get(sym),
+            })
         return {
-            "total_weight": round(total_weight, 2),
-            "targets": [
-                {
-                    "symbol":     sym,
-                    "name":       inst.name,
-                    "target_pct": inst.weight,
-                    "enabled":    inst.enabled,
-                    "cached_price": self._price_cache.get(sym),
-                }
-                for sym, inst in self._instruments.items()
-            ],
+            "total_weight":  round(total_weight, 2),
+            "holdings_value": round(total_value, 2),
+            "targets": rows,
         }
