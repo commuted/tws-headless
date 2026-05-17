@@ -22,14 +22,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .portfolio import Portfolio
-from .rebalancer import (
-    Rebalancer,
-    RebalanceConfig,
-    create_60_40_targets,
-    create_three_fund_targets,
-    create_equal_weight_targets,
-)
-from .models import TargetAllocation, AssetType, RebalanceStrategy, Bar, OrderAction
+from .models import Bar, OrderAction
 from .contract_builder import ContractBuilder
 from .command_server import (
     CommandServer,
@@ -1970,14 +1963,6 @@ DEFAULT_PORT = DEFAULT_PORT_PAPER
 DEFAULT_CLIENT_ID = 1
 
 # Example target allocations - customize for your portfolio
-DEFAULT_TARGETS = create_three_fund_targets(
-    us_pct=50.0,
-    intl_pct=30.0,
-    bond_pct=20.0,
-)
-
-# Alternative: Equal weight example
-# DEFAULT_TARGETS = create_equal_weight_targets(["SPY", "QQQ", "IWM", "EFA", "BND"])
 
 
 # =============================================================================
@@ -2024,20 +2009,6 @@ def show_portfolio(portfolio: Portfolio) -> None:
         print(f"  Net Liquidation: ${account.net_liquidation:,.2f}")
         print(f"  Available Funds: ${account.available_funds:,.2f}")
         print(f"  Buying Power:    ${account.buying_power:,.2f}")
-
-
-def show_targets(targets: List[TargetAllocation]) -> None:
-    """Display target allocations"""
-    print("\n" + "=" * 50)
-    print("TARGET ALLOCATIONS")
-    print("=" * 50)
-
-    for target in targets:
-        print(f"  {target.symbol:<8} {target.target_pct:>6.1f}%")
-
-    print("-" * 50)
-    print(f"  {'TOTAL':<8} {sum(t.target_pct for t in targets):>6.1f}%")
-    print("=" * 50)
 
 
 async def stream_prices(portfolio: Portfolio, duration: int = 0) -> None:
@@ -2141,54 +2112,6 @@ async def stream_bars(portfolio: Portfolio, duration: int = 0) -> None:
         print("=" * 100)
 
 
-def calculate_rebalance(
-    portfolio: Portfolio,
-    targets: List[TargetAllocation],
-    config: RebalanceConfig,
-) -> None:
-    """Calculate and display rebalancing trades"""
-    rebalancer = Rebalancer(portfolio=portfolio, config=config)
-    rebalancer.set_targets(targets)
-
-    result = rebalancer.calculate(strategy=RebalanceStrategy.THRESHOLD)
-    print(rebalancer.preview(result))
-
-
-def execute_rebalance(
-    portfolio: Portfolio,
-    targets: List[TargetAllocation],
-    config: RebalanceConfig,
-) -> None:
-    """Execute rebalancing trades (with confirmation)"""
-    rebalancer = Rebalancer(portfolio=portfolio, config=config)
-    rebalancer.set_targets(targets)
-
-    result = rebalancer.calculate(strategy=RebalanceStrategy.THRESHOLD)
-    print(rebalancer.preview(result))
-
-    if not result.actionable_trades:
-        print("No trades to execute.")
-        return
-
-    # Confirmation
-    print("\n*** TRADE EXECUTION ***")
-    print(f"This will execute {result.trade_count} trades.")
-
-    if config.dry_run:
-        print("(DRY RUN mode - trades will not actually execute)")
-
-    response = input("\nProceed? (yes/no): ").strip().lower()
-
-    if response == "yes":
-        success = rebalancer.execute(result)
-        if success:
-            print("Trades submitted successfully")
-        else:
-            print("Trade execution failed or not implemented")
-    else:
-        print("Cancelled")
-
-
 # =============================================================================
 # CLI
 # =============================================================================
@@ -2204,9 +2127,6 @@ Examples:
   %(prog)s --stream             Stream live tick prices for all positions
   %(prog)s --bars               Stream 5-second OHLCV bars for all positions
   %(prog)s --stream --duration 60  Stream for 60 seconds
-  %(prog)s --rebalance          Calculate rebalancing trades
-  %(prog)s --rebalance --execute Execute trades (with confirmation)
-  %(prog)s --threshold 3.0      Set drift threshold to 3%%
   %(prog)s --port 4002          Connect to IB Gateway paper trading
         """,
     )
@@ -2237,24 +2157,6 @@ Examples:
     parser.add_argument(
         "--duration", type=int, default=0,
         help="Stream duration in seconds (0 = until Ctrl+C)"
-    )
-    parser.add_argument(
-        "--rebalance", action="store_true",
-        help="Calculate rebalancing trades"
-    )
-    parser.add_argument(
-        "--execute", action="store_true",
-        help="Execute trades (requires --rebalance)"
-    )
-
-    # Rebalance options
-    parser.add_argument(
-        "--threshold", type=float, default=5.0,
-        help="Drift threshold %% to trigger rebalance (default: 5.0)"
-    )
-    parser.add_argument(
-        "--min-trade", type=float, default=100.0,
-        help="Minimum trade value in dollars (default: 100)"
     )
     parser.add_argument(
         "--live", action="store_true",
@@ -2297,13 +2199,6 @@ async def main():
     # Get the running event loop and install signal handlers
     loop = asyncio.get_running_loop()
     shutdown_manager.install_handlers(loop)
-
-    # Create rebalance config
-    config = RebalanceConfig(
-        drift_threshold_pct=args.threshold,
-        min_trade_value=args.min_trade,
-        dry_run=not args.live,
-    )
 
     # Determine port: explicit --port overrides, otherwise use --live flag
     if args.port is not None:
@@ -2361,15 +2256,6 @@ async def main():
 
         elif args.bars:
             await stream_bars(portfolio, duration=args.duration)
-
-        # Rebalance actions
-        elif args.rebalance:
-            show_targets(DEFAULT_TARGETS)
-
-            if args.execute:
-                execute_rebalance(portfolio, DEFAULT_TARGETS, config)
-            else:
-                calculate_rebalance(portfolio, DEFAULT_TARGETS, config)
 
     except KeyboardInterrupt:
         # This may happen if signal handler hasn't fully processed

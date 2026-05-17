@@ -82,14 +82,13 @@ sys.modules['command_server'] = command_server
 sys.modules['execution_db'] = execution_db
 
 # Import modules that depend on ibapi mocks
-from ib import client, portfolio, rebalancer, main
+from ib import client, portfolio, main
 from ib import data_feed, enter_exit, order_reconciler, trading_engine
 from ib import auth, connection_manager, contract_builder, order_builder, algo_params
 from ib import rate_limiter, security_pool, plugin_executive
 
 sys.modules['client'] = client
 sys.modules['portfolio'] = portfolio
-sys.modules['rebalancer'] = rebalancer
 sys.modules['main'] = main
 sys.modules['data_feed'] = data_feed
 sys.modules['enter_exit'] = enter_exit

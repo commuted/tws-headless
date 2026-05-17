@@ -796,27 +796,6 @@ class TestShowPortfolio:
             assert any("SPY" in c for c in calls)
 
 
-class TestShowTargets:
-    """Tests for show_targets function"""
-
-    def test_show_targets(self, mock_ibapi):
-        """Test show_targets displays targets"""
-        from main import show_targets
-        from models import TargetAllocation
-
-        targets = [
-            TargetAllocation(symbol="VTI", target_pct=50.0),
-            TargetAllocation(symbol="BND", target_pct=50.0),
-        ]
-
-        with patch('builtins.print') as mock_print:
-            show_targets(targets)
-
-            calls = [str(call) for call in mock_print.call_args_list]
-            assert any("VTI" in c for c in calls)
-            assert any("BND" in c for c in calls)
-
-
 class TestParseArgs:
     """Tests for parse_args function"""
 
@@ -867,33 +846,6 @@ class TestParseArgs:
             args = parse_args()
 
             assert args.bars is True
-
-    def test_parse_args_rebalance(self, mock_ibapi):
-        """Test parse_args with --rebalance"""
-        from main import parse_args
-
-        with patch('sys.argv', ['main.py', '--rebalance']):
-            args = parse_args()
-
-            assert args.rebalance is True
-
-    def test_parse_args_execute(self, mock_ibapi):
-        """Test parse_args with --execute"""
-        from main import parse_args
-
-        with patch('sys.argv', ['main.py', '--rebalance', '--execute']):
-            args = parse_args()
-
-            assert args.execute is True
-
-    def test_parse_args_threshold(self, mock_ibapi):
-        """Test parse_args with --threshold"""
-        from main import parse_args
-
-        with patch('sys.argv', ['main.py', '--threshold', '3.0']):
-            args = parse_args()
-
-            assert args.threshold == 3.0
 
     def test_parse_args_no_server(self, mock_ibapi):
         """Test parse_args with --no-server"""
@@ -1000,109 +952,6 @@ class TestStreamBars:
 
         mock_portfolio.start_bar_streaming.assert_called_once()
         mock_portfolio.stop_bar_streaming.assert_called_once()
-
-
-# =============================================================================
-# Calculate Rebalance Function Tests
-# =============================================================================
-
-class TestCalculateRebalance:
-    """Tests for calculate_rebalance function"""
-
-    def test_calculate_rebalance_creates_rebalancer(self, mock_ibapi):
-        """Test calculate_rebalance creates and uses rebalancer"""
-        from main import calculate_rebalance
-        from rebalancer import RebalanceConfig
-
-        mock_portfolio = MagicMock()
-        targets = []
-        config = RebalanceConfig()
-
-        with patch('main.Rebalancer') as MockRebalancer, \
-             patch('builtins.print'):
-            mock_rebalancer = MockRebalancer.return_value
-            mock_result = MagicMock()
-            mock_rebalancer.calculate.return_value = mock_result
-
-            calculate_rebalance(mock_portfolio, targets, config)
-
-            MockRebalancer.assert_called_once()
-            mock_rebalancer.set_targets.assert_called_once_with(targets)
-            mock_rebalancer.calculate.assert_called_once()
-            mock_rebalancer.preview.assert_called_once()
-
-
-# =============================================================================
-# Execute Rebalance Function Tests
-# =============================================================================
-
-class TestExecuteRebalance:
-    """Tests for execute_rebalance function"""
-
-    def test_execute_rebalance_no_trades(self, mock_ibapi):
-        """Test execute_rebalance with no trades"""
-        from main import execute_rebalance
-        from rebalancer import RebalanceConfig
-
-        mock_portfolio = MagicMock()
-        targets = []
-        config = RebalanceConfig()
-
-        with patch('main.Rebalancer') as MockRebalancer, \
-             patch('builtins.print'), \
-             patch('builtins.input', return_value='no'):
-            mock_rebalancer = MockRebalancer.return_value
-            mock_result = MagicMock()
-            mock_result.actionable_trades = []
-            mock_rebalancer.calculate.return_value = mock_result
-
-            execute_rebalance(mock_portfolio, targets, config)
-
-            mock_rebalancer.execute.assert_not_called()
-
-    def test_execute_rebalance_user_confirms(self, mock_ibapi):
-        """Test execute_rebalance when user confirms"""
-        from main import execute_rebalance
-        from rebalancer import RebalanceConfig
-
-        mock_portfolio = MagicMock()
-        targets = []
-        config = RebalanceConfig()
-
-        with patch('main.Rebalancer') as MockRebalancer, \
-             patch('builtins.print'), \
-             patch('builtins.input', return_value='yes'):
-            mock_rebalancer = MockRebalancer.return_value
-            mock_result = MagicMock()
-            mock_result.actionable_trades = [MagicMock()]
-            mock_result.trade_count = 1
-            mock_rebalancer.calculate.return_value = mock_result
-
-            execute_rebalance(mock_portfolio, targets, config)
-
-            mock_rebalancer.execute.assert_called_once()
-
-    def test_execute_rebalance_user_cancels(self, mock_ibapi):
-        """Test execute_rebalance when user cancels"""
-        from main import execute_rebalance
-        from rebalancer import RebalanceConfig
-
-        mock_portfolio = MagicMock()
-        targets = []
-        config = RebalanceConfig()
-
-        with patch('main.Rebalancer') as MockRebalancer, \
-             patch('builtins.print'), \
-             patch('builtins.input', return_value='no'):
-            mock_rebalancer = MockRebalancer.return_value
-            mock_result = MagicMock()
-            mock_result.actionable_trades = [MagicMock()]
-            mock_result.trade_count = 1
-            mock_rebalancer.calculate.return_value = mock_result
-
-            execute_rebalance(mock_portfolio, targets, config)
-
-            mock_rebalancer.execute.assert_not_called()
 
 
 # =============================================================================
