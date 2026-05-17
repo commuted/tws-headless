@@ -128,7 +128,7 @@ class TestPlugin(PluginBase):
         # Subscribe to a MessageBus channel to demonstrate the pattern.
         # (MessageBus may be None in unit tests — guard accordingly.)
         if self._message_bus:
-            self._message_bus.subscribe("risk_alert", self._on_risk_alert)
+            self.subscribe("risk_alert", self._on_risk_alert)
 
         # Subscribe to live bars for each registered instrument.
         for symbol, inst in self._instruments.items():
@@ -155,7 +155,7 @@ class TestPlugin(PluginBase):
             if inst.enabled:
                 self._subscribe_bars(symbol)
         if self._message_bus:
-            self._message_bus.subscribe("risk_alert", self._on_risk_alert)
+            self.subscribe("risk_alert", self._on_risk_alert)
         self.lifecycle_log.append("resume")
         return True
 
