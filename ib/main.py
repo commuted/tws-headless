@@ -150,8 +150,9 @@ class ShutdownManager:
 
         self._shutdown_initiated = True
         
-        # Signal handlers run outside the event loop thread.
-        # Use call_soon_threadsafe to set the event from the correct thread.
+        # The signal handler can interrupt the event loop mid-operation, so
+        # setting the asyncio.Event directly here is unsafe;
+        # call_soon_threadsafe is the safe way to set it on the loop.
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._shutdown_event.set)
         else:
