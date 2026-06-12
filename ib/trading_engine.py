@@ -736,6 +736,11 @@ class TradingEngine:
         first_sigint_time = None
         reset_timeout = 10.0  # Reset counter after 10 seconds
 
+        # Capture the running loop before installing signal handlers so it is
+        # available the moment a handler can fire. Also used by handle_stop
+        # (which runs in a thread via asyncio.to_thread) to schedule stop().
+        self._loop = asyncio.get_running_loop()
+
         if handle_signals:
             def signal_handler(signum, frame):
                 nonlocal sigint_count, first_sigint_time
@@ -760,17 +765,14 @@ class TradingEngine:
                     )
                 else:
                     logger.info("Shutdown confirmed, stopping engine...")
-                    # Signal handlers run outside the event loop thread.
-                    # Create the coroutine here (cheap), then let the loop
-                    # schedule it as a task via call_soon_threadsafe.
+                    # The signal handler can interrupt the event loop
+                    # mid-operation, so creating a task directly here is
+                    # unsafe. Create the coroutine here (cheap), then let
+                    # the loop schedule it as a task via call_soon_threadsafe.
                     self._loop.call_soon_threadsafe(self._loop.create_task, self.stop())
 
             signal.signal(signal.SIGINT, signal_handler)
             signal.signal(signal.SIGTERM, signal_handler)
-
-        # Capture the running loop so handle_stop (which runs in a thread via
-        # asyncio.to_thread) can schedule stop() back onto it.
-        self._loop = asyncio.get_running_loop()
 
         try:
             # Block until shutdown
