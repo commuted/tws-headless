@@ -441,6 +441,27 @@ class PluginBase(ABC):
         self._holdings_file    = self._base_path / "holdings.json"
         self._state_file       = self._base_path / "state.json"
 
+    def rebind_account(self, account_id: str) -> None:
+        """Re-root an ALREADY-loaded plugin to an account subfolder.
+
+        Unlike set_account (which only rewrites the paths, for use *before*
+        load()), this is safe to call on a plugin that has already loaded: it
+        repoints the persistence paths and reloads holdings from the new
+        account-scoped location, so state written under a previous (accountless
+        or different-account) path cannot leak into this session. Legacy
+        accountless files are left untouched and are simply no longer read.
+
+        No-op when the plugin is already bound to account_id.
+        """
+        if self._account_id == account_id:
+            return
+        self.set_account(account_id)
+        if self._loaded:
+            # Refresh in-memory holdings from the account path (fresh/empty on
+            # first run for this account). Instruments stay in memory so
+            # programmatically-configured plugins keep their instrument set.
+            self._load_holdings()
+
     @property
     def _bar_store(self):
         if not hasattr(self, "_bar_store_instance"):
