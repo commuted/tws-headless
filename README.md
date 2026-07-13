@@ -65,8 +65,38 @@ per-session resource, so a paper and a live engine can run side-by-side safely:
 On connect, the engine verifies the account's paper/live nature matches the declared
 environment and **aborts on mismatch** (override: `--allow-env-mismatch`). Real orders
 against a live account additionally require `--live-confirmed`. Point `ibctl.py` at a
-specific engine with `--env paper|live` (or `--port`); the legacy single-file
-`~/.ib_executions.db` and `~/.tws_headless.sock` are no longer used.
+specific engine with `--env paper|live` (or `--port`).
+
+#### Migrating from the old single-file DB
+
+Before this change all fills were logged to a single `~/.ib_executions.db` (and the
+socket was `~/.tws_headless.sock`). Those legacy files are **left untouched and are no
+longer read** — the engine now writes to per-account databases, which start empty. No
+automatic copy is performed, because blindly merging the old file back in would
+re-introduce the very paper/live comingling this change removes.
+
+If you want to carry historical fills forward, split the old DB by its `account` column
+into the per-account files. Each row is already tagged with its account, so the split is
+lossless:
+
+```bash
+# For each account that appears in the old DB (find them with:
+#   sqlite3 ~/.ib_executions.db 'SELECT DISTINCT account FROM executions;')
+ACCT=DU1234567
+sqlite3 ~/.ib_executions.db <<SQL
+ATTACH DATABASE '$HOME/.ib_executions_${ACCT}.db' AS dst;
+CREATE TABLE IF NOT EXISTS dst.executions AS SELECT * FROM executions WHERE 0;
+CREATE TABLE IF NOT EXISTS dst.commissions AS SELECT * FROM commissions WHERE 0;
+INSERT INTO dst.executions  SELECT * FROM executions  WHERE account = '$ACCT';
+INSERT INTO dst.commissions SELECT * FROM commissions
+  WHERE exec_id IN (SELECT exec_id FROM executions WHERE account = '$ACCT');
+SQL
+```
+
+Start the engine once against that account first so it creates the schema, or let the
+`CREATE TABLE ... AS SELECT ... WHERE 0` statements above seed empty tables. Once you've
+confirmed the new per-account DBs look right, the legacy `~/.ib_executions.db` and
+`~/.tws_headless.sock` can be deleted.
 
 ## CLI — `ibctl.py`
 
