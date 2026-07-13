@@ -70,6 +70,7 @@ Default parameters (tunable at runtime):
 
 import bisect
 import logging
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from itertools import groupby
@@ -93,6 +94,14 @@ _INIT_DERIV_RINF = 0.200   # conservative RINF initial
 
 _OPEN_HOUR,  _OPEN_MIN  = 9,  30
 _CLOSE_HOUR, _CLOSE_MIN = 15, 45   # bar completes 15:50 — inside NYSE ARCA MOC cutoff
+
+# After (re)subscribing, IB replays a burst of already-completed backfill bars
+# through the same callback as live bars. Suppress session decisions until this
+# burst has flushed, so a backfilled 09:30/15:45 bar can never fire a real order
+# on startup/resume. The burst arrives in well under a second; a few seconds of
+# settling is ample and only ever skips a session bar if the plugin is started
+# within this window of that bar completing (a safe miss, not an erroneous order).
+_BACKFILL_SETTLE_SECONDS = 20.0
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +267,15 @@ class GldUsdSwapPlugin(PluginBase):
         self._gld_price:    float = 0.0
         self._holding_gld:  bool  = False
 
+        # --- live-bar gating (hazard: backfill replay must not fire orders) ---
+        # Set at each (re)subscribe; session events are suppressed until the
+        # backfill burst has flushed and only for bars strictly newer than any
+        # seen (which also dedupes repeated in-progress updates of a forming bar).
+        self._subscribe_monotonic: float             = 0.0
+        self._hwm_ts:              Optional[datetime] = None   # high-water-mark bar time
+        self._open_fired_date:     Optional[object]   = None   # date the open decision ran
+        self._close_fired_date:    Optional[object]   = None   # date the close decision ran
+
         # --- pending order tracking (order_id → "BUY"/"SELL") ---
         self._pending_order_actions: Dict[int, str] = {}
 
@@ -348,8 +366,10 @@ class GldUsdSwapPlugin(PluginBase):
         """Subscribe to live 5-min bars for all four symbols.
 
         IB delivers backfill bars (historicalData) then live updates
-        (historicalDataUpdate) through the same on_bar callback.
+        (historicalDataUpdate) through the same on_bar callback. Mark the
+        subscribe time so _is_live_bar() can suppress the backfill burst.
         """
+        self._subscribe_monotonic = time.monotonic()
         self._live_bar_req_ids: Dict[str, Optional[int]] = {}
         for symbol, cb in [
             ("GLD",  lambda b, s="GLD":  self._on_live_bar(s, b)),
@@ -510,7 +530,7 @@ class GldUsdSwapPlugin(PluginBase):
             self._gld_price = close
             self._push_gld_meta(close)
             self._recompute_regime()
-            if ts:
+            if ts and self._is_live_bar(ts):
                 self._handle_session_event(ts)
         elif symbol == "UUP":
             self._uup.push(close, self.vol_window, self.derivative_percentile,
@@ -524,6 +544,26 @@ class GldUsdSwapPlugin(PluginBase):
             self._rinf.push(close, self.vol_window, self.derivative_percentile,
                             self.fast_bars, self.slow_bars)
             self._recompute_regime()
+
+    def _is_live_bar(self, ts: datetime) -> bool:
+        """Gate session decisions to genuinely-new, post-backfill bars.
+
+        Two hazards this blocks, both of which would otherwise place real orders:
+          1. Startup/resume backfill — subscribe_live_bars replays already-completed
+             bars (incl. today's 09:30/15:45) through the same callback as live bars.
+             Suppress everything until the backfill burst has flushed (_BACKFILL_SETTLE).
+          2. Repeated in-progress updates — historicalDataUpdate fires multiple times
+             for the same forming bar (same timestamp). Only the first, strictly newer
+             than any bar seen, is treated as live.
+
+        The high-water-mark advances on every candidate bar (even while suppressed)
+        so a backfill bar that leaks past the settle window can never look 'new'.
+        """
+        is_new = self._hwm_ts is None or ts > self._hwm_ts
+        if is_new:
+            self._hwm_ts = ts
+        settled = (time.monotonic() - self._subscribe_monotonic) >= _BACKFILL_SETTLE_SECONDS
+        return settled and is_new
 
     def _push_gld_meta(self, close: float) -> None:
         """Feed GLD close into the meta-signal SMA (no smoother — structural trend only)."""
@@ -597,11 +637,16 @@ class GldUsdSwapPlugin(PluginBase):
         09:30 — overnight position matures.
         Sell if prior-close regime was cash; hold through day if gold.
         """
+        if self._open_fired_date == ts.date():
+            return   # already decided this session (guard against repeated bars)
         if not self._holding_gld:
             return
+        self._open_fired_date = ts.date()
 
         if self._regime_at_prior_close == REGIME_CASH:
-            qty = self._current_gld_shares() or int(self.allocation_dollars / self._gld_price)
+            # Sell only this plugin's own GLD slice — never account-wide GLD that
+            # may belong to other plugins or unrelated activity (hazard #2).
+            qty = self._current_gld_shares()
             if qty > 0:
                 self._emit_sell(
                     qty=qty,
@@ -610,6 +655,11 @@ class GldUsdSwapPlugin(PluginBase):
                         f"sit out intraday, re-buy via MOC at 15:50. "
                         f"factors={self._last_factors}"
                     ),
+                )
+            else:
+                logger.warning(
+                    f"Open {ts.date()}: composite CASH but plugin holds 0 GLD in its "
+                    f"holdings — skipping sell (holding_gld flag was {self._holding_gld})"
                 )
         else:
             self._intraday_holds += 1
@@ -624,6 +674,10 @@ class GldUsdSwapPlugin(PluginBase):
         Save current composite regime for tomorrow's open decision.
         Place MOC order to buy GLD overnight if not already long.
         """
+        if self._close_fired_date == ts.date():
+            return   # already decided this session (guard against repeated bars)
+        self._close_fired_date = ts.date()
+
         self._regime_at_prior_close = self._regime
 
         if not self._holding_gld:
@@ -722,10 +776,14 @@ class GldUsdSwapPlugin(PluginBase):
             logger.error(f"Failed to place MKT SELL {qty} GLD — {reason}")
 
     def _current_gld_shares(self) -> int:
-        if self.portfolio:
-            for pos in self.portfolio.positions:
-                if pos.symbol == "GLD":
-                    return max(0, int(pos.quantity))
+        """GLD shares in THIS plugin's holdings (its allocated slice) — not the
+        account-wide GLD position. Reading portfolio.positions here would let the
+        plugin sell GLD held by other plugins or unrelated account activity
+        (hazard #2); scope strictly to the plugin's own holdings instead."""
+        if self.holdings:
+            pos = self.holdings.get_position("GLD")
+            if pos:
+                return max(0, int(pos.quantity))
         return 0
 
     # =========================================================================

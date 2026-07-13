@@ -1,6 +1,8 @@
 """
 Unit tests for plugins/gld_usd_swap/plugin.py
 """
+import time
+from datetime import datetime
 from unittest.mock import Mock, MagicMock
 import pytest
 
@@ -203,3 +205,113 @@ class TestRegimeComputation:
         plugin = _make_plugin(tmp_path)
         result = plugin.handle_request("nonexistent", {})
         assert result["success"] is False
+
+
+# ---------------------------------------------------------------------------
+# Hazard #1 — backfill replay must not fire session orders (_is_live_bar)
+# ---------------------------------------------------------------------------
+
+class TestLiveBarGate:
+    _TS_1545 = datetime(2026, 5, 15, 15, 45)
+    _TS_1540 = datetime(2026, 5, 15, 15, 40)
+    _TS_1550 = datetime(2026, 5, 15, 15, 50)
+
+    def test_suppressed_during_settle_window(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin._subscribe_monotonic = time.monotonic()      # just (re)subscribed
+        assert plugin._is_live_bar(self._TS_1545) is False   # backfill burst not flushed
+
+    def test_live_after_settle(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin._subscribe_monotonic = time.monotonic() - 999  # settled
+        assert plugin._is_live_bar(self._TS_1545) is True
+
+    def test_repeated_same_bar_deduped(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin._subscribe_monotonic = time.monotonic() - 999
+        assert plugin._is_live_bar(self._TS_1545) is True
+        assert plugin._is_live_bar(self._TS_1545) is False   # same forming-bar update
+
+    def test_older_backfill_leak_rejected(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin._subscribe_monotonic = time.monotonic() - 999
+        assert plugin._is_live_bar(self._TS_1545) is True
+        assert plugin._is_live_bar(self._TS_1540) is False   # stale bar ≤ high-water-mark
+        assert plugin._is_live_bar(self._TS_1550) is True    # genuine next live bar
+
+    def test_hwm_advances_while_suppressed(self, tmp_path):
+        """A bar seen inside the settle window advances the high-water-mark, so a
+        backfill bar that leaks past the window still can't look 'new'."""
+        plugin = _make_plugin(tmp_path)
+        plugin._subscribe_monotonic = time.monotonic()       # in settle window
+        assert plugin._is_live_bar(self._TS_1545) is False
+        plugin._subscribe_monotonic = time.monotonic() - 999  # window elapses
+        assert plugin._is_live_bar(self._TS_1545) is False    # not newer than hwm
+        assert plugin._is_live_bar(self._TS_1550) is True
+
+
+# ---------------------------------------------------------------------------
+# Session decisions — per-day dedupe + hazard #2 (plugin-scoped holdings)
+# ---------------------------------------------------------------------------
+
+class TestSessionDecisions:
+    def _loaded(self, tmp_path, **kw):
+        plugin = _make_plugin(tmp_path, **kw)
+        plugin.load()   # populate self.holdings
+        return plugin
+
+    def test_close_fires_once_per_day(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin._gld_price = 240.0
+        plugin._holding_gld = False
+        ts = datetime(2026, 5, 15, 15, 45)
+        plugin._on_market_close(ts)
+        assert plugin._trade_count == 1
+        plugin._on_market_close(ts)          # repeated bar, same session
+        assert plugin._trade_count == 1
+
+    def test_open_sells_only_plugin_holdings(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin._holding_gld = True
+        plugin._regime_at_prior_close = REGIME_CASH
+        plugin._gld_price = 240.0
+        plugin.holdings.add_position("GLD", 7, 240.0)
+        sells = []
+        plugin._emit_sell = lambda qty, reason: sells.append(qty)
+        plugin._on_market_open(datetime(2026, 5, 15, 9, 30))
+        assert sells == [7]
+
+    def test_open_deduped_per_day(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin._holding_gld = True
+        plugin._regime_at_prior_close = REGIME_CASH
+        plugin._gld_price = 240.0
+        plugin.holdings.add_position("GLD", 7, 240.0)
+        sells = []
+        plugin._emit_sell = lambda qty, reason: sells.append(qty)
+        ts = datetime(2026, 5, 15, 9, 30)
+        plugin._on_market_open(ts)
+        plugin._on_market_open(ts)           # repeated bar, same session
+        assert sells == [7]
+
+    def test_open_skips_when_plugin_holds_nothing(self, tmp_path):
+        """Account may hold GLD elsewhere, but with an empty plugin slice the
+        plugin must NOT sell it (hazard #2)."""
+        plugin = self._loaded(tmp_path)
+        plugin._holding_gld = True           # stale flag
+        plugin._regime_at_prior_close = REGIME_CASH
+        plugin._gld_price = 240.0
+        acct_pos = Mock(symbol="GLD", quantity=500)
+        plugin.portfolio = Mock(positions=[acct_pos])
+        sells = []
+        plugin._emit_sell = lambda qty, reason: sells.append(qty)
+        plugin._on_market_open(datetime(2026, 5, 15, 9, 30))
+        assert sells == []                    # did NOT touch account-wide GLD
+
+    def test_current_gld_shares_reads_holdings_not_account(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        acct_pos = Mock(symbol="GLD", quantity=500)
+        plugin.portfolio = Mock(positions=[acct_pos])
+        assert plugin._current_gld_shares() == 0      # account-wide GLD ignored
+        plugin.holdings.add_position("GLD", 12, 240.0)
+        assert plugin._current_gld_shares() == 12
