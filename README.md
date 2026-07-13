@@ -64,8 +64,16 @@ per-session resource, so a paper and a live engine can run side-by-side safely:
 
 On connect, the engine verifies the account's paper/live nature matches the declared
 environment and **aborts on mismatch** (override: `--allow-env-mismatch`). Real orders
-against a live account additionally require `--live-confirmed`. Point `ibctl.py` at a
-specific engine with `--env paper|live` (or `--port`).
+against a live account additionally require `--live-confirmed`. If IB reports **no managed
+account**, the engine aborts rather than fall back to shared/default state. Point
+`ibctl.py` at a specific engine with `--env paper|live` (or `--port`).
+
+All plugin state is scoped to the account, including the system `_unassigned` plugin and
+any system/example plugins registered at engine startup: once the account is known, every
+registered plugin is re-rooted under `plugins/{slot}/{account_id}/`. Legacy accountless
+`plugins/{slot}/` directories from before this change are **left untouched and no longer
+read** (per-account state starts fresh; reconciliation repopulates `_unassigned` from the
+live account).
 
 #### Migrating from the old single-file DB
 

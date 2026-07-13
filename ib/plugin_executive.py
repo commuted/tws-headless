@@ -1719,8 +1719,28 @@ class PluginExecutive:
         return True
 
     def set_account(self, account_id: str) -> None:
-        """Set the active account. Future plugin loads will be rooted under this account."""
+        """Set the active account and scope all plugin state to it.
+
+        Future plugin loads are rooted under this account (via the load paths
+        that check self._account). Plugins already registered before the account
+        was known — the system unassigned plugin created in __init__ and any
+        system/example plugins registered at engine startup — are re-rooted here
+        too, so their holdings/state persist under plugins/{slot}/{account}/
+        rather than a shared accountless directory. Without this, paper and live
+        sessions would comingle those plugins' state.
+        """
         self._account = account_id
+        for config in list(self._plugins.values()):
+            plugin = getattr(config, "plugin", None)
+            if plugin is None:
+                continue
+            try:
+                plugin.rebind_account(account_id)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to rebind plugin "
+                    f"'{getattr(plugin, 'slot', '?')}' to account {account_id}: {e}"
+                )
 
     def unregister_plugin(self, name: str) -> bool:
         """

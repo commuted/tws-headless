@@ -304,30 +304,41 @@ def main():
     def on_started():
         logger.info("Engine started successfully")
 
-        # Configure per-account state before reconciliation and auto-reload
-        if engine.portfolio and engine.portfolio.managed_accounts:
-            account_id = engine.portfolio.managed_accounts[0]
-            logger.info(f"Active account: {account_id}")
+        # Configure per-account state before reconciliation and auto-reload.
+        # Without a known account we cannot scope state, execution logging, or
+        # the paper/live guardrail — so refuse to start rather than silently fall
+        # back to shared/default files (which would comingle paper and live).
+        if not (engine.portfolio and engine.portfolio.managed_accounts):
+            abort["reason"] = (
+                "No managed account reported by IB. Refusing to start on "
+                "shared/default state without a known account — paper/live "
+                "separation and the environment guardrail cannot be enforced."
+            )
+            logger.error(abort["reason"])
+            return
 
-            # Guardrail: refuse to proceed if the connected account's paper/live
-            # nature contradicts the declared environment, or if real orders would
-            # run against a live account without confirmation. Runs BEFORE any
-            # state config, reconciliation, or plugin auto-reload.
-            from .environment import check_env_consistency, require_live_confirmation
-            err = check_env_consistency(env, account_id, args.allow_env_mismatch)
-            if err is None:
-                err = require_live_confirmation(env, mode_map[mode], args.live_confirmed)
-            if err:
-                abort["reason"] = err
-                logger.error(err)
-                return
+        account_id = engine.portfolio.managed_accounts[0]
+        logger.info(f"Active account: {account_id}")
 
-            from .plugin_store import configure_plugin_store
-            from .execution_db import configure_execution_db
-            configure_plugin_store(account_id)
-            configure_execution_db(account_id)
-            if engine.plugin_executive:
-                engine.plugin_executive.set_account(account_id)
+        # Guardrail: refuse to proceed if the connected account's paper/live
+        # nature contradicts the declared environment, or if real orders would
+        # run against a live account without confirmation. Runs BEFORE any
+        # state config, reconciliation, or plugin auto-reload.
+        from .environment import check_env_consistency, require_live_confirmation
+        err = check_env_consistency(env, account_id, args.allow_env_mismatch)
+        if err is None:
+            err = require_live_confirmation(env, mode_map[mode], args.live_confirmed)
+        if err:
+            abort["reason"] = err
+            logger.error(err)
+            return
+
+        from .plugin_store import configure_plugin_store
+        from .execution_db import configure_execution_db
+        configure_plugin_store(account_id)
+        configure_execution_db(account_id)
+        if engine.plugin_executive:
+            engine.plugin_executive.set_account(account_id)
 
         if command_server:
             if command_server.start():
