@@ -548,3 +548,17 @@ def get_execution_db() -> ExecutionDatabase:
     if _execution_db is None:
         _execution_db = ExecutionDatabase()
     return _execution_db
+
+
+def configure_execution_db(account_id: str) -> None:
+    """Re-initialise the global ExecutionDatabase singleton keyed to account_id.
+
+    Keeps paper and live fills/commissions in separate databases. Mirrors
+    ib.plugin_store.configure_plugin_store. Call once the active account is known.
+    """
+    global _execution_db
+    try:
+        from .environment import execution_db_path_for
+    except ImportError:  # module loaded standalone (e.g. test bootstrap) — no package context
+        from ib.environment import execution_db_path_for
+    _execution_db = ExecutionDatabase(execution_db_path_for(account_id))
