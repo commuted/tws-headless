@@ -75,8 +75,41 @@ from enum import Enum
 from typing import Dict, Any, Optional
 
 
-# Default socket path - must match command_server.py DEFAULT_SOCKET_PATH
+# Legacy single socket path (pre paper/live separation). Used as a fallback only.
 DEFAULT_SOCKET_PATH = os.path.expanduser("~/.tws_headless.sock")
+
+# Paper/live separation: env-keyed sockets so ibctl targets the right engine.
+# Kept in sync with ib/environment.py (ibctl stays standalone — no package imports).
+_PAPER_PORTS = {7497, 4002}
+_LIVE_PORTS = {7496, 4001}
+
+
+def _socket_for_env(env):
+    return os.path.expanduser(f"~/.tws_headless_{env}.sock")
+
+
+def _env_from_port(port):
+    if port in _PAPER_PORTS:
+        return "paper"
+    if port in _LIVE_PORTS:
+        return "live"
+    return None
+
+
+def resolve_socket_path(explicit_socket, env, port):
+    """Resolve which engine socket to talk to.
+
+    Priority: explicit --socket > --env > --port-derived env > legacy fallback.
+    """
+    if explicit_socket:
+        return explicit_socket
+    if env:
+        return _socket_for_env(env)
+    if port is not None:
+        derived = _env_from_port(port)
+        if derived:
+            return _socket_for_env(derived)
+    return DEFAULT_SOCKET_PATH
 
 
 class CommandStatus(Enum):
@@ -633,8 +666,20 @@ Examples:
     )
     parser.add_argument(
         "--socket", "-s",
-        default=DEFAULT_SOCKET_PATH,
-        help=f"Socket path (default: {DEFAULT_SOCKET_PATH})",
+        default=None,
+        help="Socket path (default: ~/.tws_headless_{env}.sock, chosen via --env/--port)",
+    )
+    parser.add_argument(
+        "--env",
+        choices=["paper", "live"],
+        default=None,
+        help="Target the paper or live engine (selects ~/.tws_headless_{env}.sock)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Derive the target engine (paper/live) from a TWS/Gateway port",
     )
     parser.add_argument(
         "--timeout", "-t",
@@ -665,6 +710,9 @@ Examples:
     # Flags not recognised by the top-level parser (e.g. --bar-size, --db)
     # are treated as part of the subcommand's argument list.
     args.command = list(args.command) + extra
+
+    # Resolve which engine socket to talk to (paper vs live separation).
+    args.socket = resolve_socket_path(args.socket, args.env, args.port)
 
     if not args.command:
         parser.print_help()

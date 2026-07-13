@@ -38,12 +38,73 @@ python3 -m ib.run_engine [options]
 | `--host` | `127.0.0.1` | IB host |
 | `--client-id` | `1` | IB client ID (must be unique per session) |
 | `--market-data-type` | auto | `1`=live, `2`=frozen, `3`=delayed, `4`=delayed-frozen. Auto-detected if omitted. |
-| `--socket` | `~/.tws_headless.sock` | Unix socket path for `ibctl.py` commands |
+| `--env` | auto (from port) | Trading environment `paper`/`live`. Namespaces the socket, execution DB, and logs. |
+| `--allow-env-mismatch` | — | Override the guardrail that aborts on a paper/live account vs. environment mismatch |
+| `--live-confirmed` | — | Required to run `immediate`/`queued` (real) orders against a **live** account |
+| `--socket` | `~/.tws_headless_{env}.sock` | Unix socket path for `ibctl.py` commands (env-keyed by default) |
 | `--no-server` | — | Disable socket command server |
 | `--plugin-dir` | `plugins/` | Plugin search directory |
 | `--verbose` / `--quiet` | — | Logging verbosity |
 
 Environment variables mirror all options: `PORT`, `MODE`, `MARKET_DATA_TYPE`, `IB_PLUGIN_DIR`.
+
+### Paper/live separation
+
+Paper and live operation never share state. The environment is derived from the port
+(`7497`/`4002` → paper, `7496`/`4001` → live; override with `--env`) and namespaces every
+per-session resource, so a paper and a live engine can run side-by-side safely:
+
+| Resource | Path | Keyed by |
+|----------|------|----------|
+| Command socket | `~/.tws_headless_{paper,live}.sock` | environment |
+| Log file | `logs/{paper,live}/engine.log` | environment |
+| Execution/fills DB | `~/.ib_executions_{account_id}.db` | account |
+| Plugin registry DB | `~/.ib_plugin_store_{account_id}.db` | account |
+| Plugin state/holdings | `plugins/{slot}/{account_id}/` | account |
+
+On connect, the engine verifies the account's paper/live nature matches the declared
+environment and **aborts on mismatch** (override: `--allow-env-mismatch`). Real orders
+against a live account additionally require `--live-confirmed`. If IB reports **no managed
+account**, the engine aborts rather than fall back to shared/default state. Point
+`ibctl.py` at a specific engine with `--env paper|live` (or `--port`).
+
+All plugin state is scoped to the account, including the system `_unassigned` plugin and
+any system/example plugins registered at engine startup: once the account is known, every
+registered plugin is re-rooted under `plugins/{slot}/{account_id}/`. Legacy accountless
+`plugins/{slot}/` directories from before this change are **left untouched and no longer
+read** (per-account state starts fresh; reconciliation repopulates `_unassigned` from the
+live account).
+
+#### Migrating from the old single-file DB
+
+Before this change all fills were logged to a single `~/.ib_executions.db` (and the
+socket was `~/.tws_headless.sock`). Those legacy files are **left untouched and are no
+longer read** — the engine now writes to per-account databases, which start empty. No
+automatic copy is performed, because blindly merging the old file back in would
+re-introduce the very paper/live comingling this change removes.
+
+If you want to carry historical fills forward, split the old DB by its `account` column
+into the per-account files. Each row is already tagged with its account, so the split is
+lossless:
+
+```bash
+# For each account that appears in the old DB (find them with:
+#   sqlite3 ~/.ib_executions.db 'SELECT DISTINCT account FROM executions;')
+ACCT=DU1234567
+sqlite3 ~/.ib_executions.db <<SQL
+ATTACH DATABASE '$HOME/.ib_executions_${ACCT}.db' AS dst;
+CREATE TABLE IF NOT EXISTS dst.executions AS SELECT * FROM executions WHERE 0;
+CREATE TABLE IF NOT EXISTS dst.commissions AS SELECT * FROM commissions WHERE 0;
+INSERT INTO dst.executions  SELECT * FROM executions  WHERE account = '$ACCT';
+INSERT INTO dst.commissions SELECT * FROM commissions
+  WHERE exec_id IN (SELECT exec_id FROM executions WHERE account = '$ACCT');
+SQL
+```
+
+Start the engine once against that account first so it creates the schema, or let the
+`CREATE TABLE ... AS SELECT ... WHERE 0` statements above seed empty tables. Once you've
+confirmed the new per-account DBs look right, the legacy `~/.ib_executions.db` and
+`~/.tws_headless.sock` can be deleted.
 
 ## CLI — `ibctl.py`
 

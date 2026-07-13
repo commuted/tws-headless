@@ -204,6 +204,88 @@ class TestRegisterPluginCallsSetAccount:
 
 
 # ---------------------------------------------------------------------------
+# PluginBase.rebind_account — re-root an ALREADY-loaded plugin
+# ---------------------------------------------------------------------------
+
+class TestPluginBaseRebindAccount:
+    def test_reroots_loaded_plugin(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path))
+        plugin = SimplePlugin("alpha")
+        plugin.set_account("DU1")
+        plugin.load()
+        plugin.rebind_account("U9")
+        assert plugin._account_id == "U9"
+        assert plugin._base_path == tmp_path / "alpha" / "U9"
+        assert plugin._holdings_file == tmp_path / "alpha" / "U9" / "holdings.json"
+
+    def test_noop_when_same_account(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path))
+        plugin = SimplePlugin("alpha")
+        plugin.set_account("DU1")
+        plugin.load()
+        before = plugin._base_path
+        # Should return early and not touch paths / reload
+        plugin.rebind_account("DU1")
+        assert plugin._base_path == before
+
+    def test_holdings_reloaded_from_new_account_path(self, tmp_path, monkeypatch):
+        """After rebind, in-memory holdings reflect the new (empty) account path,
+        not whatever was persisted under the previous accountless/other path."""
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path))
+        plugin = SimplePlugin("alpha")
+        plugin.set_account("DU1")
+        plugin.load()
+        # Seed holdings under DU1 and persist them there.
+        plugin._load_holdings()
+        plugin._holdings.add_position("SPY", 100, 400.0)
+        plugin.save_holdings()
+        assert (tmp_path / "alpha" / "DU1" / "holdings.json").exists()
+
+        plugin.rebind_account("U9")
+        # U9 has no holdings file yet → fresh, empty holdings (no SPY leak).
+        assert plugin._holdings is not None
+        assert "SPY" not in {p.symbol for p in plugin._holdings.current_positions}
+        assert not (tmp_path / "alpha" / "U9" / "holdings.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# PluginExecutive.set_account — re-roots already-registered plugins
+# ---------------------------------------------------------------------------
+
+class TestExecutiveSetAccountRebinds:
+    def test_registered_plugin_rebound(self, tmp_path, monkeypatch):
+        """A plugin registered BEFORE set_account (accountless) must be re-rooted
+        to the account when set_account is later called."""
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path))
+        executive = PluginExecutive(None, None)
+        plugin = SimplePlugin("beta")
+        executive.register_plugin(plugin)  # _account is "" → registers accountless
+        assert plugin._account_id == ""
+
+        executive.set_account("DU1234567")
+        assert plugin._account_id == "DU1234567"
+        assert plugin._base_path == tmp_path / "beta" / "DU1234567"
+
+    def test_rebind_failure_does_not_break_set_account(self, tmp_path, monkeypatch):
+        """A plugin whose rebind raises must not prevent set_account from
+        completing (and re-rooting the others)."""
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path))
+        executive = PluginExecutive(None, None)
+        good = SimplePlugin("good")
+        bad = SimplePlugin("bad")
+        executive.register_plugin(good)
+        executive.register_plugin(bad)
+
+        def boom(_):
+            raise RuntimeError("rebind failed")
+        monkeypatch.setattr(bad, "rebind_account", boom)
+
+        executive.set_account("DU1")
+        assert executive._account == "DU1"
+        assert good._account_id == "DU1"
+
+
+# ---------------------------------------------------------------------------
 # PluginBase._bar_store — lazy property
 # ---------------------------------------------------------------------------
 
