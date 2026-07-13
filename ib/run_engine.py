@@ -27,7 +27,6 @@ import sys
 import os
 from pathlib import Path
 from typing import Optional, List
-from .command_server import DEFAULT_SOCKET_PATH
 
 # Setup logging
 logging.basicConfig(
@@ -77,6 +76,22 @@ Examples:
         help="Order execution mode (default: from MODE env or dry_run)"
     )
 
+    # Paper/live environment separation
+    parser.add_argument(
+        "--env", choices=["paper", "live"], default=None,
+        help="Trading environment (default: auto-detect from port). Namespaces the "
+             "command socket, execution DB, and logs so paper and live never comingle."
+    )
+    parser.add_argument(
+        "--allow-env-mismatch", action="store_true",
+        help="Override the guardrail that aborts when the connected account's "
+             "paper/live nature contradicts --env/port (not recommended)."
+    )
+    parser.add_argument(
+        "--live-confirmed", action="store_true",
+        help="Required to run immediate/queued (real) order modes against a LIVE account."
+    )
+
     parser.add_argument(
         "--plugin-dir",
         default=None,
@@ -93,8 +108,8 @@ Examples:
 
     # Command server options
     parser.add_argument(
-        "--socket", default=DEFAULT_SOCKET_PATH,
-        help=f"Unix socket path for commands (default: {DEFAULT_SOCKET_PATH})"
+        "--socket", default=None,
+        help="Unix socket path for commands (default: ~/.tws_headless_{env}.sock)"
     )
     parser.add_argument(
         "--no-server", action="store_true",
@@ -139,6 +154,31 @@ def main():
 
     mode = args.mode or os.environ.get("MODE", "dry_run")
 
+    # Resolve paper/live environment (from --env, else the port). This keys the
+    # command socket and log file so paper and live never comingle. Fail loudly
+    # rather than guess when neither is conclusive.
+    from .environment import resolve_env, socket_path_for, log_path_for
+    try:
+        env = resolve_env(port, args.env)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
+
+    # Env-keyed command socket (unless the user gave an explicit --socket).
+    socket_path = args.socket or socket_path_for(env)
+
+    # Env-keyed log file (in addition to console logging from basicConfig).
+    log_file = log_path_for(env)
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        _file_handler = logging.FileHandler(log_file)
+        _file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        logging.getLogger().addHandler(_file_handler)
+    except OSError as e:
+        logger.warning(f"Could not open log file {log_file}: {e}")
+
     mdt_env = os.environ.get("MARKET_DATA_TYPE")
     if mdt_env is not None:
         try:
@@ -156,10 +196,12 @@ def main():
     logger.info("=" * 60)
     logger.info("IB Trading Engine")
     logger.info("=" * 60)
+    logger.info(f"Environment: {env.value.upper()}")
     logger.info(f"Port: {port}")
     logger.info(f"Order Mode: {mode}")
     logger.info(f"Market Data Type: {market_data_type if market_data_type else 'auto'}")
-    logger.info(f"Socket: {args.socket if not args.no_server else 'disabled'}")
+    logger.info(f"Socket: {socket_path if not args.no_server else 'disabled'}")
+    logger.info(f"Log file: {log_file}")
     logger.info("Engine Mode: Plugin Executive")
     logger.info("=" * 60)
 
@@ -201,7 +243,7 @@ def main():
     # Create command handler and server
     command_server: Optional[CommandServer] = None
     if not args.no_server:
-        command_server = CommandServer(socket_path=args.socket)
+        command_server = CommandServer(socket_path=socket_path)
         handler = EngineCommandHandler(engine)
         handler.register_commands(command_server)
 
@@ -255,6 +297,10 @@ def main():
         logger.warning(f"Could not load paper_test_feeds plugin: {e}")
 
     # Callbacks
+    # Populated by on_started if a paper/live guardrail trips; checked in _run()
+    # to hard-fail before any reconciliation or trading occurs.
+    abort = {"reason": None}
+
     def on_started():
         logger.info("Engine started successfully")
 
@@ -262,14 +308,30 @@ def main():
         if engine.portfolio and engine.portfolio.managed_accounts:
             account_id = engine.portfolio.managed_accounts[0]
             logger.info(f"Active account: {account_id}")
+
+            # Guardrail: refuse to proceed if the connected account's paper/live
+            # nature contradicts the declared environment, or if real orders would
+            # run against a live account without confirmation. Runs BEFORE any
+            # state config, reconciliation, or plugin auto-reload.
+            from .environment import check_env_consistency, require_live_confirmation
+            err = check_env_consistency(env, account_id, args.allow_env_mismatch)
+            if err is None:
+                err = require_live_confirmation(env, mode_map[mode], args.live_confirmed)
+            if err:
+                abort["reason"] = err
+                logger.error(err)
+                return
+
             from .plugin_store import configure_plugin_store
+            from .execution_db import configure_execution_db
             configure_plugin_store(account_id)
+            configure_execution_db(account_id)
             if engine.plugin_executive:
                 engine.plugin_executive.set_account(account_id)
 
         if command_server:
             if command_server.start():
-                logger.info(f"Command server listening on {args.socket}")
+                logger.info(f"Command server listening on {socket_path}")
             else:
                 logger.warning("Failed to start command server")
 
@@ -335,6 +397,10 @@ def main():
 
     async def _run():
         if await engine.start():
+            if abort["reason"]:
+                logger.error(f"Aborting startup: {abort['reason']}")
+                await engine.stop()
+                return 1
             await engine.run_forever()
             logger.info("Engine stopped.")
             return 0

@@ -38,12 +38,35 @@ python3 -m ib.run_engine [options]
 | `--host` | `127.0.0.1` | IB host |
 | `--client-id` | `1` | IB client ID (must be unique per session) |
 | `--market-data-type` | auto | `1`=live, `2`=frozen, `3`=delayed, `4`=delayed-frozen. Auto-detected if omitted. |
-| `--socket` | `~/.tws_headless.sock` | Unix socket path for `ibctl.py` commands |
+| `--env` | auto (from port) | Trading environment `paper`/`live`. Namespaces the socket, execution DB, and logs. |
+| `--allow-env-mismatch` | — | Override the guardrail that aborts on a paper/live account vs. environment mismatch |
+| `--live-confirmed` | — | Required to run `immediate`/`queued` (real) orders against a **live** account |
+| `--socket` | `~/.tws_headless_{env}.sock` | Unix socket path for `ibctl.py` commands (env-keyed by default) |
 | `--no-server` | — | Disable socket command server |
 | `--plugin-dir` | `plugins/` | Plugin search directory |
 | `--verbose` / `--quiet` | — | Logging verbosity |
 
 Environment variables mirror all options: `PORT`, `MODE`, `MARKET_DATA_TYPE`, `IB_PLUGIN_DIR`.
+
+### Paper/live separation
+
+Paper and live operation never share state. The environment is derived from the port
+(`7497`/`4002` → paper, `7496`/`4001` → live; override with `--env`) and namespaces every
+per-session resource, so a paper and a live engine can run side-by-side safely:
+
+| Resource | Path | Keyed by |
+|----------|------|----------|
+| Command socket | `~/.tws_headless_{paper,live}.sock` | environment |
+| Log file | `logs/{paper,live}/engine.log` | environment |
+| Execution/fills DB | `~/.ib_executions_{account_id}.db` | account |
+| Plugin registry DB | `~/.ib_plugin_store_{account_id}.db` | account |
+| Plugin state/holdings | `plugins/{slot}/{account_id}/` | account |
+
+On connect, the engine verifies the account's paper/live nature matches the declared
+environment and **aborts on mismatch** (override: `--allow-env-mismatch`). Real orders
+against a live account additionally require `--live-confirmed`. Point `ibctl.py` at a
+specific engine with `--env paper|live` (or `--port`); the legacy single-file
+`~/.ib_executions.db` and `~/.tws_headless.sock` are no longer used.
 
 ## CLI — `ibctl.py`
 

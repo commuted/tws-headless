@@ -22,7 +22,10 @@ from .auth import TokenStore, Authenticator
 logger = logging.getLogger(__name__)
 
 
-# Default socket path — user home dir prevents pre-creation by other local users
+# Legacy default socket path — user home dir prevents pre-creation by other local
+# users. run_engine now binds an env-keyed socket (~/.tws_headless_{paper,live}.sock,
+# see ib/environment.socket_path_for) so paper and live engines never share a socket;
+# this constant remains as a fallback/back-compat default.
 DEFAULT_SOCKET_PATH = str(Path.home() / ".tws_headless.sock")
 
 
