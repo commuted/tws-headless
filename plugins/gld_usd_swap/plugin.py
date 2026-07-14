@@ -70,7 +70,6 @@ Default parameters (tunable at runtime):
 
 import bisect
 import logging
-import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from itertools import groupby
@@ -79,7 +78,7 @@ from typing import Dict, List, Optional
 from ibapi.order import Order as IbOrder
 
 from ib.contract_builder import ContractBuilder
-from plugins.base import PluginBase, TradeSignal
+from plugins.base import PluginBase, PluginState, TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -96,12 +95,14 @@ _OPEN_HOUR,  _OPEN_MIN  = 9,  30
 _CLOSE_HOUR, _CLOSE_MIN = 15, 45   # bar completes 15:50 — inside NYSE ARCA MOC cutoff
 
 # After (re)subscribing, IB replays a burst of already-completed backfill bars
-# through the same callback as live bars. Suppress session decisions until this
-# burst has flushed, so a backfilled 09:30/15:45 bar can never fire a real order
-# on startup/resume. The burst arrives in well under a second; a few seconds of
-# settling is ample and only ever skips a session bar if the plugin is started
-# within this window of that bar completing (a safe miss, not an erroneous order).
-_BACKFILL_SETTLE_SECONDS = 20.0
+# (via historicalData) before live updates start (via historicalDataUpdate).
+# Session decisions must never fire from a replayed bar — a backfilled
+# 09:30/15:45 bar on startup/resume would place a stale real order.  The
+# subscription delivers backfill and live bars through separate callbacks
+# (subscribe_live_bars on_bar vs on_live_bar), so gating is positive
+# identification, not a timing heuristic: only bars arriving through the
+# live-update callback, with a timestamp strictly newer than any bar seen,
+# may trigger session decisions.
 
 
 # ---------------------------------------------------------------------------
@@ -268,13 +269,18 @@ class GldUsdSwapPlugin(PluginBase):
         self._holding_gld:  bool  = False
 
         # --- live-bar gating (hazard: backfill replay must not fire orders) ---
-        # Set at each (re)subscribe; session events are suppressed until the
-        # backfill burst has flushed and only for bars strictly newer than any
-        # seen (which also dedupes repeated in-progress updates of a forming bar).
-        self._subscribe_monotonic: float             = 0.0
+        # Session events fire only for bars delivered through the live-update
+        # callback AND strictly newer than any bar seen (the high-water-mark
+        # also dedupes repeated in-progress updates of a forming bar).
         self._hwm_ts:              Optional[datetime] = None   # high-water-mark bar time
         self._open_fired_date:     Optional[object]   = None   # date the open decision ran
         self._close_fired_date:    Optional[object]   = None   # date the close decision ran
+
+        # True when state restore found orders still in flight from a previous
+        # session (e.g. crash between MOC placement and the 16:00 fill).  Makes
+        # startup reconciliation conservative so the plugin can never place a
+        # duplicate overnight buy for an unresolved order.
+        self._restored_pending_buy: bool = False
 
         # --- pending order tracking (order_id → "BUY"/"SELL") ---
         self._pending_order_actions: Dict[int, str] = {}
@@ -319,18 +325,51 @@ class GldUsdSwapPlugin(PluginBase):
             self._uup.restore(saved.get("uup",  {}), _INIT_DERIV_UUP)
             self._tlt.restore(saved.get("tlt",  {}), _INIT_DERIV_TLT)
             self._rinf.restore(saved.get("rinf", {}), _INIT_DERIV_RINF)
+            self._pending_order_actions = {
+                int(oid): action
+                for oid, action in saved.get("pending_orders", {}).items()
+            }
             logger.info(
                 f"Restored: holding={self._holding_gld}, "
                 f"prior_regime={self._regime_at_prior_close}, "
                 f"trades={self._trade_count}"
             )
 
+        if self._pending_order_actions:
+            # Orders were in flight when the previous session ended (e.g. crash
+            # between the 15:45 MOC placement and the 16:00 fill).  We cannot
+            # attribute their fills after a restart, so fail safe:
+            #   - a pending BUY is treated as holding (prevents a duplicate
+            #     overnight buy at the next close; worst case is a missed trade)
+            #   - the operator must verify the fill in TWS and, if it filled,
+            #     transfer the GLD shares into this plugin's holdings.
+            self._restored_pending_buy = (
+                "BUY" in self._pending_order_actions.values()
+            )
+            logger.error(
+                f"Restored {len(self._pending_order_actions)} unresolved order(s) "
+                f"from previous session: {self._pending_order_actions} — verify "
+                f"fills in TWS; if a BUY filled while the engine was down, "
+                f"transfer the GLD shares into this plugin's holdings "
+                f"(ibctl transfer position _unassigned {self.name} GLD <qty>)"
+            )
+            if self._restored_pending_buy and not self._holding_gld:
+                self._holding_gld = True
+                logger.warning(
+                    "Unresolved BUY in flight → conservatively assuming "
+                    "holding_gld=True until manually reconciled"
+                )
+
         if self.portfolio:
             actual = self._current_gld_shares()
             if actual > 0 and not self._holding_gld:
                 logger.info(f"Reconcile: found {actual} GLD shares → holding_gld=True")
                 self._holding_gld = True
-            elif actual == 0 and self._holding_gld:
+            elif actual == 0 and self._holding_gld and not self._restored_pending_buy:
+                # Skipped when a BUY is unresolved: its shares may have filled
+                # into the account (and been swept to _unassigned) without ever
+                # reaching this plugin's holdings — flipping to False here would
+                # trigger a duplicate overnight buy at the next close.
                 logger.info("Reconcile: no GLD in portfolio → holding_gld=False")
                 self._holding_gld = False
 
@@ -352,6 +391,9 @@ class GldUsdSwapPlugin(PluginBase):
         return True
 
     def freeze(self) -> bool:
+        # Cancel subscriptions so no bars — and therefore no session decisions
+        # or orders — can occur while frozen.  resume() re-subscribes.
+        self._cancel_subscriptions()
         self._save_state()
         return True
 
@@ -365,21 +407,18 @@ class GldUsdSwapPlugin(PluginBase):
     def _start_subscriptions(self) -> None:
         """Subscribe to live 5-min bars for all four symbols.
 
-        IB delivers backfill bars (historicalData) then live updates
-        (historicalDataUpdate) through the same on_bar callback. Mark the
-        subscribe time so _is_live_bar() can suppress the backfill burst.
+        Backfill bars (historicalData replay) arrive via on_bar and only feed
+        the signal state; live updates (historicalDataUpdate) arrive via
+        on_live_bar and may additionally trigger session decisions.  This
+        positive backfill/live separation is what guarantees a replayed
+        09:30/15:45 bar can never fire a real order on startup/resume.
         """
-        self._subscribe_monotonic = time.monotonic()
         self._live_bar_req_ids: Dict[str, Optional[int]] = {}
-        for symbol, cb in [
-            ("GLD",  lambda b, s="GLD":  self._on_live_bar(s, b)),
-            ("UUP",  lambda b, s="UUP":  self._on_live_bar(s, b)),
-            ("TLT",  lambda b, s="TLT":  self._on_live_bar(s, b)),
-            ("RINF", lambda b, s="RINF": self._on_live_bar(s, b)),
-        ]:
+        for symbol in ("GLD", "UUP", "TLT", "RINF"):
             req_id = self.subscribe_live_bars(
                 contract=ContractBuilder.etf(symbol),
-                on_bar=cb,
+                on_bar=lambda b, s=symbol: self._on_bar(s, b, is_live=False),
+                on_live_bar=lambda b, s=symbol: self._on_bar(s, b, is_live=True),
             )
             self._live_bar_req_ids[symbol] = req_id
 
@@ -407,6 +446,10 @@ class GldUsdSwapPlugin(PluginBase):
             "uup":                   self._uup.save(),
             "tlt":                   self._tlt.save(),
             "rinf":                  self._rinf.save(),
+            # In-flight orders survive a restart so an unresolved MOC buy can
+            # never be silently forgotten (and duplicated) after a crash.
+            "pending_orders":        {str(oid): action for oid, action
+                                      in self._pending_order_actions.items()},
         })
 
     # =========================================================================
@@ -510,15 +553,23 @@ class GldUsdSwapPlugin(PluginBase):
     # MARKET DATA
     # =========================================================================
 
-    def _on_live_bar(self, symbol: str, bar) -> None:
+    def _on_bar(self, symbol: str, bar, is_live: bool = False) -> None:
         """Process one 5-min bar for the given symbol.
 
-        Called by subscribe_live_bars for both backfill and live updates.
+        Called by subscribe_live_bars: backfill bars arrive with is_live=False
+        (historicalData replay), live updates with is_live=True
+        (historicalDataUpdate).  All bars feed the signal state; only live
+        bars may trigger session decisions.
 
         IB bar date format for 5-min bars: "20260318 09:30:00" (legacy) or
         "20260318-09:30:00" (new API, UTC endDateTime).  We parse chars 0-7
         as date and 9-16 as time, which works for both separators.
         """
+        if self._state == PluginState.FROZEN:
+            # Backstop: freeze() cancels subscriptions, but an in-flight
+            # callback must never process data or trade while frozen.
+            return
+
         close = float(bar.close)
 
         try:
@@ -530,7 +581,7 @@ class GldUsdSwapPlugin(PluginBase):
             self._gld_price = close
             self._push_gld_meta(close)
             self._recompute_regime()
-            if ts and self._is_live_bar(ts):
+            if ts and self._is_live_bar(ts, is_live):
                 self._handle_session_event(ts)
         elif symbol == "UUP":
             self._uup.push(close, self.vol_window, self.derivative_percentile,
@@ -545,25 +596,25 @@ class GldUsdSwapPlugin(PluginBase):
                             self.fast_bars, self.slow_bars)
             self._recompute_regime()
 
-    def _is_live_bar(self, ts: datetime) -> bool:
-        """Gate session decisions to genuinely-new, post-backfill bars.
+    def _is_live_bar(self, ts: datetime, is_live: bool) -> bool:
+        """Gate session decisions to genuinely-new bars from the live callback.
 
         Two hazards this blocks, both of which would otherwise place real orders:
           1. Startup/resume backfill — subscribe_live_bars replays already-completed
-             bars (incl. today's 09:30/15:45) through the same callback as live bars.
-             Suppress everything until the backfill burst has flushed (_BACKFILL_SETTLE).
+             bars (incl. today's 09:30/15:45). Those arrive with is_live=False
+             (historicalData vs historicalDataUpdate) and never fire decisions.
           2. Repeated in-progress updates — historicalDataUpdate fires multiple times
              for the same forming bar (same timestamp). Only the first, strictly newer
-             than any bar seen, is treated as live.
+             than any bar seen, is treated as new.
 
-        The high-water-mark advances on every candidate bar (even while suppressed)
-        so a backfill bar that leaks past the settle window can never look 'new'.
+        The high-water-mark advances on every bar, including backfill, so the
+        forming bar already replayed at subscribe time can't fire again when its
+        live updates start arriving.
         """
         is_new = self._hwm_ts is None or ts > self._hwm_ts
         if is_new:
             self._hwm_ts = ts
-        settled = (time.monotonic() - self._subscribe_monotonic) >= _BACKFILL_SETTLE_SECONDS
-        return settled and is_new
+        return is_live and is_new
 
     def _push_gld_meta(self, close: float) -> None:
         """Feed GLD close into the meta-signal SMA (no smoother — structural trend only)."""
@@ -667,6 +718,9 @@ class GldUsdSwapPlugin(PluginBase):
                 f"Open {ts.date()}: holding GLD intraday "
                 f"(regime={self._regime_at_prior_close}, factors={self._last_factors})"
             )
+        # Persist immediately: a crash before the next scheduled save must not
+        # lose today's decision (pending order, counters).
+        self._save_state()
 
     def _on_market_close(self, ts: datetime) -> None:
         """
@@ -681,7 +735,14 @@ class GldUsdSwapPlugin(PluginBase):
         self._regime_at_prior_close = self._regime
 
         if not self._holding_gld:
-            shares = int(self.allocation_dollars / self._gld_price) if self._gld_price > 0 else 0
+            budget = self.allocation_dollars
+            if self.portfolio:
+                # Real trading: never spend beyond the cash actually funded to
+                # this plugin (via ibctl transfer). An unfunded plugin places
+                # no orders instead of drawing on account-wide capital.
+                cash = self.holdings.current_cash if self.holdings else 0.0
+                budget = min(budget, cash)
+            shares = int(budget / self._gld_price) if self._gld_price > 0 else 0
             if shares > 0:
                 self._place_moc_buy(
                     shares,
@@ -690,12 +751,22 @@ class GldUsdSwapPlugin(PluginBase):
                         f"(tomorrow regime={self._regime}, factors={self._last_factors})"
                     ),
                 )
+            elif self.portfolio and self._gld_price > 0:
+                logger.error(
+                    f"Close {ts.date()}: MOC buy skipped — plugin cash "
+                    f"${budget:,.2f} buys 0 shares at ${self._gld_price:.2f}. "
+                    f"Fund the plugin: ibctl transfer cash _unassigned "
+                    f"{self.name} {self.allocation_dollars:.0f} --confirm"
+                )
         else:
             self._overnight_holds += 1
             logger.info(
                 f"Close {ts.date()}: rolling overnight (no order), "
                 f"regime={self._regime}, factors={self._last_factors}"
             )
+        # Persist immediately: the regime saved here drives tomorrow's open
+        # decision and must survive an overnight crash/restart.
+        self._save_state()
 
     # =========================================================================
     # ORDER EXECUTION
@@ -800,21 +871,43 @@ class GldUsdSwapPlugin(PluginBase):
 
     def on_order_fill(self, order_record) -> None:
         action = self._pending_order_actions.pop(order_record.order_id, None)
+        qty    = float(order_record.filled_quantity or 0)
+        price  = float(order_record.avg_fill_price or 0.0)
+
         if action == "BUY":
             self._holding_gld = True
             self._overnight_holds += 1
-            logger.info(
-                f"MOC BUY filled: {order_record.filled_quantity:.0f} GLD "
-                f"@ ${order_record.avg_fill_price:.2f}"
-            )
+            self._apply_fill_to_holdings("BUY", qty, price)
+            logger.info(f"MOC BUY filled: {qty:.0f} GLD @ ${price:.2f}")
         elif action == "SELL":
             self._holding_gld = False
-            logger.info(
-                f"MKT SELL filled: {order_record.filled_quantity:.0f} GLD "
-                f"@ ${order_record.avg_fill_price:.2f}"
-            )
+            self._apply_fill_to_holdings("SELL", qty, price)
+            logger.info(f"MKT SELL filled: {qty:.0f} GLD @ ${price:.2f}")
         if action:
             self._save_state()
+
+    def _apply_fill_to_holdings(self, action: str, qty: float, price: float) -> None:
+        """Record a fill in this plugin's holdings ledger.
+
+        Without this, bought shares never enter holdings.json: the open-time
+        sell would always find 0 shares (strategy stuck long), and after a
+        restart the startup account reconciliation would sweep the shares to
+        _unassigned while this plugin — seeing empty holdings — buys another
+        full allocation.  Holdings are the plugin's source of truth for what
+        it may sell and how much cash it may spend, so every fill must land
+        here.  (MOC can fill above the 15:45 close; a small negative cash
+        balance after slippage is bookkeeping, corrected by reconciliation.)
+        """
+        if not self.holdings or qty <= 0:
+            return
+        if action == "BUY":
+            self.holdings.add_position("GLD", qty, cost_basis=price,
+                                       current_price=price)
+            self.holdings.add_cash(-qty * price)
+        else:
+            self.holdings.remove_position("GLD", qty)
+            self.holdings.add_cash(qty * price)
+        self.save_holdings()
 
     def on_order_status(self, order_record) -> None:
         from ib.models import OrderStatus
@@ -830,6 +923,7 @@ class GldUsdSwapPlugin(PluginBase):
                 f"holding_gld={self._holding_gld} unchanged; "
                 f"manual reconciliation may be needed"
             )
+            self._save_state()   # drop the terminal order from persisted pending
 
     # =========================================================================
     # REQUESTS / CLI

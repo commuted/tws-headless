@@ -128,6 +128,13 @@ class TradingEngine:
             port=self.config.port,
             client_id=self.config.client_id,
         )
+        # In DRY_RUN mode, gate direct order placement at the portfolio level
+        # too — plugins that call place_order_custom() bypass the executive's
+        # reconciler (where order_mode is otherwise enforced), and without this
+        # a dry-run engine would still transmit their orders to IB.
+        self._portfolio.dry_run = (
+            self.config.order_mode == OrderExecutionMode.DRY_RUN
+        )
 
         self._connection_config = ConnectionConfig(
             auto_reconnect=self.config.auto_reconnect,
