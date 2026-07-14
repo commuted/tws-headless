@@ -197,13 +197,22 @@ class UnassignedPlugin(PluginBase):
         self,
         claimed_symbols: Optional[Set[str]] = None,
         claimed_cash: float = 0.0,
+        claimed_quantities: Optional[Dict[str, float]] = None,
     ) -> bool:
         """
         Sync unassigned positions and cash from portfolio.
 
         Args:
             claimed_symbols: Symbols already claimed by other plugins
+                             (symbol-level: the whole symbol is excluded).
             claimed_cash: Cash already allocated to other plugins
+            claimed_quantities: Quantities claimed per symbol. When given,
+                             takes precedence over claimed_symbols and the
+                             sync is quantity-level: unassigned holds
+                             account − claimed per symbol, so a partially
+                             claimed symbol keeps its remainder here instead
+                             of vanishing (10 of 471 GLD claimed must leave
+                             461 unassigned, not zero).
 
         Returns:
             True if sync successful
@@ -228,7 +237,19 @@ class UnassignedPlugin(PluginBase):
             # Get unassigned positions
             unassigned_positions = []
             for pos in self.portfolio.positions:
-                if pos.symbol not in self._claimed_symbols:
+                if claimed_quantities is not None:
+                    remainder = pos.quantity - claimed_quantities.get(pos.symbol, 0.0)
+                    if remainder <= 1e-9:
+                        continue
+                    fraction = remainder / pos.quantity if pos.quantity else 0.0
+                    unassigned_positions.append(HoldingPosition(
+                        symbol=pos.symbol,
+                        quantity=remainder,
+                        cost_basis=pos.avg_cost,
+                        current_price=pos.current_price,
+                        market_value=pos.market_value * fraction,
+                    ))
+                elif pos.symbol not in self._claimed_symbols:
                     unassigned_positions.append(HoldingPosition(
                         symbol=pos.symbol,
                         quantity=pos.quantity,

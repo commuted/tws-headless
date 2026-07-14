@@ -1395,18 +1395,30 @@ class PluginBase(ABC):
             return False
 
     def _load_instruments(self):
-        """Load instruments from instruments.json."""
-        instruments_file = self._base_path / "instruments.json"
-        if not instruments_file.exists():
+        """Load instruments from instruments.json.
+
+        When the plugin is account-scoped (base path plugins/<slot>/<account>/),
+        an instruments.json in the account directory wins; otherwise fall back
+        to the plugin-root copy shipped with the plugin. Instruments are plugin
+        configuration, not runtime state — without the fallback, account
+        scoping silently drops the shipped instrument set (0 instruments).
+        """
+        candidates = [self._base_path / "instruments.json"]
+        if self._account_id:
+            candidates.append(self._base_path.parent / "instruments.json")
+
+        for instruments_file in candidates:
+            if not instruments_file.exists():
+                continue
+            try:
+                data = json.loads(instruments_file.read_text())
+                self._instruments.clear()
+                for d in data.get("instruments", []):
+                    inst = PluginInstrument.from_dict(d)
+                    self._instruments[inst.symbol] = inst
+            except Exception as e:
+                logger.error(f"Failed to load instruments for '{self.slot}': {e}")
             return
-        try:
-            data = json.loads(instruments_file.read_text())
-            self._instruments.clear()
-            for d in data.get("instruments", []):
-                inst = PluginInstrument.from_dict(d)
-                self._instruments[inst.symbol] = inst
-        except Exception as e:
-            logger.error(f"Failed to load instruments for '{self.slot}': {e}")
 
     def _load_holdings(self):
         """Load holdings from holdings.json, falling back to fresh Holdings if absent."""
