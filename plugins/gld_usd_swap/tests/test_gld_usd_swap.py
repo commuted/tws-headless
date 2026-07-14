@@ -529,3 +529,115 @@ class TestPendingOrderRestore:
 
         state = json.loads((plugin.plugin_dir / "state.json").read_text())["state"]
         assert state["pending_orders"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Reconnect handling — live-bar subscriptions must be re-created
+# ---------------------------------------------------------------------------
+
+class TestOnReconnect:
+    def test_on_reconnect_cancels_and_resubscribes(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin._live_bar_req_ids = {"GLD": 1, "UUP": 2, "TLT": 3, "RINF": 4}
+        cancelled, resubscribed = [], []
+        plugin.cancel_live_bars = cancelled.append
+        plugin._start_subscriptions = lambda: resubscribed.append(True)
+
+        plugin.on_reconnect()
+
+        assert sorted(cancelled) == [1, 2, 3, 4]
+        assert resubscribed == [True]
+
+
+# ---------------------------------------------------------------------------
+# Alerting — IB errors, stuck orders, bar-parse failures
+# ---------------------------------------------------------------------------
+
+class TestAlerting:
+    def _bus_plugin(self, tmp_path):
+        """Plugin wired to a real MessageBus with a capture subscriber."""
+        from ib.message_bus import MessageBus
+
+        bus = MessageBus()
+        received = []
+        bus.subscribe("alerts", received.append, subscriber="test")
+        plugin = _make_plugin(tmp_path, message_bus=bus)
+        return plugin, received
+
+    def test_on_ib_error_publishes_alert(self, tmp_path):
+        plugin, received = self._bus_plugin(tmp_path)
+        plugin._pending_order_actions[55] = "BUY"
+
+        plugin.on_ib_error(55, 201, "Order rejected - insufficient funds")
+
+        assert len(received) == 1
+        payload = received[0].payload
+        assert payload["kind"] == "ib_error"
+        assert payload["is_order"] is True
+        assert payload["error_code"] == 201
+
+    def test_stuck_pending_order_alerts_once(self, tmp_path):
+        import time as _time
+
+        plugin, received = self._bus_plugin(tmp_path)
+        plugin._pending_order_actions[55] = "SELL"
+        plugin._pending_order_placed_at[55] = _time.time() - 3600  # 1h ago
+
+        plugin._check_pending_order_age()
+        plugin._check_pending_order_age()
+
+        kinds = [m.payload["kind"] for m in received]
+        assert kinds == ["stuck_order"]
+
+    def test_recent_pending_order_no_alert(self, tmp_path):
+        import time as _time
+
+        plugin, received = self._bus_plugin(tmp_path)
+        plugin._pending_order_actions[55] = "BUY"
+        plugin._pending_order_placed_at[55] = _time.time() - 60
+
+        plugin._check_pending_order_age()
+        assert received == []
+
+    def test_fill_clears_pending_age_tracking(self, tmp_path):
+        import time as _time
+
+        plugin = _make_plugin(tmp_path)
+        plugin._pending_order_actions[55] = "BUY"
+        plugin._pending_order_placed_at[55] = _time.time()
+        plugin.on_order_fill(Mock(order_id=55, filled_quantity=40,
+                                  avg_fill_price=240.0))
+        assert 55 not in plugin._pending_order_placed_at
+
+    def test_repeated_parse_failures_alert_once(self, tmp_path):
+        from plugins.gld_usd_swap.plugin import _PARSE_FAILURE_ALERT_THRESHOLD
+
+        plugin, received = self._bus_plugin(tmp_path)
+        bad_bar = Mock(close=240.0, date=None)   # unparseable timestamp
+
+        for _ in range(_PARSE_FAILURE_ALERT_THRESHOLD + 5):
+            plugin._on_bar("GLD", bad_bar, is_live=True)
+
+        kinds = [m.payload["kind"] for m in received]
+        assert kinds == ["bar_parse_failure"]
+
+    def test_parse_success_resets_failure_counter(self, tmp_path):
+        plugin, received = self._bus_plugin(tmp_path)
+        bad_bar = Mock(close=240.0, date=None)
+        good_bar = Mock(close=240.0, date="20260515 10:00:00")
+
+        for _ in range(5):
+            plugin._on_bar("GLD", bad_bar, is_live=True)
+        plugin._on_bar("GLD", good_bar, is_live=True)
+        assert plugin._bar_parse_failures == 0
+        assert received == []
+
+    def test_terminal_order_publishes_alert(self, tmp_path):
+        from ib.models import OrderStatus
+
+        plugin, received = self._bus_plugin(tmp_path)
+        plugin._pending_order_actions[77] = "BUY"
+        plugin.on_order_status(Mock(order_id=77, status=OrderStatus.CANCELLED))
+
+        kinds = [m.payload["kind"] for m in received]
+        assert kinds == ["order_terminal"]
