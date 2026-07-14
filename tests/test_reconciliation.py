@@ -391,8 +391,10 @@ class TestReconcileWithAccount:
         assert len(position_discrepancies) == 0
 
     def test_system_plugins_excluded_from_claims(self):
-        """Test that system plugins are excluded from position claims calculation"""
-        # System plugin claims 100 SPY (should be ignored)
+        """System plugin holdings don't count as claims — and _unassigned
+        already holding the unclaimed remainder is the CONVERGED state, not
+        a discrepancy (the old behavior re-added 100 SPY every run)."""
+        # _unassigned already holds the full unclaimed position
         system_plugin = MockPlugin("_unassigned", cash=0.0, positions=[
             {"symbol": "SPY", "quantity": 100, "cost_basis": 450.0}
         ], is_system=True)
@@ -414,8 +416,108 @@ class TestReconcileWithAccount:
 
         report = pe.reconcile_with_account()
 
-        # Should find unclaimed (system plugin claims don't count)
-        assert len(report["discrepancies"]) >= 1
+        # No position discrepancies: the ledger already adds up, and the
+        # system plugin's holdings were not double-counted as claims
+        position_discs = [d for d in report["discrepancies"]
+                          if d.get("type") != "cash_mismatch"]
+        assert position_discs == []
+        # And crucially: NOT re-added (was 100 + 100 under the old code)
+        assert system_plugin.holdings.get_position("SPY").quantity == 100
+
+    def test_reconcile_is_idempotent(self):
+        """A second reconcile over an unchanged web reports zero position
+        discrepancies — the hourly watchdog run must not re-flag the same
+        state forever."""
+        plugin = MockPlugin("momentum", cash=5000.0, positions=[
+            {"symbol": "SPY", "quantity": 60, "cost_basis": 450.0}
+        ])
+        portfolio = MockPortfolio(
+            positions=[MockPosition("SPY", 100, 450.0, 455.0)],
+            cash=5000.0
+        )
+        unassigned = MockPlugin("_unassigned", cash=0.0, is_system=True)
+        pe = self.create_executive(
+            portfolio=portfolio,
+            plugins={"momentum": plugin, "_unassigned": unassigned},
+            unassigned_plugin=unassigned
+        )
+
+        first = pe.reconcile_with_account()
+        assert any(d["type"] == "under_claimed" for d in first["discrepancies"])
+        assert unassigned.holdings.get_position("SPY").quantity == 40
+
+        second = pe.reconcile_with_account()
+        position_discs = [d for d in second["discrepancies"]
+                          if d.get("type") != "cash_mismatch"]
+        assert position_discs == []
+        # Quantity stable, not accumulated
+        assert unassigned.holdings.get_position("SPY").quantity == 40
+
+    def test_partial_claim_keeps_remainder_visible(self):
+        """The GLD case: a plugin claims 10 of the account's 471; _unassigned
+        must end up holding exactly the 461 remainder."""
+        plugin = MockPlugin("gld_usd_swap", cash=20000.0, positions=[
+            {"symbol": "GLD", "quantity": 10, "cost_basis": 420.79}
+        ])
+        portfolio = MockPortfolio(
+            positions=[MockPosition("GLD", 471, 420.79, 367.13)],
+            cash=900000.0
+        )
+        unassigned = MockPlugin("_unassigned", cash=0.0, is_system=True)
+        pe = self.create_executive(
+            portfolio=portfolio,
+            plugins={"gld_usd_swap": plugin, "_unassigned": unassigned},
+            unassigned_plugin=unassigned
+        )
+
+        pe.reconcile_with_account()
+        assert unassigned.holdings.get_position("GLD").quantity == 461
+
+    def test_unassigned_excess_removed(self):
+        """When plugins claim the whole account position, an _unassigned
+        leftover is excess and gets removed (set semantics, not add)."""
+        plugin = MockPlugin("momentum", cash=0.0, positions=[
+            {"symbol": "SPY", "quantity": 100, "cost_basis": 450.0}
+        ])
+        portfolio = MockPortfolio(
+            positions=[MockPosition("SPY", 100, 450.0, 455.0)],
+            cash=0.0
+        )
+        unassigned = MockPlugin("_unassigned", cash=0.0, positions=[
+            {"symbol": "SPY", "quantity": 25, "cost_basis": 450.0}
+        ], is_system=True)
+        pe = self.create_executive(
+            portfolio=portfolio,
+            plugins={"momentum": plugin, "_unassigned": unassigned},
+            unassigned_plugin=unassigned
+        )
+
+        report = pe.reconcile_with_account()
+
+        adj = next(a for a in report["adjustments"]
+                   if a["action"] == "removed_from_unassigned")
+        assert adj["symbol"] == "SPY" and adj["quantity"] == 25
+        assert unassigned.holdings.get_position("SPY") is None
+
+    def test_stale_unassigned_position_removed(self):
+        """A symbol _unassigned holds but the account doesn't is stale
+        bookkeeping and gets dropped."""
+        portfolio = MockPortfolio(positions=[], cash=0.0)
+        unassigned = MockPlugin("_unassigned", cash=0.0, positions=[
+            {"symbol": "XYZ", "quantity": 461, "cost_basis": 10.0}
+        ], is_system=True)
+        pe = self.create_executive(
+            portfolio=portfolio,
+            plugins={"_unassigned": unassigned},
+            unassigned_plugin=unassigned
+        )
+
+        report = pe.reconcile_with_account()
+
+        disc = next(d for d in report["discrepancies"]
+                    if d["type"] == "stale_unassigned_position")
+        assert disc["symbol"] == "XYZ"
+        assert unassigned.holdings.get_position("XYZ") is None
 
     def test_report_includes_timestamp(self):
         """Test report includes timestamp"""
