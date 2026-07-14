@@ -8,8 +8,9 @@ from Interactive Brokers. Supports both snapshot and streaming market data.
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable
 from datetime import datetime
 
 from ibapi.contract import Contract
@@ -151,6 +152,12 @@ class Portfolio(IBClient):
         # Historical data requests (one-shot, per-requester callbacks)
         # reqId -> (on_bar_cb, on_end_cb, accumulated_bars)
         self._historical_requests: Dict[int, tuple] = {}
+
+        # keepUpToDate feed monitoring: symbol and last-bar wall-clock time per
+        # live-bar subscription, so a watchdog can detect a silently dead feed
+        # (e.g. a subscription lost across a reconnect).
+        self._kutd_symbols: Dict[int, str] = {}     # reqId -> symbol
+        self._kutd_last_bar: Dict[int, float] = {}  # reqId -> time.time() of last bar
 
         # Contract details requests
         # reqId -> (on_details_cb, on_end_cb, accumulated_details)
@@ -1030,6 +1037,9 @@ class Portfolio(IBClient):
         self._historical_requests[req_id] = (
             on_bar, on_bar_update, on_end, keep_up_to_date, []
         )
+        if keep_up_to_date:
+            self._kutd_symbols[req_id] = contract.symbol
+            self._kutd_last_bar[req_id] = time.time()
         logger.debug(
             f"reqHistoricalData req_id={req_id} "
             f"duration={duration_str} bar_size={bar_size_setting} "
@@ -1054,7 +1064,27 @@ class Portfolio(IBClient):
         if req_id in self._historical_requests:
             self.cancelHistoricalData(req_id)
             del self._historical_requests[req_id]
+            self._kutd_symbols.pop(req_id, None)
+            self._kutd_last_bar.pop(req_id, None)
             logger.debug(f"Cancelled historical data request req_id={req_id}")
+
+    def keep_up_to_date_feeds(self) -> List[Dict[str, Any]]:
+        """Active keepUpToDate bar feeds with seconds since the last bar.
+
+        Used by monitoring (the watchdog plugin) to detect a silently dead
+        live-bar feed: a subscription that exists but has stopped delivering
+        bars — e.g. lost across a TWS reconnect — shows a growing
+        seconds_since_last_bar during market hours.
+        """
+        now = time.time()
+        return [
+            {
+                "req_id": req_id,
+                "symbol": symbol,
+                "seconds_since_last_bar": now - self._kutd_last_bar.get(req_id, now),
+            }
+            for req_id, symbol in self._kutd_symbols.items()
+        ]
 
     def request_contract_details(
         self,
@@ -1825,6 +1855,8 @@ class Portfolio(IBClient):
             return
         on_bar, _on_bar_update, _on_end, _keep_up_to_date, bars = entry
         bars.append(bar)
+        if reqId in self._kutd_last_bar:
+            self._kutd_last_bar[reqId] = time.time()
         if on_bar:
             try:
                 on_bar(bar)
@@ -1868,6 +1900,8 @@ class Portfolio(IBClient):
             return
         on_bar, on_bar_update, _on_end, _keep_up_to_date, bars = entry
         bars.append(bar)
+        if reqId in self._kutd_last_bar:
+            self._kutd_last_bar[reqId] = time.time()
         cb = on_bar_update or on_bar
         if cb:
             try:

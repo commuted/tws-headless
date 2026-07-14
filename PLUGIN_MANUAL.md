@@ -766,6 +766,24 @@ class MyPlugin(PluginBase):
 Returns the IB request ID (pass to `portfolio.cancel_historical_data()` in
 `stop()`), or `None` on error.
 
+**Reconnects: you MUST re-subscribe.** After an unexpected disconnection the
+ConnectionManager recovers tick/bar streams centrally, but it cannot restore
+keepUpToDate subscriptions — their request parameters live with the plugin.
+Override `on_reconnect()` (called by the executive on every STARTED plugin
+once the connection is re-established) to cancel and re-create your
+subscriptions:
+
+```python
+def on_reconnect(self) -> None:
+    self._cancel_my_subscriptions()
+    self._create_my_subscriptions()
+```
+
+Without this, a plugin runs blind after any TWS reconnect — no bars, no
+errors. The watchdog plugin's feed-staleness check (see
+`plugins/watchdog/watchdog.md`) detects this failure mode as a backstop,
+but the fix belongs here.
+
 ---
 
 ### 8.6 Buffered data accessors

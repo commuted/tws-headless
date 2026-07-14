@@ -774,6 +774,19 @@ class PluginBase(ABC):
                       updates and set to the position symbol for single-position updates.
         """
 
+    def on_reconnect(self) -> None:
+        """
+        Called after the IB connection is re-established following an
+        unexpected disconnection.
+
+        Tick/bar streams are recovered centrally by the ConnectionManager, but
+        keepUpToDate historical subscriptions (subscribe_live_bars) are NOT —
+        their request parameters live with the requester. Any plugin using
+        subscribe_live_bars MUST override this to cancel and re-create its
+        subscriptions, or it will run blind (no bars, no errors) after a
+        reconnect.
+        """
+
     def on_ib_error(self, req_id: int, error_code: int, error_string: str) -> None:
         """
         Called when IB reports an error for a request attributed to this plugin.

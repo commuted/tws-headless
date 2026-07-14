@@ -233,6 +233,7 @@ class TradingEngine:
         self._connection_manager.on_connected = self._on_connected
         self._connection_manager.on_disconnected = self._on_disconnected
         self._connection_manager.on_reconnecting = self._on_reconnecting
+        self._connection_manager.on_reconnected = self._on_conn_reconnected
 
         # Plugin executive callbacks
         if self._plugin_executive:
@@ -361,6 +362,16 @@ class TradingEngine:
     def _on_reconnecting(self, attempt: int):
         """Handle reconnection attempt"""
         logger.info(f"Trading engine: Reconnection attempt {attempt}")
+
+    def _on_conn_reconnected(self):
+        """Connection recovered after an unexpected drop.
+
+        Let plugins re-create their keepUpToDate live-bar subscriptions —
+        the ConnectionManager's stream recovery cannot restore those.
+        """
+        logger.warning("Trading engine: connection recovered — notifying plugins")
+        if self._plugin_executive:
+            self._plugin_executive.notify_reconnected()
 
     def _on_tick(self, symbol: str, tick: TickData):
         """Handle tick data"""

@@ -274,6 +274,23 @@ startup/resume — which includes today's session bars — feeds indicator
 state only and can never place an order. Engine `--mode dry_run` suppresses
 this plugin's orders at the portfolio level.
 
+### Anomaly alerting
+
+The plugin publishes to the MessageBus `alerts` channel (sunk by the
+watchdog plugin to `alerts.jsonl` + optional webhook — see
+`plugins/watchdog/watchdog.md`) on:
+
+| Kind | Condition |
+|------|-----------|
+| `ib_error` | IB reports an error for one of this plugin's orders or data requests |
+| `order_terminal` | An order is cancelled/rejected/errored without filling |
+| `stuck_order` | A placed order has no fill or terminal status after 30 min (bar-driven; the watchdog also checks on wall clock, covering the overnight MOC window) |
+| `bar_parse_failure` | 10 consecutive unparseable bar timestamps — session decisions cannot fire; check TWS date format/timezone |
+
+On reconnect after a dropped TWS connection, the plugin automatically
+re-creates its live-bar subscriptions (`on_reconnect`); without this it
+would hold positions with a silently dead feed.
+
 ## Warm-Up Period
 
 Signal factors require history before activating:
