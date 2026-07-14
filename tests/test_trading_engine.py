@@ -95,6 +95,57 @@ class TestEngineConfig:
         assert engine.portfolio.dry_run is False
 
 
+class TestWaitForManagedAccounts:
+    """The managedAccounts callback is async and connect() does not gate on
+    it; start() must give it a bounded window before the account guardrail
+    samples the list (a snapshot taken too early reads a handshake race as
+    'no account' and hard-fails startup)."""
+
+    def _engine(self, timeout):
+        with patch('trading_engine.Portfolio'):
+            engine = TradingEngine(EngineConfig(
+                managed_accounts_timeout=timeout,
+            ))
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_returns_immediately_when_accounts_present(self):
+        engine = self._engine(timeout=5.0)
+        engine._portfolio.managed_accounts = ["DU123456"]
+
+        start = time.monotonic()
+        assert await engine._wait_for_managed_accounts() is True
+        assert time.monotonic() - start < 0.2
+
+    @pytest.mark.asyncio
+    async def test_waits_for_late_arriving_accounts(self):
+        engine = self._engine(timeout=5.0)
+        engine._portfolio.managed_accounts = []
+
+        async def _deliver_late():
+            await asyncio.sleep(0.4)
+            engine._portfolio.managed_accounts = ["DU123456"]
+
+        task = asyncio.ensure_future(_deliver_late())
+        try:
+            assert await engine._wait_for_managed_accounts() is True
+        finally:
+            await task
+
+    @pytest.mark.asyncio
+    async def test_times_out_when_accounts_never_arrive(self):
+        engine = self._engine(timeout=0.5)
+        engine._portfolio.managed_accounts = []
+
+        start = time.monotonic()
+        assert await engine._wait_for_managed_accounts() is False
+        elapsed = time.monotonic() - start
+        assert 0.4 < elapsed < 3.0
+
+    def test_default_timeout(self):
+        assert EngineConfig().managed_accounts_timeout == 15.0
+
+
 class TestTradingEngineInit:
     """Tests for TradingEngine initialization"""
 
