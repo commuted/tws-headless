@@ -55,6 +55,13 @@ class EngineConfig:
     auto_reconnect: bool = True
     keepalive_enabled: bool = True
     keepalive_interval: float = 30.0
+    # How long start() waits for IB's managedAccounts callback after connect.
+    # connect() only gates on nextValidId; the account list arrives via a
+    # separate handshake message and can lag (or be briefly empty right after
+    # a TWS login/restart). The account guardrail aborts on an empty list, so
+    # sampling it without a grace period turns handshake timing into a hard
+    # startup failure.
+    managed_accounts_timeout: float = 15.0
 
     # Data feed settings
     use_delayed_data: bool = True
@@ -635,6 +642,29 @@ class TradingEngine:
         self._data_feed.unsubscribe(symbol)
         self._subscribed_symbols.discard(symbol)
 
+    async def _wait_for_managed_accounts(self) -> bool:
+        """Wait (bounded) for IB's managedAccounts callback to populate.
+
+        Returns True as soon as the portfolio reports a non-empty account
+        list, False if the timeout elapses. A False return does not fail
+        startup — the run_engine account guardrail remains the backstop and
+        will abort if the list is still empty when it checks.
+        """
+        timeout = self.config.managed_accounts_timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            if self._portfolio.managed_accounts:
+                return True
+            if loop.time() >= deadline:
+                logger.warning(
+                    f"No managed account reported by IB within {timeout:.0f}s "
+                    f"of connecting — proceeding; the account guardrail will "
+                    f"abort startup if the list stays empty"
+                )
+                return False
+            await asyncio.sleep(0.25)
+
     async def start(self) -> bool:
         """
         Start the trading engine.
@@ -660,6 +690,14 @@ class TradingEngine:
                 if not self.config.auto_reconnect:
                     self._state = EngineState.ERROR
                     return False
+
+            # Wait (bounded) for the managed-account list before anything
+            # samples it. Must be awaited here, not blocked on in on_started:
+            # the managedAccounts callback is delivered by this same event
+            # loop, so a blocking poll would deadlock the very message it
+            # waits for.
+            if self._connection_manager.is_connected:
+                await self._wait_for_managed_accounts()
 
             # Register pending plugins
             if self._plugin_executive:
