@@ -417,6 +417,50 @@ class TestSubscribeLiveBarsCache:
         )
         assert result is None
 
+    def test_on_live_bar_routes_separately(self, tmp_path, monkeypatch):
+        """With on_live_bar given, backfill bars reach on_bar only and live
+        update bars reach on_live_bar only — the caller can tell replayed
+        history from genuinely-live data."""
+        monkeypatch.setenv("IB_HIST_DB", str(tmp_path / "bars.db"))
+        plugin, portfolio = self._make_plugin_with_portfolio()
+        if hasattr(plugin, "_bar_store_instance"):
+            del plugin._bar_store_instance
+
+        backfill, live = [], []
+        plugin.subscribe_live_bars(
+            contract=MagicMock(symbol="GLD"),
+            on_bar=backfill.append,
+            on_live_bar=live.append,
+        )
+        _, kwargs = portfolio.request_historical_data.call_args
+        assert kwargs["on_bar_update"] is not None
+
+        fake_bar = MagicMock()
+        fake_bar.date = "20250101 10:00:00"
+        fake_bar.open = fake_bar.high = fake_bar.low = fake_bar.close = 185.0
+        fake_bar.volume = 1000
+
+        kwargs["on_bar"](fake_bar)
+        assert backfill == [fake_bar] and live == []
+
+        kwargs["on_bar_update"](fake_bar)
+        assert backfill == [fake_bar] and live == [fake_bar]
+
+    def test_no_on_live_bar_passes_none_update_callback(self, tmp_path, monkeypatch):
+        """Without on_live_bar, on_bar_update is None so the portfolio routes
+        live updates to on_bar (backward compatible)."""
+        monkeypatch.setenv("IB_HIST_DB", str(tmp_path / "bars.db"))
+        plugin, portfolio = self._make_plugin_with_portfolio()
+        if hasattr(plugin, "_bar_store_instance"):
+            del plugin._bar_store_instance
+
+        plugin.subscribe_live_bars(
+            contract=MagicMock(symbol="GLD"),
+            on_bar=lambda b: None,
+        )
+        _, kwargs = portfolio.request_historical_data.call_args
+        assert kwargs["on_bar_update"] is None
+
 
 # ---------------------------------------------------------------------------
 # PluginBase.get_bars_cached — delegation to BarStore.get_bars

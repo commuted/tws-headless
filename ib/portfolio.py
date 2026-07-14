@@ -180,6 +180,14 @@ class Portfolio(IBClient):
         self._pending_orders: Dict[int, asyncio.Event] = {}  # orderId -> completion event
         self._on_order_status: Optional[Callable[[OrderRecord], None]] = None
 
+        # When True, every order placement method (place_order, place_order_raw,
+        # and therefore place_order_custom) logs and suppresses the order instead
+        # of transmitting it to IB.  Set by TradingEngine when the engine runs in
+        # OrderExecutionMode.DRY_RUN so that orders placed directly against the
+        # portfolio — bypassing the executive's reconciler, e.g. by plugins —
+        # are gated by dry-run mode too.
+        self.dry_run: bool = False
+
         # Commission tracking - maps exec_id to commission report
         self._commission_reports: Dict[str, "CommissionAndFeesReport"] = {}
         self._on_commission: Optional[Callable[[str, float, float, str], None]] = None
@@ -987,6 +995,7 @@ class Portfolio(IBClient):
         on_bar: Optional[Callable] = None,
         on_end: Optional[Callable] = None,
         keep_up_to_date: bool = False,
+        on_bar_update: Optional[Callable] = None,
     ) -> int:
         """
         Request historical bar data from IB.
@@ -1005,12 +1014,22 @@ class Portfolio(IBClient):
             use_rth:          Regular trading hours only
             on_bar:           Optional callback(bar) called for each bar as it arrives
             on_end:           Callback(bars, start, end) called when request completes
+            keep_up_to_date:  Keep the subscription open for live bar updates
+            on_bar_update:    Optional callback(bar) for live bars delivered via
+                              historicalDataUpdate (keep_up_to_date=True only).
+                              When set, backfill bars (historicalData) go to
+                              on_bar and live update bars go to on_bar_update,
+                              letting callers distinguish replayed history from
+                              genuinely-live data. When None, all bars go to
+                              on_bar (backward compatible).
 
         Returns:
             Request ID (pass to cancel_historical_data() to abort early)
         """
         req_id = self.get_next_req_id()
-        self._historical_requests[req_id] = (on_bar, on_end, keep_up_to_date, [])
+        self._historical_requests[req_id] = (
+            on_bar, on_bar_update, on_end, keep_up_to_date, []
+        )
         logger.debug(
             f"reqHistoricalData req_id={req_id} "
             f"duration={duration_str} bar_size={bar_size_setting} "
@@ -1103,6 +1122,13 @@ class Portfolio(IBClient):
         Returns:
             Order ID if submitted, None if failed
         """
+        if self.dry_run:
+            logger.info(
+                f"[DRY RUN] Order suppressed: {action} {quantity} "
+                f"{contract.symbol} @ {order_type}"
+            )
+            return None
+
         if not self.connected:
             logger.error("Not connected to IB")
             return None
@@ -1232,6 +1258,13 @@ class Portfolio(IBClient):
         Returns:
             True if submitted successfully
         """
+        if self.dry_run:
+            logger.info(
+                f"[DRY RUN] Order suppressed: {order.action} {order.totalQuantity} "
+                f"{contract.symbol} @ {order.orderType}"
+            )
+            return False
+
         if not self.connected:
             logger.error("Not connected to IB")
             return False
@@ -1786,11 +1819,11 @@ class Portfolio(IBClient):
             self.historicalDataEnd(reqId, "", "")
 
     def historicalData(self, reqId: int, bar) -> None:
-        """IB callback: one bar of historical data has arrived."""
+        """IB callback: one bar of historical data has arrived (backfill)."""
         entry = self._historical_requests.get(reqId)
         if entry is None:
             return
-        on_bar, _on_end, _keep_up_to_date, bars = entry
+        on_bar, _on_bar_update, _on_end, _keep_up_to_date, bars = entry
         bars.append(bar)
         if on_bar:
             try:
@@ -1809,7 +1842,7 @@ class Portfolio(IBClient):
         entry = self._historical_requests.get(reqId)
         if entry is None:
             return
-        _on_bar, on_end, keep_up_to_date, bars = entry
+        _on_bar, _on_bar_update, on_end, keep_up_to_date, bars = entry
         logger.debug(
             f"historicalDataEnd req_id={reqId} bars={len(bars)} "
             f"start={start} end={end}"
@@ -1825,15 +1858,20 @@ class Portfolio(IBClient):
             self._historical_requests.pop(reqId, None)
 
     def historicalDataUpdate(self, reqId: int, bar) -> None:
-        """IB callback: a new bar has arrived for a keep_up_to_date subscription."""
+        """IB callback: a new bar has arrived for a keep_up_to_date subscription.
+
+        Routes to on_bar_update when the requester provided one (so callers can
+        tell live bars from the backfill replay); falls back to on_bar otherwise.
+        """
         entry = self._historical_requests.get(reqId)
         if entry is None:
             return
-        on_bar, _on_end, _keep_up_to_date, bars = entry
+        on_bar, on_bar_update, _on_end, _keep_up_to_date, bars = entry
         bars.append(bar)
-        if on_bar:
+        cb = on_bar_update or on_bar
+        if cb:
             try:
-                on_bar(bar)
+                cb(bar)
             except Exception as e:
                 logger.error(f"Error in historicalDataUpdate on_bar callback: {e}")
 

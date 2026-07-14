@@ -917,6 +917,7 @@ class PluginBase(ABC):
         bar_size_setting: str = "5 mins",
         what_to_show: str = "TRADES",
         use_rth: bool = True,
+        on_live_bar: Optional[Callable] = None,
     ) -> Optional[int]:
         """
         Subscribe to live bar updates using reqHistoricalData(keepUpToDate=True).
@@ -926,18 +927,25 @@ class PluginBase(ABC):
 
         IB delivers bars via:
           historicalData     — initial backfill bars (already-completed bars)
-          historicalDataUpdate — each new bar as it completes going forward
+          historicalDataUpdate — live updates of the forming bar going forward
 
-        Both call on_bar(bar) with ibapi BarData objects (date, open, high,
-        low, close, volume, wap, barCount).
+        Both deliver ibapi BarData objects (date, open, high, low, close,
+        volume, wap, barCount).
 
         Args:
             contract:         IB Contract (use ContractBuilder helpers)
-            on_bar:           Callback(bar) called for each bar (backfill + live)
+            on_bar:           Callback(bar) called for each bar. When
+                              on_live_bar is None this receives backfill AND
+                              live bars; otherwise backfill bars only.
             duration_str:     How far back to seed: "1 D", "2 D", etc.
             bar_size_setting: Bar width: "5 mins", "1 hour", "1 day", etc.
             what_to_show:     TRADES, MIDPOINT, BID, ASK
             use_rth:          Regular trading hours only
+            on_live_bar:      Optional callback(bar) for live update bars only
+                              (historicalDataUpdate). Use this when the plugin
+                              must distinguish genuinely-live bars from the
+                              backfill replay — e.g. to make sure a replayed
+                              session bar can never trigger a real order.
 
         Returns:
             req_id to pass to cancel_live_bars(), or None on error.
@@ -949,13 +957,15 @@ class PluginBase(ABC):
         symbol = contract.symbol
         store  = self._bar_store
 
-        def _caching_on_bar(bar):
-            on_bar(bar)          # user callback first — never block live trading
-            if store:
-                try:
-                    store.insert_bar(symbol, bar_size_setting, what_to_show, use_rth, bar)
-                except Exception:
-                    pass
+        def _caching(cb):
+            def _wrapped(bar):
+                cb(bar)          # user callback first — never block live trading
+                if store:
+                    try:
+                        store.insert_bar(symbol, bar_size_setting, what_to_show, use_rth, bar)
+                    except Exception:
+                        pass
+            return _wrapped
 
         req_id = self.portfolio.request_historical_data(
             contract=contract,
@@ -963,9 +973,10 @@ class PluginBase(ABC):
             bar_size_setting=bar_size_setting,
             what_to_show=what_to_show,
             use_rth=use_rth,
-            on_bar=_caching_on_bar,
+            on_bar=_caching(on_bar),
             on_end=None,          # no on_end — keeps subscription alive
             keep_up_to_date=True,
+            on_bar_update=_caching(on_live_bar) if on_live_bar else None,
         )
         logger.info(
             f"Plugin '{self.name}': live bar subscription req_id={req_id} "
