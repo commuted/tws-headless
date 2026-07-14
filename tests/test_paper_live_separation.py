@@ -206,27 +206,43 @@ class TestConfigureExecutionDb:
 # ---------------------------------------------------------------------------
 
 class TestIbctlSocketResolution:
+    """resolve_socket_path returns (path, error). exists is injected so the
+    tests are hermetic — the developer machine may have real engine sockets.
+    Auto-discovery behavior is covered in test_ibctl.py."""
+
+    _NONE_EXIST = staticmethod(lambda p: False)
+
     def _ibctl(self):
         import ibctl
         return ibctl
 
     def test_explicit_socket_wins(self):
         m = self._ibctl()
-        assert m.resolve_socket_path("/tmp/custom.sock", "paper", 7497) == "/tmp/custom.sock"
+        path, err = m.resolve_socket_path("/tmp/custom.sock", "paper", 7497,
+                                          exists=self._NONE_EXIST)
+        assert path == "/tmp/custom.sock" and err is None
 
     def test_env_selects_socket(self):
         m = self._ibctl()
-        assert m.resolve_socket_path(None, "live", None).endswith("_live.sock")
+        path, err = m.resolve_socket_path(None, "live", None,
+                                          exists=self._NONE_EXIST)
+        assert path.endswith("_live.sock") and err is None
 
     def test_port_derives_env(self):
         m = self._ibctl()
-        assert m.resolve_socket_path(None, None, 7497).endswith("_paper.sock")
-        assert m.resolve_socket_path(None, None, 4001).endswith("_live.sock")
+        path, _ = m.resolve_socket_path(None, None, 7497, exists=self._NONE_EXIST)
+        assert path.endswith("_paper.sock")
+        path, _ = m.resolve_socket_path(None, None, 4001, exists=self._NONE_EXIST)
+        assert path.endswith("_live.sock")
 
     def test_unknown_port_falls_back_to_legacy(self):
         m = self._ibctl()
-        assert m.resolve_socket_path(None, None, 9999) == m.DEFAULT_SOCKET_PATH
+        path, err = m.resolve_socket_path(None, None, 9999,
+                                          exists=self._NONE_EXIST)
+        assert path == m.DEFAULT_SOCKET_PATH and err is None
 
     def test_nothing_falls_back_to_legacy(self):
         m = self._ibctl()
-        assert m.resolve_socket_path(None, None, None) == m.DEFAULT_SOCKET_PATH
+        path, err = m.resolve_socket_path(None, None, None,
+                                          exists=self._NONE_EXIST)
+        assert path == m.DEFAULT_SOCKET_PATH and err is None

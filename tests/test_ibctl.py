@@ -605,3 +605,58 @@ class TestRequestToken:
         call_kwargs = mock_send.call_args
         assert call_kwargs[1].get('request_token') == 'my-token' or \
                'my-token' in str(call_kwargs)
+
+
+# =============================================================================
+# resolve_socket_path Tests (paper/live socket auto-discovery)
+# =============================================================================
+
+class TestResolveSocketPath:
+    """Socket resolution: explicit > env > port > auto-discovery > legacy.
+    A live engine must never be targeted implicitly."""
+
+    def _resolve(self, existing, explicit=None, env=None, port=None):
+        from ibctl import resolve_socket_path
+        return resolve_socket_path(
+            explicit, env, port, exists=lambda p: p in existing,
+        )
+
+    def _sock(self, env):
+        from ibctl import _socket_for_env
+        return _socket_for_env(env)
+
+    def test_explicit_socket_wins(self):
+        path, err = self._resolve(set(), explicit="/tmp/custom.sock")
+        assert path == "/tmp/custom.sock" and err is None
+
+    def test_env_flag_selects_env_socket(self):
+        path, err = self._resolve(set(), env="live")
+        assert path == self._sock("live") and err is None
+
+    def test_paper_port_derives_paper_socket(self):
+        path, err = self._resolve(set(), port=7497)
+        assert path == self._sock("paper") and err is None
+
+    def test_legacy_socket_preferred_when_present(self):
+        from ibctl import DEFAULT_SOCKET_PATH
+        path, err = self._resolve({DEFAULT_SOCKET_PATH, self._sock("paper")})
+        assert path == DEFAULT_SOCKET_PATH and err is None
+
+    def test_lone_paper_socket_auto_discovered(self):
+        path, err = self._resolve({self._sock("paper")})
+        assert path == self._sock("paper") and err is None
+
+    def test_lone_live_socket_requires_explicit_env(self):
+        path, err = self._resolve({self._sock("live")})
+        assert path is None
+        assert "live" in err and "--env" in err
+
+    def test_both_sockets_ambiguous(self):
+        path, err = self._resolve({self._sock("paper"), self._sock("live")})
+        assert path is None
+        assert "--env" in err
+
+    def test_nothing_running_falls_back_to_legacy(self):
+        from ibctl import DEFAULT_SOCKET_PATH
+        path, err = self._resolve(set())
+        assert path == DEFAULT_SOCKET_PATH and err is None
