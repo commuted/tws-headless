@@ -334,9 +334,13 @@ def main():
         # back to shared/default files (which would comingle paper and live).
         if not (engine.portfolio and engine.portfolio.managed_accounts):
             abort["reason"] = (
-                "No managed account reported by IB. Refusing to start on "
-                "shared/default state without a known account — paper/live "
-                "separation and the environment guardrail cannot be enforced."
+                "No managed account reported by IB (waited "
+                f"{engine.config.managed_accounts_timeout:.0f}s after connect). "
+                "Refusing to start on shared/default state without a known "
+                "account — paper/live separation and the environment guardrail "
+                "cannot be enforced. Common transient causes: TWS/Gateway just "
+                "logged in or mid-restart, or 2FA pending. The supervisor will "
+                "retry with backoff."
             )
             logger.error(abort["reason"])
             return

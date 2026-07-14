@@ -44,6 +44,11 @@ env_claude
 plugins/*/state.json
 plugins/*/holdings.json
 plugins/_unassigned/
+# Account-scoped plugin state (plugins/<name>/<account_id>/...)
+plugins/*/*/state.json
+plugins/*/*/holdings.json
+plugins/*/*/instruments.json
+plugins/*/*/alerts.jsonl
 
 # Historical bar data (runtime cache, not source)
 historical/*.db
