@@ -803,14 +803,21 @@ class PluginExecutive:
             logger.warning("No unassigned plugin to sync")
             return False
 
-        # Collect claimed symbols from all other plugins
+        # Collect claimed symbols and per-symbol quantities from all other
+        # plugins. Quantities make the sync quantity-level: a partially
+        # claimed symbol keeps its remainder in _unassigned instead of
+        # vanishing from the ledger entirely.
         claimed_symbols = self._get_claimed_symbols()
+        claimed_quantities = self._get_claimed_quantities()
 
         # Calculate claimed cash (sum of cash in other plugin holdings)
         claimed_cash = self._get_claimed_cash()
 
         # Sync unassigned plugin
-        return plugin.sync_from_portfolio(claimed_symbols, claimed_cash)
+        return plugin.sync_from_portfolio(
+            claimed_symbols, claimed_cash,
+            claimed_quantities=claimed_quantities,
+        )
 
     def _get_claimed_symbols(self) -> Set[str]:
         """Get all symbols with actual positions held by non-system plugins"""
@@ -829,6 +836,22 @@ class PluginExecutive:
                 for pos in plugin.holdings.current_positions:
                     if pos.quantity != 0:  # Only non-zero positions
                         claimed.add(pos.symbol.upper())
+
+        return claimed
+
+    def _get_claimed_quantities(self) -> Dict[str, float]:
+        """Per-symbol quantities held by non-system plugins (summed)."""
+        claimed: Dict[str, float] = {}
+
+        for name, config in self._plugins.items():
+            plugin = config.plugin
+            if plugin.is_system_plugin:
+                continue
+            if plugin.holdings:
+                for pos in plugin.holdings.current_positions:
+                    if pos.quantity:
+                        sym = pos.symbol.upper()
+                        claimed[sym] = claimed.get(sym, 0.0) + pos.quantity
 
         return claimed
 
@@ -1164,64 +1187,17 @@ class PluginExecutive:
         # Find discrepancies
         unassigned_plugin = self.unassigned_plugin
 
-        # 1. Positions in account but not claimed by any plugin
+        # 1. Sync _unassigned to the remainder. For every account position,
+        #    _unassigned must hold exactly (account − claimed) — quantity-level,
+        #    so partially-claimed symbols keep their remainder visible (10 of
+        #    471 GLD claimed leaves 461 in _unassigned, not zero). The
+        #    remainder is SET, not added: reconciliation is idempotent, a
+        #    steady-state web reports zero discrepancies, and the hourly
+        #    watchdog run only alerts on real drift.
         for symbol, acct_pos in account_positions.items():
             claimed_qty = all_plugin_positions.get(symbol, 0)
 
-            if claimed_qty == 0:
-                # Entire position is unassigned
-                discrepancy = {
-                    "type": "unclaimed_position",
-                    "symbol": symbol,
-                    "account_quantity": acct_pos["quantity"],
-                    "claimed_quantity": 0,
-                    "difference": acct_pos["quantity"],
-                }
-                report["discrepancies"].append(discrepancy)
-
-                # Add to unassigned
-                if unassigned_plugin and unassigned_plugin.holdings:
-                    unassigned_plugin.holdings.add_position(
-                        symbol=symbol,
-                        quantity=acct_pos["quantity"],
-                        cost_basis=acct_pos["avg_cost"],
-                        current_price=acct_pos["current_price"],
-                    )
-                    report["adjustments"].append({
-                        "action": "added_to_unassigned",
-                        "symbol": symbol,
-                        "quantity": acct_pos["quantity"],
-                    })
-                    report["summary"]["positions_added_to_unassigned"] += 1
-
-            elif claimed_qty < acct_pos["quantity"]:
-                # Under-claimed - some shares not assigned
-                difference = acct_pos["quantity"] - claimed_qty
-                discrepancy = {
-                    "type": "under_claimed",
-                    "symbol": symbol,
-                    "account_quantity": acct_pos["quantity"],
-                    "claimed_quantity": claimed_qty,
-                    "difference": difference,
-                }
-                report["discrepancies"].append(discrepancy)
-
-                # Add difference to unassigned
-                if unassigned_plugin and unassigned_plugin.holdings:
-                    unassigned_plugin.holdings.add_position(
-                        symbol=symbol,
-                        quantity=difference,
-                        cost_basis=acct_pos["avg_cost"],
-                        current_price=acct_pos["current_price"],
-                    )
-                    report["adjustments"].append({
-                        "action": "added_to_unassigned",
-                        "symbol": symbol,
-                        "quantity": difference,
-                    })
-                    report["summary"]["quantity_adjustments"] += 1
-
-            elif claimed_qty > acct_pos["quantity"]:
+            if claimed_qty > acct_pos["quantity"]:
                 # Over-claimed - plugins claim more than account has
                 difference = claimed_qty - acct_pos["quantity"]
                 discrepancy = {
@@ -1254,6 +1230,71 @@ class PluginExecutive:
                         })
                         remaining_to_remove -= remove_qty
                         report["summary"]["positions_removed_from_plugins"] += 1
+
+                claimed_qty = acct_pos["quantity"]   # after the reduction
+
+            expected_unassigned = acct_pos["quantity"] - claimed_qty
+
+            if not (unassigned_plugin and unassigned_plugin.holdings):
+                continue
+            current_pos = unassigned_plugin.holdings.get_position(symbol)
+            current_qty = current_pos.quantity if current_pos else 0
+            delta = expected_unassigned - current_qty
+            if abs(delta) <= 1e-9:
+                continue   # ledger already in sync — not a discrepancy
+
+            report["discrepancies"].append({
+                "type": "unclaimed_position" if claimed_qty == 0 else "under_claimed",
+                "symbol": symbol,
+                "account_quantity": acct_pos["quantity"],
+                "claimed_quantity": claimed_qty,
+                "difference": acct_pos["quantity"] - claimed_qty,
+            })
+            if delta > 0:
+                unassigned_plugin.holdings.add_position(
+                    symbol=symbol,
+                    quantity=delta,
+                    cost_basis=acct_pos["avg_cost"],
+                    current_price=acct_pos["current_price"],
+                )
+                report["adjustments"].append({
+                    "action": "added_to_unassigned",
+                    "symbol": symbol,
+                    "quantity": delta,
+                })
+                if claimed_qty == 0:
+                    report["summary"]["positions_added_to_unassigned"] += 1
+                else:
+                    report["summary"]["quantity_adjustments"] += 1
+            else:
+                unassigned_plugin.holdings.remove_position(symbol, -delta)
+                report["adjustments"].append({
+                    "action": "removed_from_unassigned",
+                    "symbol": symbol,
+                    "quantity": -delta,
+                })
+                report["summary"]["quantity_adjustments"] += 1
+
+        # 1b. Drop stale _unassigned entries for symbols the account no longer
+        #     holds — bookkeeping left behind by fills, manual account trades,
+        #     or the old symbol-level sync.
+        if unassigned_plugin and unassigned_plugin.holdings:
+            for pos in list(unassigned_plugin.holdings.current_positions):
+                if pos.symbol not in account_positions and pos.quantity > 0:
+                    report["discrepancies"].append({
+                        "type": "stale_unassigned_position",
+                        "symbol": pos.symbol,
+                        "account_quantity": 0,
+                        "claimed_quantity": 0,
+                        "difference": -pos.quantity,
+                    })
+                    unassigned_plugin.holdings.remove_position(pos.symbol, pos.quantity)
+                    report["adjustments"].append({
+                        "action": "removed_from_unassigned",
+                        "symbol": pos.symbol,
+                        "quantity": pos.quantity,
+                    })
+                    report["summary"]["quantity_adjustments"] += 1
 
         # 2. Positions claimed by plugins but not in account
         for symbol, plugin_list in plugin_positions.items():
