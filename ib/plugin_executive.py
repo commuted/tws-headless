@@ -1692,6 +1692,14 @@ class PluginExecutive:
         plugin.set_message_bus(self.message_bus)
         plugin.set_executive(self)
 
+        # Attach the live portfolio. Plugins loaded from file (ibctl plugin
+        # load, session auto-reload) and factory-constructed plugins arrive
+        # bare; without a portfolio they run in "test mode" — no warm-up, no
+        # market data subscriptions, no orders — while reporting a healthy
+        # started state. Never overrides a portfolio the caller already set.
+        if self.portfolio is not None and plugin.portfolio is None:
+            plugin.portfolio = self.portfolio
+
         if plugin.instance_id in self._plugins:
             logger.warning(f"Plugin instance '{plugin.instance_id}' already registered")
             return False

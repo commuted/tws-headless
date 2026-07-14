@@ -248,3 +248,35 @@ class TestExecutiveAlerts:
         executive, received, _ = self._wired(tmp_path)
         executive._handle_ib_error_for_plugins(999, 201, "Order rejected")
         assert received == []
+
+
+class TestRegisterPluginAttachesPortfolio:
+    """Plugins loaded from file or a factory arrive without a portfolio and
+    would otherwise run in 'test mode' — no warm-up, no subscriptions, no
+    orders — while reporting a healthy started state."""
+
+    def test_bare_plugin_gets_executive_portfolio(self, tmp_path):
+        portfolio = MagicMock()
+        executive = PluginExecutive(portfolio, None, message_bus=MessageBus())
+        plugin = ReconnectProbePlugin("p_bare", tmp_path / "a")
+        assert plugin.portfolio is None
+
+        executive.register_plugin(plugin, execution_mode=ExecutionMode.MANUAL)
+        assert plugin.portfolio is portfolio
+
+    def test_explicit_portfolio_not_overridden(self, tmp_path):
+        exec_portfolio = MagicMock()
+        own_portfolio = Mock()
+        executive = PluginExecutive(exec_portfolio, None, message_bus=MessageBus())
+        plugin = ReconnectProbePlugin("p_own", tmp_path / "a")
+        plugin.portfolio = own_portfolio
+
+        executive.register_plugin(plugin, execution_mode=ExecutionMode.MANUAL)
+        assert plugin.portfolio is own_portfolio
+
+    def test_no_executive_portfolio_leaves_none(self, tmp_path):
+        executive = PluginExecutive(None, None, message_bus=MessageBus())
+        plugin = ReconnectProbePlugin("p_none", tmp_path / "a")
+
+        executive.register_plugin(plugin, execution_mode=ExecutionMode.MANUAL)
+        assert plugin.portfolio is None

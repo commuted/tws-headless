@@ -305,6 +305,19 @@ class WatchdogPlugin(PluginBase):
             )
         return True
 
+    def _feed_snapshot(self) -> List[Dict]:
+        """Registered keepUpToDate feeds with age, for get_status visibility."""
+        if not self.portfolio or not hasattr(self.portfolio, "keep_up_to_date_feeds"):
+            return []
+        try:
+            return [
+                {"symbol": f["symbol"],
+                 "seconds_since_last_bar": round(f["seconds_since_last_bar"], 1)}
+                for f in self.portfolio.keep_up_to_date_feeds()
+            ]
+        except Exception:
+            return []
+
     def _in_rth(self, now: Optional[datetime] = None) -> bool:
         """US equity regular trading hours (America/New_York), weekdays.
         Market holidays are not modeled (rare false positives)."""
@@ -411,6 +424,12 @@ class WatchdogPlugin(PluginBase):
                     "stale_feeds_active":  sorted(self._stale_alerted),
                     "stuck_orders_active": sorted(self._stuck_alerted),
                     "in_rth":          self._in_rth(),
+                    # The feeds actually registered — an empty list during
+                    # market hours means no plugin has a live bar
+                    # subscription at all (e.g. a plugin loaded without a
+                    # portfolio), which the staleness check cannot see:
+                    # zero feeds and all-feeds-fresh look identical to it.
+                    "live_bar_feeds": self._feed_snapshot(),
                 },
             }
 
