@@ -111,6 +111,7 @@ def portfolio_instance(mock_ibapi):
         portfolio._orders_lock = Lock()
         portfolio._pending_orders = {}
         portfolio._on_order_status = None
+        portfolio.dry_run = False
         portfolio._connected = asyncio.Event()
         portfolio._callbacks = {}
         portfolio.managed_accounts = ["DU123456"]
@@ -1133,6 +1134,117 @@ class TestOrderPlacement:
         assert result == 100
         order = portfolio_instance._orders[100]
         assert order.order_type == "LMT"
+
+
+# =============================================================================
+# Dry-Run Gate Tests
+# =============================================================================
+
+class TestDryRunGate:
+    """dry_run=True must suppress every order placement path — including
+    place_order_custom, which plugins use to bypass the executive's
+    reconciler (where DRY_RUN mode is otherwise enforced)."""
+
+    def _armed(self, portfolio_instance):
+        portfolio_instance._connected.set()
+        portfolio_instance._next_order_id = 100
+        portfolio_instance._lock = Lock()
+        portfolio_instance.dry_run = True
+        return portfolio_instance
+
+    def test_place_order_suppressed(self, portfolio_instance):
+        p = self._armed(portfolio_instance)
+        contract = MagicMock()
+        contract.symbol = "GLD"
+
+        with patch.object(p, 'placeOrder') as mock_place:
+            result = p.place_order(contract, "BUY", 100)
+
+        assert result is None
+        mock_place.assert_not_called()
+        assert p._orders == {}
+
+    def test_place_order_raw_suppressed(self, portfolio_instance):
+        p = self._armed(portfolio_instance)
+        contract = MagicMock()
+        contract.symbol = "GLD"
+        order = MagicMock()
+        order.action = "BUY"
+        order.totalQuantity = 40
+        order.orderType = "MOC"
+
+        with patch.object(p, 'placeOrder') as mock_place:
+            result = p.place_order_raw(100, contract, order)
+
+        assert result is False
+        mock_place.assert_not_called()
+        assert p._orders == {}
+
+    def test_place_order_custom_suppressed(self, portfolio_instance):
+        p = self._armed(portfolio_instance)
+        contract = MagicMock()
+        contract.symbol = "GLD"
+        order = MagicMock()
+        order.action = "SELL"
+        order.totalQuantity = 40
+        order.orderType = "MKT"
+
+        with patch.object(p, 'placeOrder') as mock_place:
+            result = p.place_order_custom(contract, order)
+
+        assert result is None
+        mock_place.assert_not_called()
+
+    def test_orders_transmit_when_dry_run_false(self, portfolio_instance):
+        portfolio_instance._connected.set()
+        portfolio_instance._next_order_id = 100
+        portfolio_instance._lock = Lock()
+        portfolio_instance.dry_run = False
+        contract = MagicMock()
+        contract.symbol = "GLD"
+        order = MagicMock()
+        order.action = "BUY"
+        order.totalQuantity = 40
+        order.orderType = "MOC"
+
+        with patch.object(portfolio_instance, 'placeOrder') as mock_place:
+            result = portfolio_instance.place_order_custom(contract, order)
+
+        assert result == 100
+        mock_place.assert_called_once()
+
+
+# =============================================================================
+# Historical Bar Callback Routing Tests
+# =============================================================================
+
+class TestHistoricalBarRouting:
+    """historicalData (backfill) routes to on_bar; historicalDataUpdate (live)
+    routes to on_bar_update when provided, else falls back to on_bar."""
+
+    def test_update_routes_to_on_bar_update(self, portfolio_instance):
+        backfill, live = [], []
+        portfolio_instance._historical_requests = {
+            7: (backfill.append, live.append, None, True, []),
+        }
+        bar = MagicMock()
+
+        portfolio_instance.historicalData(7, bar)
+        assert backfill == [bar] and live == []
+
+        portfolio_instance.historicalDataUpdate(7, bar)
+        assert backfill == [bar] and live == [bar]
+
+    def test_update_falls_back_to_on_bar(self, portfolio_instance):
+        received = []
+        portfolio_instance._historical_requests = {
+            7: (received.append, None, None, True, []),
+        }
+        bar = MagicMock()
+
+        portfolio_instance.historicalData(7, bar)
+        portfolio_instance.historicalDataUpdate(7, bar)
+        assert received == [bar, bar]
 
 
 # =============================================================================

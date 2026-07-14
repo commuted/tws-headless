@@ -720,12 +720,24 @@ def subscribe_live_bars(
     bar_size_setting: str = "5 mins",
     what_to_show: str = "TRADES",
     use_rth: bool = True,
+    on_live_bar: Optional[Callable] = None,
 ) -> Optional[int]:
 ```
 
 IB delivers the backfill bars immediately, then continues delivering bars
-as each new interval closes (`keepUpToDate=True`). Both backfill and live
-bars pass through `on_bar` and are inserted into BarStore automatically.
+as each new interval closes (`keepUpToDate=True`). By default both backfill
+and live bars pass through `on_bar` and are inserted into BarStore
+automatically.
+
+**Separating backfill from live bars.** Pass `on_live_bar` to receive live
+update bars (`historicalDataUpdate`) through a dedicated callback while
+backfill bars (`historicalData` replay) keep arriving via `on_bar`. Any
+plugin that takes trading decisions from time-of-day bars MUST use this
+separation: on startup/resume IB replays already-completed bars — including
+today's session bars — through the backfill path, and a replayed bar must
+never be able to trigger a real order. See `plugins/gld_usd_swap` for the
+pattern (backfill feeds indicator state only; live bars may also fire
+session decisions).
 
 ```python
 class MyPlugin(PluginBase):
@@ -1188,6 +1200,13 @@ order_id = self.portfolio.place_order_custom(contract, order)
 if order_id is not None:
     self.register_order(order_id)
 ```
+
+**Dry-run mode applies to direct orders too.** When the engine runs with
+`--mode dry_run`, the portfolio itself suppresses every placement path
+(`place_order`, `place_order_raw`, `place_order_custom`): the order is
+logged with a `[DRY RUN]` prefix and the call returns `None`/`False`.
+Plugins should treat a `None` order ID as "not placed" (which they must do
+anyway for connection failures).
 
 ### `on_order_fill(self, order_record) -> None`
 
