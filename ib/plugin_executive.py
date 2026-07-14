@@ -3327,6 +3327,51 @@ class PluginExecutive:
             "cash_released": cash_released,
         }
 
+    def publish_alert(self, kind: str, data: Dict[str, Any]) -> None:
+        """Publish an operational alert to the MessageBus 'alerts' channel.
+
+        Consumed by the watchdog plugin's alert sink (alerts.jsonl + optional
+        webhook). Never raises — alerting must not break the calling path.
+        """
+        try:
+            self.message_bus.publish(
+                channel="alerts",
+                payload={
+                    "kind": kind,
+                    "timestamp": datetime.now().isoformat(),
+                    **data,
+                },
+                publisher="plugin_executive",
+                message_type="alert",
+            )
+        except Exception as e:
+            logger.error(f"Failed to publish alert '{kind}': {e}")
+
+    def notify_reconnected(self) -> None:
+        """Called by the engine after an unexpected disconnection is recovered.
+
+        keepUpToDate historical subscriptions (subscribe_live_bars) are not
+        restored by the ConnectionManager's stream recovery — without this,
+        plugins like gld_usd_swap would hold positions with a silently dead
+        bar feed. Gives every STARTED plugin the chance to re-create its
+        subscriptions via on_reconnect(), and raises an alert so the event
+        is visible outside the logs.
+        """
+        started = [
+            config.plugin for config in list(self._plugins.values())
+            if config.plugin.state == PluginState.STARTED
+        ]
+        self.publish_alert("reconnected", {
+            "message": "IB connection re-established after unexpected drop; "
+                       "notifying plugins to re-create live-bar subscriptions",
+            "plugins_notified": [p.name for p in started],
+        })
+        for plugin in started:
+            try:
+                plugin.on_reconnect()
+            except Exception as e:
+                logger.error(f"[{plugin.name}] on_reconnect error: {e}")
+
     def _handle_order_status_for_plugins(self, order_record) -> None:
         """
         Route an order status update to the plugins that own the order.
@@ -3398,6 +3443,16 @@ class PluginExecutive:
                 f"IB error reqId={req_id} code={error_code} not attributed to any plugin"
             )
             return
+
+        # Plugin-attributed errors (order rejections, stream failures) must be
+        # visible outside the logs — raise an operational alert.
+        self.publish_alert("ib_error", {
+            "req_id": req_id,
+            "error_code": error_code,
+            "error_string": error_string,
+            "plugins": [p.name for p in plugins],
+            "is_order_error": bool(order_names),
+        })
 
         for plugin in plugins:
             try:

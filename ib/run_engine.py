@@ -296,6 +296,30 @@ def main():
     except ImportError as e:
         logger.warning(f"Could not load paper_test_feeds plugin: {e}")
 
+    # Load and start the watchdog plugin (anomaly detection + alert sink).
+    # Started immediately — a watchdog that must be switched on manually is
+    # a watchdog that's off. Its checks no-op safely until IB connects.
+    try:
+        from plugins.watchdog import WatchdogPlugin
+        from .plugin_executive import ExecutionMode
+
+        watchdog = WatchdogPlugin(
+            portfolio=engine.portfolio,
+            message_bus=engine.message_bus,
+        )
+        if engine.plugin_executive:
+            engine.plugin_executive.register_plugin(
+                watchdog,
+                execution_mode=ExecutionMode.MANUAL,
+                enabled=True,
+            )
+            if engine.plugin_executive.start_plugin(watchdog.name):
+                logger.info(f"Added and started plugin: {watchdog.name}")
+            else:
+                logger.warning("Watchdog plugin registered but failed to start")
+    except ImportError as e:
+        logger.warning(f"Could not load watchdog plugin: {e}")
+
     # Callbacks
     # Populated by on_started if a paper/live guardrail trips; checked in _run()
     # to hard-fail before any reconciliation or trading occurs.

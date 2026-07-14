@@ -1,0 +1,250 @@
+"""
+Tests for the operational monitoring chain added for live readiness:
+
+  - Portfolio keepUpToDate feed-activity tracking (staleness data source)
+  - ConnectionManager.on_reconnected (fires once after an unexpected drop)
+  - PluginExecutive.publish_alert / notify_reconnected / IB-error alerts
+"""
+
+import time
+from pathlib import Path
+from unittest.mock import Mock, MagicMock
+
+import pytest
+
+from ib.portfolio import Portfolio
+from ib.connection_manager import ConnectionManager, ConnectionConfig
+from ib.plugin_executive import PluginExecutive, ExecutionMode
+from ib.message_bus import MessageBus
+from plugins.base import PluginBase, PluginState
+
+
+# ---------------------------------------------------------------------------
+# Portfolio keepUpToDate feed tracking
+# ---------------------------------------------------------------------------
+
+def _bare_portfolio():
+    p = Portfolio.__new__(Portfolio)
+    p._historical_requests = {}
+    p._kutd_symbols = {}
+    p._kutd_last_bar = {}
+    return p
+
+
+class TestKeepUpToDateFeedTracking:
+    def test_keep_up_to_date_request_registers_feed(self):
+        p = _bare_portfolio()
+        p.get_next_req_id = lambda: 33
+        p.reqHistoricalData = Mock()
+
+        p.request_historical_data(
+            contract=Mock(symbol="GLD"), keep_up_to_date=True,
+        )
+
+        assert p._kutd_symbols == {33: "GLD"}
+        feeds = p.keep_up_to_date_feeds()
+        assert feeds[0]["symbol"] == "GLD"
+        assert feeds[0]["seconds_since_last_bar"] < 1.0
+
+    def test_one_shot_request_not_registered(self):
+        p = _bare_portfolio()
+        p.get_next_req_id = lambda: 34
+        p.reqHistoricalData = Mock()
+
+        p.request_historical_data(contract=Mock(symbol="GLD"))
+
+        assert p._kutd_symbols == {}
+        assert p.keep_up_to_date_feeds() == []
+
+    def test_bar_arrival_refreshes_activity(self):
+        p = _bare_portfolio()
+        p._historical_requests[9] = (None, None, None, True, [])
+        p._kutd_symbols[9] = "GLD"
+        p._kutd_last_bar[9] = time.time() - 500
+
+        assert p.keep_up_to_date_feeds()[0]["seconds_since_last_bar"] == \
+            pytest.approx(500, abs=5)
+
+        p.historicalDataUpdate(9, MagicMock())
+        assert p.keep_up_to_date_feeds()[0]["seconds_since_last_bar"] < 1.0
+
+    def test_backfill_bar_also_refreshes_activity(self):
+        p = _bare_portfolio()
+        p._historical_requests[9] = (None, None, None, True, [])
+        p._kutd_symbols[9] = "GLD"
+        p._kutd_last_bar[9] = time.time() - 500
+
+        p.historicalData(9, MagicMock())
+        assert p.keep_up_to_date_feeds()[0]["seconds_since_last_bar"] < 1.0
+
+    def test_cancel_removes_feed(self):
+        p = _bare_portfolio()
+        p.cancelHistoricalData = Mock()
+        p._historical_requests[9] = (None, None, None, True, [])
+        p._kutd_symbols[9] = "GLD"
+        p._kutd_last_bar[9] = time.time()
+
+        p.cancel_historical_data(9)
+        assert p.keep_up_to_date_feeds() == []
+
+
+# ---------------------------------------------------------------------------
+# ConnectionManager.on_reconnected
+# ---------------------------------------------------------------------------
+
+def _manager():
+    portfolio = Mock()
+    portfolio._callbacks = {}
+    portfolio._stream_subscriptions = {}
+    portfolio._bar_subscriptions = {}
+    manager = ConnectionManager(
+        portfolio, ConnectionConfig(auto_reconnect=False),
+    )
+    # Neutralize asyncio task startup and stream recovery for sync testing
+    manager._start_keepalive_task = lambda: None
+    manager._start_health_task = lambda: None
+    manager._recover_streams = lambda: None
+    return manager
+
+
+class TestOnReconnected:
+    def test_not_fired_on_initial_connect(self):
+        manager = _manager()
+        fired = []
+        manager.on_reconnected = lambda: fired.append(True)
+
+        manager._on_connected()
+        assert fired == []
+
+    def test_fired_once_after_unexpected_drop(self):
+        manager = _manager()
+        fired = []
+        manager.on_reconnected = lambda: fired.append(True)
+
+        manager._on_connected()          # initial connect
+        manager._handle_disconnection()  # unexpected drop
+        manager._on_connected()          # recovered
+        assert fired == [True]
+
+        manager._on_connected()          # later connect without a drop
+        assert fired == [True]
+
+    def test_fired_after_each_drop(self):
+        manager = _manager()
+        fired = []
+        manager.on_reconnected = lambda: fired.append(True)
+
+        for _ in range(2):
+            manager._handle_disconnection()
+            manager._on_connected()
+        assert fired == [True, True]
+
+
+# ---------------------------------------------------------------------------
+# PluginExecutive alerts + reconnect notification
+# ---------------------------------------------------------------------------
+
+class ReconnectProbePlugin(PluginBase):
+    """Minimal plugin recording on_reconnect calls."""
+
+    def __init__(self, name, base_path):
+        super().__init__(name, base_path=base_path)
+        self.reconnect_calls = 0
+
+    @property
+    def description(self):
+        return "reconnect probe"
+
+    def start(self):
+        return True
+
+    def stop(self):
+        return True
+
+    def freeze(self):
+        return True
+
+    def resume(self):
+        return True
+
+    def handle_request(self, request_type, payload):
+        return {"success": False}
+
+    def calculate_signals(self):
+        return []
+
+    def on_reconnect(self):
+        self.reconnect_calls += 1
+
+
+class TestExecutiveAlerts:
+    def _wired(self, tmp_path):
+        bus = MessageBus()
+        received = []
+        bus.subscribe("alerts", received.append, subscriber="test")
+        executive = PluginExecutive(None, None, message_bus=bus)
+        return executive, received, tmp_path
+
+    def test_publish_alert_reaches_channel(self, tmp_path):
+        executive, received, _ = self._wired(tmp_path)
+        executive.publish_alert("test_kind", {"detail": 1})
+
+        assert len(received) == 1
+        payload = received[0].payload
+        assert payload["kind"] == "test_kind"
+        assert payload["detail"] == 1
+        assert "timestamp" in payload
+        assert received[0].metadata.message_type == "alert"
+
+    def test_notify_reconnected_calls_started_plugins_only(self, tmp_path):
+        executive, received, base = self._wired(tmp_path)
+        started = ReconnectProbePlugin("p_started", base / "a")
+        frozen = ReconnectProbePlugin("p_frozen", base / "b")
+        executive.register_plugin(started, execution_mode=ExecutionMode.MANUAL)
+        executive.register_plugin(frozen, execution_mode=ExecutionMode.MANUAL)
+        started._state = PluginState.STARTED
+        frozen._state = PluginState.FROZEN
+
+        executive.notify_reconnected()
+
+        assert started.reconnect_calls == 1
+        assert frozen.reconnect_calls == 0
+        kinds = [m.payload["kind"] for m in received]
+        assert "reconnected" in kinds
+        alert = next(m for m in received if m.payload["kind"] == "reconnected")
+        # The executive's built-in _unassigned system plugin is also STARTED
+        assert "p_started" in alert.payload["plugins_notified"]
+        assert "p_frozen" not in alert.payload["plugins_notified"]
+
+    def test_notify_reconnected_survives_plugin_error(self, tmp_path):
+        executive, received, base = self._wired(tmp_path)
+        bad = ReconnectProbePlugin("p_bad", base / "a")
+        good = ReconnectProbePlugin("p_good", base / "b")
+        bad.on_reconnect = Mock(side_effect=RuntimeError("boom"))
+        executive.register_plugin(bad, execution_mode=ExecutionMode.MANUAL)
+        executive.register_plugin(good, execution_mode=ExecutionMode.MANUAL)
+        bad._state = PluginState.STARTED
+        good._state = PluginState.STARTED
+
+        executive.notify_reconnected()
+        assert good.reconnect_calls == 1
+
+    def test_plugin_attributed_ib_error_publishes_alert(self, tmp_path):
+        executive, received, base = self._wired(tmp_path)
+        plugin = ReconnectProbePlugin("p_orders", base / "a")
+        executive.register_plugin(plugin, execution_mode=ExecutionMode.MANUAL)
+        executive.register_order_for_plugin(55, "p_orders")
+
+        executive._handle_ib_error_for_plugins(55, 201, "Order rejected")
+
+        kinds = [m.payload["kind"] for m in received]
+        assert kinds == ["ib_error"]
+        payload = received[0].payload
+        assert payload["error_code"] == 201
+        assert payload["plugins"] == ["p_orders"]
+        assert payload["is_order_error"] is True
+
+    def test_unattributed_ib_error_no_alert(self, tmp_path):
+        executive, received, _ = self._wired(tmp_path)
+        executive._handle_ib_error_for_plugins(999, 201, "Order rejected")
+        assert received == []
