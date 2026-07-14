@@ -76,7 +76,17 @@ state.json (regime, SMAs, trade count, allocation)
 ./ibctl.py transfer position _unassigned gld_usd_swap GLD 25 --confirm
 ```
 
-The plugin calculates share quantity as `int(allocation_dollars / gld_price)`. Increase `allocation_dollars` to scale up.
+**Funding is enforced.** With a live portfolio the MOC buy is sized as
+`int(min(allocation_dollars, plugin cash) / gld_price)` — an unfunded plugin
+places no orders (an error is logged at each skipped close). Increase
+`allocation_dollars` *and* transfer matching cash to scale up.
+
+**Fills update holdings automatically.** Each BUY/SELL fill adds/removes the
+GLD position in `holdings.json` and adjusts the plugin's cash by the fill
+value, so the open-time sell always operates on exactly the shares this
+plugin bought. (MOC fills at the closing auction, which can differ slightly
+from the 15:45 price; small cash drift is corrected by account
+reconciliation.)
 
 ## Parameters
 
@@ -222,7 +232,7 @@ Valid values: `"gold"`, `"cash"`, `"unknown"`.
 ## Lifecycle
 
 ```bash
-# Freeze (saves regime state, cancels bar subscriptions)
+# Freeze (cancels bar subscriptions — no bars, no orders while frozen — and saves state)
 ./ibctl.py plugin freeze gld_usd_swap
 
 # Resume (reopens subscriptions; SMAs warm up from fresh bars)
@@ -232,7 +242,37 @@ Valid values: `"gold"`, `"cash"`, `"unknown"`.
 ./ibctl.py plugin stop gld_usd_swap
 ```
 
-State persisted on stop/freeze: `holding_gld`, current regime, `regime_at_prior_close`, `allocation_dollars`, all SMA parameters, trade/hold counts.
+State persisted on stop/freeze **and at every session decision** (09:30 and
+15:45): `holding_gld`, current regime, `regime_at_prior_close`,
+`allocation_dollars`, all SMA parameters, trade/hold counts, and any
+in-flight orders. The regime saved at close therefore survives an overnight
+crash.
+
+### Crash recovery
+
+If the engine dies between the 15:45 MOC placement and the 16:00 fill, the
+order is restored from state on the next start and treated conservatively:
+the plugin assumes the buy filled (`holding_gld=True`) so it can never place
+a duplicate overnight buy, and logs an error asking you to verify the fill
+in TWS. If the order did fill while the engine was down, the shares land in
+`_unassigned` at startup reconciliation — transfer them back:
+
+```bash
+./ibctl.py plugin request gld_usd_swap get_status   # check holding_gld / pending
+./ibctl.py transfer position _unassigned gld_usd_swap GLD <qty> --confirm
+```
+
+If it did not fill, clear the stale flag with
+`force_regime` / a fresh `plugin stop` + `start` once holdings are correct.
+
+### Safety gating
+
+Session decisions (the 09:30 sell and 15:45 MOC buy) fire only on bars
+delivered through the live-update callback (`historicalDataUpdate`) with a
+timestamp strictly newer than any bar seen. Backfill replay on
+startup/resume — which includes today's session bars — feeds indicator
+state only and can never place an order. Engine `--mode dry_run` suppresses
+this plugin's orders at the portfolio level.
 
 ## Warm-Up Period
 

@@ -78,6 +78,22 @@ class TestEngineConfig:
         assert config.order_mode == OrderExecutionMode.IMMEDIATE
         assert config.keepalive_interval == 60.0
 
+    def test_dry_run_mode_gates_portfolio(self):
+        """DRY_RUN engines must set portfolio.dry_run so direct order
+        placement (place_order_custom by plugins) is suppressed too."""
+        with patch('trading_engine.Portfolio'):
+            engine = TradingEngine(EngineConfig(
+                order_mode=OrderExecutionMode.DRY_RUN,
+            ))
+        assert engine.portfolio.dry_run is True
+
+    def test_immediate_mode_leaves_portfolio_live(self):
+        with patch('trading_engine.Portfolio'):
+            engine = TradingEngine(EngineConfig(
+                order_mode=OrderExecutionMode.IMMEDIATE,
+            ))
+        assert engine.portfolio.dry_run is False
+
 
 class TestTradingEngineInit:
     """Tests for TradingEngine initialization"""
