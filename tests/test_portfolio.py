@@ -112,6 +112,8 @@ def portfolio_instance(mock_ibapi):
         portfolio._pending_orders = {}
         portfolio._on_order_status = None
         portfolio.dry_run = False
+        portfolio._kutd_symbols = {}
+        portfolio._kutd_last_bar = {}
         portfolio._connected = asyncio.Event()
         portfolio._callbacks = {}
         portfolio.managed_accounts = ["DU123456"]

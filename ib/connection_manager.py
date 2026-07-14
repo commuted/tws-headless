@@ -127,7 +127,17 @@ class ConnectionManager:
         self.on_connected: Optional[Callable[[], None]] = None
         self.on_disconnected: Optional[Callable[[], None]] = None
         self.on_reconnecting: Optional[Callable[[int], None]] = None  # arg: attempt number
+        # Fired after a connection is re-established following an unexpected
+        # disconnection (never on the initial connect), after _recover_streams.
+        # Used to let plugins re-create keepUpToDate historical subscriptions,
+        # which _recover_streams cannot restore (it only re-issues tick/bar
+        # streams; the reqHistoricalData parameters live with the requesters).
+        self.on_reconnected: Optional[Callable[[], None]] = None
         self.on_error: Optional[Callable[[Exception], None]] = None
+
+        # Set on unexpected disconnection; consumed by _on_connected to fire
+        # on_reconnected exactly once per recovered connection.
+        self._notify_reconnected = False
 
         # Register for portfolio connection events
         self._setup_portfolio_callbacks()
@@ -283,6 +293,16 @@ class ConnectionManager:
         # Recover streams if we have saved subscriptions
         self._recover_streams()
 
+        # After an unexpected drop, notify so plugins can re-create their
+        # keepUpToDate subscriptions (not covered by _recover_streams).
+        if self._notify_reconnected:
+            self._notify_reconnected = False
+            if self.on_reconnected:
+                try:
+                    self.on_reconnected()
+                except Exception as e:
+                    logger.error(f"Error in on_reconnected callback: {e}")
+
         # Invoke callback
         if self.on_connected:
             try:
@@ -299,6 +319,7 @@ class ConnectionManager:
 
         # Save current stream state before reconnecting
         self._save_stream_state()
+        self._notify_reconnected = True
 
         self._set_state(ConnectionState.DISCONNECTED)
 

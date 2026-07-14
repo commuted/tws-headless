@@ -70,6 +70,7 @@ Default parameters (tunable at runtime):
 
 import bisect
 import logging
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from itertools import groupby
@@ -93,6 +94,16 @@ _INIT_DERIV_RINF = 0.200   # conservative RINF initial
 
 _OPEN_HOUR,  _OPEN_MIN  = 9,  30
 _CLOSE_HOUR, _CLOSE_MIN = 15, 45   # bar completes 15:50 — inside NYSE ARCA MOC cutoff
+
+# Alert when an order has had no fill/terminal status for this long. (The
+# watchdog plugin runs an independent wall-clock check; this in-plugin check
+# only advances on bar callbacks, so it mainly covers intraday sells.)
+_PENDING_ORDER_ALERT_SECONDS = 1800
+
+# Alert after this many consecutive unparseable bar timestamps — session
+# decisions match on the parsed clock time, so a format/timezone drift would
+# otherwise silently disable all trading (including exits) with zero errors.
+_PARSE_FAILURE_ALERT_THRESHOLD = 10
 
 # After (re)subscribing, IB replays a burst of already-completed backfill bars
 # (via historicalData) before live updates start (via historicalDataUpdate).
@@ -284,6 +295,11 @@ class GldUsdSwapPlugin(PluginBase):
 
         # --- pending order tracking (order_id → "BUY"/"SELL") ---
         self._pending_order_actions: Dict[int, str] = {}
+        self._pending_order_placed_at: Dict[int, float] = {}  # order_id → time.time()
+        self._pending_alerted: set = set()   # order_ids already alerted as stuck
+
+        # --- bar-timestamp parse failure tracking (timezone/format drift) ---
+        self._bar_parse_failures: int = 0
 
         # --- diagnostics ---
         self._trade_count:      int               = 0
@@ -328,6 +344,11 @@ class GldUsdSwapPlugin(PluginBase):
             self._pending_order_actions = {
                 int(oid): action
                 for oid, action in saved.get("pending_orders", {}).items()
+            }
+            # Age restored orders from now — if they stay unresolved, the
+            # stuck-order alert fires after the normal threshold.
+            self._pending_order_placed_at = {
+                oid: time.time() for oid in self._pending_order_actions
             }
             logger.info(
                 f"Restored: holding={self._holding_gld}, "
@@ -403,6 +424,15 @@ class GldUsdSwapPlugin(PluginBase):
         self._cancel_subscriptions()
         self._start_subscriptions()
         return True
+
+    def on_reconnect(self) -> None:
+        # keepUpToDate subscriptions are not restored by the connection
+        # manager's stream recovery. Without this the plugin runs blind after
+        # any TWS reconnect — holding a position with no bars, no session
+        # decisions, and no errors logged.
+        logger.warning("Reconnected — re-creating live bar subscriptions")
+        self._cancel_subscriptions()
+        self._start_subscriptions()
 
     def _start_subscriptions(self) -> None:
         """Subscribe to live 5-min bars for all four symbols.
@@ -525,7 +555,7 @@ class GldUsdSwapPlugin(PluginBase):
                 if (ts.hour == _CLOSE_HOUR and ts.minute == _CLOSE_MIN
                         and self._regime != REGIME_UNKNOWN):
                     last_close_regime = self._regime
-            except (ValueError, AttributeError):
+            except (ValueError, TypeError, AttributeError):
                 pass
 
         # --- log per-symbol stats ---
@@ -574,8 +604,26 @@ class GldUsdSwapPlugin(PluginBase):
 
         try:
             ts = datetime.strptime(bar.date[:8] + " " + bar.date[9:17], "%Y%m%d %H:%M:%S")
-        except (ValueError, AttributeError):
+        except (ValueError, TypeError, AttributeError):
             ts = None
+
+        # Session decisions match on the parsed clock time; a bar-date format
+        # or timezone drift would silently disable all trading (incl. exits).
+        if ts is None:
+            self._bar_parse_failures += 1
+            if self._bar_parse_failures == _PARSE_FAILURE_ALERT_THRESHOLD:
+                self._alert(
+                    "bar_parse_failure",
+                    f"{self._bar_parse_failures} consecutive unparseable bar "
+                    f"timestamps (last: {getattr(bar, 'date', None)!r}) — "
+                    f"session decisions CANNOT fire; check TWS date format "
+                    f"and timezone",
+                )
+        else:
+            self._bar_parse_failures = 0
+
+        if is_live:
+            self._check_pending_order_age()
 
         if symbol == "GLD":
             self._gld_price = close
@@ -804,6 +852,7 @@ class GldUsdSwapPlugin(PluginBase):
         oid = self.portfolio.place_order_custom(contract, order)
         if oid is not None:
             self._pending_order_actions[oid] = "BUY"
+            self._pending_order_placed_at[oid] = time.time()
             self.register_order(oid)
             logger.info(f"MOC BUY {shares} GLD (order_id={oid}) — {reason}")
         else:
@@ -841,10 +890,51 @@ class GldUsdSwapPlugin(PluginBase):
         oid = self.portfolio.place_order_custom(contract, order)
         if oid is not None:
             self._pending_order_actions[oid] = "SELL"
+            self._pending_order_placed_at[oid] = time.time()
             self.register_order(oid)
             logger.info(f"MKT SELL {qty} GLD (order_id={oid}) — {reason}")
         else:
             logger.error(f"Failed to place MKT SELL {qty} GLD — {reason}")
+
+    def _alert(self, kind: str, message: str, **data) -> None:
+        """Log at ERROR and publish to the 'alerts' channel.
+
+        The watchdog plugin's sink turns alerts-channel messages into
+        alerts.jsonl entries and optional webhook notifications — the path
+        that reaches a human when nobody is watching the logs.
+        """
+        logger.error(f"[alert:{kind}] {message}")
+        if self._message_bus is not None:
+            self.publish(
+                "alerts",
+                {
+                    "kind":      kind,
+                    "message":   message,
+                    "plugin":    self.name,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    **data,
+                },
+                message_type="alert",
+            )
+
+    def _check_pending_order_age(self) -> None:
+        """Alert once per order that has no fill/terminal status past the
+        threshold. Runs on live bar callbacks, so it covers intraday orders;
+        the watchdog plugin covers the overnight MOC window on wall clock."""
+        now = time.time()
+        for oid, placed in self._pending_order_placed_at.items():
+            if oid in self._pending_alerted:
+                continue
+            age = now - placed
+            if age > _PENDING_ORDER_ALERT_SECONDS:
+                self._pending_alerted.add(oid)
+                action = self._pending_order_actions.get(oid, "?")
+                self._alert(
+                    "stuck_order",
+                    f"{action} order {oid} unresolved for {age / 60:.0f} min — "
+                    f"no fill or terminal status from IB; check TWS",
+                    order_id=oid, action=action, age_seconds=int(age),
+                )
 
     def _current_gld_shares(self) -> int:
         """GLD shares in THIS plugin's holdings (its allocated slice) — not the
@@ -871,6 +961,8 @@ class GldUsdSwapPlugin(PluginBase):
 
     def on_order_fill(self, order_record) -> None:
         action = self._pending_order_actions.pop(order_record.order_id, None)
+        self._pending_order_placed_at.pop(order_record.order_id, None)
+        self._pending_alerted.discard(order_record.order_id)
         qty    = float(order_record.filled_quantity or 0)
         price  = float(order_record.avg_fill_price or 0.0)
 
@@ -916,14 +1008,29 @@ class GldUsdSwapPlugin(PluginBase):
         ):
             return
         action = self._pending_order_actions.pop(order_record.order_id, None)
+        self._pending_order_placed_at.pop(order_record.order_id, None)
+        self._pending_alerted.discard(order_record.order_id)
         if action:
-            logger.error(
+            self._alert(
+                "order_terminal",
                 f"{action} order {order_record.order_id} "
                 f"{order_record.status.value} — "
                 f"holding_gld={self._holding_gld} unchanged; "
-                f"manual reconciliation may be needed"
+                f"manual reconciliation may be needed",
+                order_id=order_record.order_id,
+                action=action,
+                status=order_record.status.value,
             )
             self._save_state()   # drop the terminal order from persisted pending
+
+    def on_ib_error(self, req_id: int, error_code: int, error_string: str) -> None:
+        is_order = req_id in self._pending_order_actions
+        self._alert(
+            "ib_error",
+            f"IB error on {'order' if is_order else 'request'} {req_id}: "
+            f"code={error_code} {error_string}",
+            req_id=req_id, error_code=error_code, is_order=is_order,
+        )
 
     # =========================================================================
     # REQUESTS / CLI
