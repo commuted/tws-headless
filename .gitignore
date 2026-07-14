@@ -52,4 +52,6 @@ plugins/*/*/alerts.jsonl
 
 # Historical bar data (runtime cache, not source)
 historical/*.db
+historical/*.db-shm
+historical/*.db-wal
 historical/config.json

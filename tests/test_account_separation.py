@@ -540,3 +540,61 @@ class TestGetBarsCached:
             force=True,
         )
         assert force_values == [True]
+
+
+# ---------------------------------------------------------------------------
+# PluginBase._load_instruments — account-scoped fallback to plugin root
+# ---------------------------------------------------------------------------
+
+class TestInstrumentsAccountFallback:
+    """Instruments are plugin configuration, not runtime state: an
+    account-scoped plugin whose account directory has no instruments.json
+    must fall back to the copy shipped at the plugin root (previously it
+    silently loaded 0 instruments)."""
+
+    def _write_instruments(self, dir_path, symbols):
+        import json
+        dir_path.mkdir(parents=True, exist_ok=True)
+        (dir_path / "instruments.json").write_text(json.dumps({
+            "instruments": [{"symbol": s, "name": s} for s in symbols]
+        }))
+
+    def test_account_scoped_falls_back_to_plugin_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path))
+        self._write_instruments(tmp_path / "alpha", ["GLD", "UUP"])
+
+        plugin = SimplePlugin("alpha")
+        plugin.set_account("DU123")
+        plugin.load()
+
+        assert sorted(i.symbol for i in plugin.instruments) == ["GLD", "UUP"]
+
+    def test_account_scoped_file_overrides_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path))
+        self._write_instruments(tmp_path / "alpha", ["GLD"])
+        self._write_instruments(tmp_path / "alpha" / "DU123", ["SPY"])
+
+        plugin = SimplePlugin("alpha")
+        plugin.set_account("DU123")
+        plugin.load()
+
+        assert [i.symbol for i in plugin.instruments] == ["SPY"]
+
+    def test_unscoped_plugin_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path))
+        self._write_instruments(tmp_path / "alpha", ["GLD"])
+
+        plugin = SimplePlugin("alpha")
+        plugin.load()
+
+        assert [i.symbol for i in plugin.instruments] == ["GLD"]
+
+    def test_no_file_anywhere_loads_none(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path))
+        (tmp_path / "alpha").mkdir()
+
+        plugin = SimplePlugin("alpha")
+        plugin.set_account("DU123")
+        plugin.load()
+
+        assert plugin.instruments == []

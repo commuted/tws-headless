@@ -173,6 +173,46 @@ class TestUnassignedPluginSync:
         holdings = plugin.get_effective_holdings()
         assert holdings["cash"] == 7000.0  # 10000 - 3000
 
+    def test_sync_with_claimed_quantities_keeps_remainder(self):
+        """Quantity-level sync: a partially claimed symbol keeps its
+        remainder in unassigned instead of vanishing (10 of 471 GLD claimed
+        must leave 461 here)."""
+        portfolio = MockPortfolio()
+        portfolio.add_position("GLD", 471, 420.79)
+        portfolio.add_position("SPY", 200, 450.0)
+
+        plugin = UnassignedPlugin(portfolio=portfolio)
+        plugin.load()
+        plugin.start()
+
+        assert plugin.sync_from_portfolio(
+            claimed_symbols={"GLD"},          # symbol-level view says "claimed"
+            claimed_quantities={"GLD": 10.0}, # quantity-level view wins
+        ) == True
+
+        holdings = plugin.get_effective_holdings()
+        by_symbol = {p["symbol"]: p for p in holdings["positions"]}
+        assert by_symbol["GLD"]["quantity"] == 461
+        assert by_symbol["SPY"]["quantity"] == 200
+
+    def test_sync_with_claimed_quantities_full_claim_excluded(self):
+        """A fully claimed symbol drops out of unassigned entirely."""
+        portfolio = MockPortfolio()
+        portfolio.add_position("GLD", 10, 420.79)
+        portfolio.add_position("SPY", 200, 450.0)
+
+        plugin = UnassignedPlugin(portfolio=portfolio)
+        plugin.load()
+        plugin.start()
+
+        assert plugin.sync_from_portfolio(
+            claimed_quantities={"GLD": 10.0},
+        ) == True
+
+        holdings = plugin.get_effective_holdings()
+        symbols = [p["symbol"] for p in holdings["positions"]]
+        assert symbols == ["SPY"]
+
 
 class TestUnassignedPluginCashTracking:
     """Test cash balance tracking"""
