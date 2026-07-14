@@ -349,6 +349,23 @@ class TestRequests:
         assert result["data"]["monitor_running"] is True
         plugin.stop()
 
+    def test_get_status_exposes_feed_snapshot(self, tmp_path):
+        """Zero feeds and all-feeds-fresh are identical to the staleness
+        check; get_status must show what is actually registered."""
+        plugin = _make_plugin(tmp_path)
+        plugin.portfolio = Mock()
+        plugin.portfolio.keep_up_to_date_feeds.return_value = [
+            {"req_id": 7, "symbol": "GLD", "seconds_since_last_bar": 12.34},
+        ]
+        result = plugin.handle_request("get_status", {})
+        feeds = result["data"]["live_bar_feeds"]
+        assert feeds == [{"symbol": "GLD", "seconds_since_last_bar": 12.3}]
+
+    def test_get_status_empty_feed_snapshot_without_portfolio(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        result = plugin.handle_request("get_status", {})
+        assert result["data"]["live_bar_feeds"] == []
+
     def test_check_now_runs_checks(self, tmp_path):
         plugin = _make_plugin(tmp_path)
         plugin.portfolio = Mock(

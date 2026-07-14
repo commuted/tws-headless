@@ -96,20 +96,49 @@ def _env_from_port(port):
     return None
 
 
-def resolve_socket_path(explicit_socket, env, port):
+def resolve_socket_path(explicit_socket, env, port, exists=os.path.exists):
     """Resolve which engine socket to talk to.
 
-    Priority: explicit --socket > --env > --port-derived env > legacy fallback.
+    Priority: explicit --socket > --env > --port-derived env > auto-discovery
+    of a running engine's socket > legacy fallback.
+
+    Auto-discovery (nothing specified): if the legacy socket exists, use it
+    (a pre-separation engine is running); else if exactly the *paper* socket
+    exists, use it — the common single-engine case should just work. A live
+    engine is never targeted implicitly: if the live socket exists (alone or
+    alongside paper), require --env so commands cannot land on a live account
+    by default.
+
+    Returns (socket_path, error_message); error_message is set when the
+    target is ambiguous or live-only and must be chosen explicitly.
     """
     if explicit_socket:
-        return explicit_socket
+        return explicit_socket, None
     if env:
-        return _socket_for_env(env)
+        return _socket_for_env(env), None
     if port is not None:
         derived = _env_from_port(port)
         if derived:
-            return _socket_for_env(derived)
-    return DEFAULT_SOCKET_PATH
+            return _socket_for_env(derived), None
+
+    if exists(DEFAULT_SOCKET_PATH):
+        return DEFAULT_SOCKET_PATH, None
+
+    paper = _socket_for_env("paper")
+    live = _socket_for_env("live")
+    paper_up, live_up = exists(paper), exists(live)
+    if paper_up and not live_up:
+        return paper, None
+    if live_up:
+        which = ("both paper and live engine sockets"
+                 if paper_up else "a live engine socket")
+        return None, (
+            f"Found {which}; refusing to guess. "
+            f"Pass --env paper or --env live to target the right engine."
+        )
+    # Nothing running — return the legacy path so the caller produces the
+    # standard "server not running" error (with env-socket hints).
+    return DEFAULT_SOCKET_PATH, None
 
 
 class CommandStatus(Enum):
@@ -196,9 +225,14 @@ def send_command(
         )
 
     except FileNotFoundError:
+        running = [p for e in ("paper", "live")
+                   if os.path.exists(p := _socket_for_env(e))]
+        hint = (f" Found running engine socket(s): {', '.join(running)} — "
+                f"target one with --env paper or --env live."
+                if running else "")
         return CommandResult(
             status=CommandStatus.ERROR,
-            message=f"Server not running (socket not found: {socket_path})",
+            message=f"Server not running (socket not found: {socket_path}).{hint}",
         )
     except ConnectionRefusedError:
         return CommandResult(
@@ -711,13 +745,16 @@ Examples:
     # are treated as part of the subcommand's argument list.
     args.command = list(args.command) + extra
 
-    # Resolve which engine socket to talk to (paper vs live separation).
-    args.socket = resolve_socket_path(args.socket, args.env, args.port)
-
     if not args.command:
         parser.print_help()
         sys.exit(0)
         return
+
+    # Resolve which engine socket to talk to (paper vs live separation).
+    args.socket, socket_err = resolve_socket_path(args.socket, args.env, args.port)
+    if socket_err:
+        print(f"Error: {socket_err}", file=sys.stderr)
+        sys.exit(2)
 
     # Historical subcommand — handled locally (coverage/purge) or via engine (fetch)
     if args.command[0].lower() == "historical":
