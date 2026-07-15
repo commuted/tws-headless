@@ -1098,7 +1098,11 @@ class PluginExecutive:
             {
                 "symbol": p.get("symbol"),
                 "quantity": p.get("quantity", 0),
-                "value": p.get("market_value", p.get("quantity", 0) * p.get("current_price", 0)),
+                # market_value is rarely maintained in plugin ledgers (fills
+                # and transfers record quantity/cost/price but not value), so
+                # a stored 0.0 must not shadow the qty × price fallback.
+                "value": (p.get("market_value")
+                          or p.get("quantity", 0) * p.get("current_price", 0)),
             }
             for p in positions
             if p.get("quantity", 0) > 0

@@ -120,6 +120,31 @@ class TestFormatResult:
         assert any("SPY" in c for c in calls)
         assert any("BND" in c for c in calls)
 
+    def test_format_result_transfer_list_positions_no_crash(self):
+        """Transfer-list results reuse the 'positions' key with rows shaped
+        {symbol, quantity, value} — the portfolio table renderer must not
+        hard-index price/pnl/allocation on them (KeyError regression)."""
+        from ibctl import format_result
+        from ibctl import CommandStatus, CommandResult
+
+        result = CommandResult(
+            status=CommandStatus.SUCCESS,
+            message="Transferable from 'gld_usd_swap': ...",
+            data={
+                "cash": 20000.0,
+                "positions": [
+                    {"symbol": "GLD", "quantity": 10.0, "value": 3671.30},
+                ],
+            },
+        )
+
+        with patch('builtins.print') as mock_print:
+            format_result(result, verbose=False)   # must not raise
+
+        # The portfolio table (with its Price/P&L header) is NOT rendered
+        calls = [str(call) for call in mock_print.call_args_list]
+        assert not any("P&L" in c for c in calls)
+
     def test_format_result_dump_with_positions_and_orders(self):
         """Test format_result formats plugin dump data with positions and orders"""
         from ibctl import format_result
