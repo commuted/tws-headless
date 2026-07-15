@@ -13,6 +13,7 @@ Provides:
 
 import asyncio
 import logging
+import os
 from decimal import Decimal
 from typing import Optional, Callable, Dict, List, Set, Any, Tuple
 from datetime import datetime, timedelta
@@ -3155,6 +3156,57 @@ class PluginExecutive:
             "stream_manager": self.stream_manager.get_status(),
         }
 
+    def _localize_class_path(self, slot: str, class_path: str) -> str:
+        """Prefer the slot's plugin file under the ACTIVE plugin directory.
+
+        The registry stores an absolute class_path in a home-scoped SQLite DB
+        that outlives checkouts. Observed live: a slot registered months ago
+        from a different working copy kept auto-reloading that stale tree's
+        plugin code — the engine core ran current code while the strategy
+        class silently predated every safety fix (and placed a real after-
+        hours MOC). If the stored path already lives under the active plugin
+        dir it is returned unchanged; otherwise, when the same slot exists
+        locally, the local file wins, an alert is raised, and the registry is
+        left to be rewritten by the subsequent load. A foreign path with no
+        local counterpart is returned unchanged (deliberately-external
+        plugins stay loadable).
+        """
+        active_dir = Path(
+            os.environ.get("IB_PLUGIN_DIR",
+                           Path(__file__).resolve().parent.parent / "plugins")
+        ).resolve()
+        stored = Path(class_path)
+        try:
+            if stored.resolve().is_relative_to(active_dir):
+                return class_path
+        except (OSError, ValueError):
+            pass
+
+        local = active_dir / slot / stored.name
+        if not local.exists():
+            # Fall back to the conventional entry file for the slot
+            for candidate in (active_dir / slot / "plugin.py",
+                              active_dir / slot / "__init__.py"):
+                if candidate.exists():
+                    local = candidate
+                    break
+            else:
+                return class_path
+
+        logger.warning(
+            f"reload_registered_plugins: slot '{slot}' was registered from a "
+            f"foreign tree ({class_path}); loading the active copy instead: "
+            f"{local}"
+        )
+        self.publish_alert("stale_plugin_path", {
+            "slot": slot,
+            "registered_path": str(class_path),
+            "loaded_path": str(local),
+            "message": "Plugin registry pointed outside the active plugin "
+                       "directory; the local copy was loaded instead",
+        })
+        return str(local)
+
     def reload_registered_plugins(self) -> Dict[str, Any]:
         """
         Reload plugins that were active at last shutdown.
@@ -3188,6 +3240,8 @@ class PluginExecutive:
             if slot in loaded_slots:
                 result["skipped"].append(slot)
                 continue
+
+            class_path = self._localize_class_path(slot, class_path)
 
             if not Path(class_path).exists():
                 logger.warning(
