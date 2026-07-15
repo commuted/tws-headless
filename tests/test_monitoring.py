@@ -280,3 +280,44 @@ class TestRegisterPluginAttachesPortfolio:
 
         executive.register_plugin(plugin, execution_mode=ExecutionMode.MANUAL)
         assert plugin.portfolio is None
+
+
+class TestAutoSaveDoesNotClobber:
+    """The executive's periodic auto-save must never overwrite a plugin's
+    state.json with a generic stub — that destroyed strategy state (regime,
+    counters, pending-order crash-recovery records) every health cycle.
+    Plugins without get_state_for_save() are skipped entirely."""
+
+    def _registered(self, tmp_path, plugin):
+        executive = PluginExecutive(None, None, message_bus=MessageBus())
+        executive.register_plugin(plugin, execution_mode=ExecutionMode.MANUAL)
+        plugin._state = PluginState.STARTED
+        return executive
+
+    def test_plugin_without_hook_is_skipped(self, tmp_path):
+        plugin = ReconnectProbePlugin("p_plain", tmp_path / "a")
+        assert not hasattr(plugin, "get_state_for_save")
+        executive = self._registered(tmp_path, plugin)
+
+        plugin.save_state({"my": "state"})     # plugin-managed content
+        executive._auto_save_all_states()
+
+        assert plugin.load_state() == {"my": "state"}   # untouched
+
+    def test_plugin_with_hook_is_saved(self, tmp_path):
+        plugin = ReconnectProbePlugin("p_hooked", tmp_path / "a")
+        plugin.get_state_for_save = lambda: {"holding": True, "pending": {"118": "BUY"}}
+        executive = self._registered(tmp_path, plugin)
+
+        executive._auto_save_all_states()
+
+        assert plugin.load_state() == {"holding": True, "pending": {"118": "BUY"}}
+
+    def test_stopped_plugin_not_saved(self, tmp_path):
+        plugin = ReconnectProbePlugin("p_stopped", tmp_path / "a")
+        plugin.get_state_for_save = lambda: {"x": 1}
+        executive = self._registered(tmp_path, plugin)
+        plugin._state = PluginState.STOPPED
+
+        executive._auto_save_all_states()
+        assert plugin.load_state() == {}   # nothing written

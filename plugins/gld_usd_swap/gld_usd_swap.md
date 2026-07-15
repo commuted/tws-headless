@@ -267,12 +267,22 @@ If it did not fill, clear the stale flag with
 
 ### Safety gating
 
-Session decisions (the 09:30 sell and 15:45 MOC buy) fire only on bars
-delivered through the live-update callback (`historicalDataUpdate`) with a
-timestamp strictly newer than any bar seen. Backfill replay on
-startup/resume — which includes today's session bars — feeds indicator
-state only and can never place an order. Engine `--mode dry_run` suppresses
-this plugin's orders at the portfolio level.
+Three layers, outermost last:
+
+1. **Backfill/live separation** — session decisions fire only on bars
+   delivered through the live-update callback (`historicalDataUpdate`) with
+   a timestamp strictly newer than any bar seen. Backfill replay on
+   startup/resume feeds indicator state only.
+2. **Wall-clock validity windows** — even a bar that passes layer 1 is
+   refused unless it is today's bar AND the New York wall clock is inside
+   the decision's window: open 09:30–09:45 ET, close 15:45–15:55 ET (the
+   MOC submission cutoff). This is the absolute bound: IB has been observed
+   re-delivering the day's 15:45 bar through the live-update path on an
+   after-hours restart, which would otherwise place an MOC that queues for
+   the NEXT day's close. Refused decisions are logged warnings, never
+   orders.
+3. **Engine `--mode dry_run`** suppresses this plugin's orders at the
+   portfolio level.
 
 ### Anomaly alerting
 
