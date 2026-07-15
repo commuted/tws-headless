@@ -321,3 +321,70 @@ class TestAutoSaveDoesNotClobber:
 
         executive._auto_save_all_states()
         assert plugin.load_state() == {}   # nothing written
+
+
+class TestLocalizeClassPath:
+    """The registry stores absolute class_paths in a home-scoped DB that
+    outlives checkouts. A slot registered from another working copy must
+    reload from the ACTIVE plugin directory — observed live: a months-old
+    tree's plugin code auto-reloaded for weeks, silently missing every
+    safety fix."""
+
+    def _executive(self):
+        bus = MessageBus()
+        received = []
+        bus.subscribe("alerts", received.append, subscriber="test")
+        return PluginExecutive(None, None, message_bus=bus), received
+
+    def test_path_under_active_dir_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path))
+        local = tmp_path / "myplug" / "plugin.py"
+        local.parent.mkdir(parents=True)
+        local.write_text("# plugin")
+        executive, received = self._executive()
+
+        assert executive._localize_class_path("myplug", str(local)) == str(local)
+        assert received == []
+
+    def test_foreign_path_remapped_to_local_copy(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path / "active"))
+        local = tmp_path / "active" / "gld_usd_swap" / "__init__.py"
+        local.parent.mkdir(parents=True)
+        local.write_text("# current")
+        foreign = tmp_path / "stale_tree" / "gld_usd_swap" / "__init__.py"
+        foreign.parent.mkdir(parents=True)
+        foreign.write_text("# ancient")
+        executive, received = self._executive()
+
+        result = executive._localize_class_path("gld_usd_swap", str(foreign))
+
+        assert result == str(local)
+        kinds = [m.payload["kind"] for m in received]
+        assert kinds == ["stale_plugin_path"]
+
+    def test_foreign_path_remaps_to_conventional_entry_file(self, tmp_path, monkeypatch):
+        """Different entry filename locally (plugin.py vs stored __init__.py)
+        still resolves to the local copy."""
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path / "active"))
+        local = tmp_path / "active" / "gld_usd_swap" / "plugin.py"
+        local.parent.mkdir(parents=True)
+        local.write_text("# current")
+        executive, received = self._executive()
+
+        result = executive._localize_class_path(
+            "gld_usd_swap", str(tmp_path / "elsewhere" / "gld_usd_swap" / "__init__.py")
+        )
+        assert result == str(local)
+
+    def test_foreign_path_without_local_copy_kept(self, tmp_path, monkeypatch):
+        """Deliberately-external plugins (no local counterpart) stay loadable."""
+        monkeypatch.setenv("IB_PLUGIN_DIR", str(tmp_path / "active"))
+        (tmp_path / "active").mkdir()
+        external = tmp_path / "external" / "special" / "plugin.py"
+        external.parent.mkdir(parents=True)
+        external.write_text("# external")
+        executive, received = self._executive()
+
+        result = executive._localize_class_path("special", str(external))
+        assert result == str(external)
+        assert received == []
