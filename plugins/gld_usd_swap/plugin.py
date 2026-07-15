@@ -73,6 +73,7 @@ import logging
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from itertools import groupby
 from typing import Dict, List, Optional
 
@@ -94,6 +95,20 @@ _INIT_DERIV_RINF = 0.200   # conservative RINF initial
 
 _OPEN_HOUR,  _OPEN_MIN  = 9,  30
 _CLOSE_HOUR, _CLOSE_MIN = 15, 45   # bar completes 15:50 — inside NYSE ARCA MOC cutoff
+
+_NY_TZ = ZoneInfo("America/New_York")
+
+# Wall-clock validity windows (ET). A session decision is only meaningful
+# while it can still act on THIS session: the open sell shortly after the
+# open, the MOC entry before the ~15:50 submission cutoff. A session bar
+# arriving outside its window is stale — observed live: IB re-delivers the
+# day's 15:45 bar through the live-update path on an after-hours
+# (re)subscribe, which sailed past the backfill/live gate and placed an MOC
+# at 19:53 ET that IB queued for the NEXT day's close. The bar-level gates
+# (is_live + high-water-mark) dedupe and filter replay; this wall-clock
+# check is the absolute bound that makes late firing impossible.
+_OPEN_WINDOW_ET  = ((9, 30),  (9, 45))
+_CLOSE_WINDOW_ET = ((15, 45), (15, 55))
 
 # Alert when an order has had no fill/terminal status for this long. (The
 # watchdog plugin runs an independent wall-clock check; this in-plugin check
@@ -458,8 +473,15 @@ class GldUsdSwapPlugin(PluginBase):
                 self.cancel_live_bars(req_id)
         self._live_bar_req_ids = {}
 
-    def _save_state(self) -> None:
-        self.save_state({
+    def get_state_for_save(self) -> dict:
+        """The plugin's full persistable state.
+
+        Also consumed by the executive's periodic auto-save. Implementing
+        this is what keeps the executive from ever writing its generic
+        stub over state.json (which would destroy the regime, counters,
+        and the pending-order records that back crash recovery).
+        """
+        return {
             "holding_gld":           self._holding_gld,
             "regime_at_prior_close": self._regime_at_prior_close,
             "trade_count":           self._trade_count,
@@ -480,7 +502,10 @@ class GldUsdSwapPlugin(PluginBase):
             # never be silently forgotten (and duplicated) after a crash.
             "pending_orders":        {str(oid): action for oid, action
                                       in self._pending_order_actions.items()},
-        })
+        }
+
+    def _save_state(self) -> None:
+        self.save_state(self.get_state_for_save())
 
     # =========================================================================
     # HISTORICAL WARM-UP
@@ -675,9 +700,36 @@ class GldUsdSwapPlugin(PluginBase):
 
     def _handle_session_event(self, ts: datetime) -> None:
         if ts.hour == _OPEN_HOUR  and ts.minute == _OPEN_MIN:
-            self._on_market_open(ts)
+            if self._session_decision_valid(ts, _OPEN_WINDOW_ET, "Open"):
+                self._on_market_open(ts)
         elif ts.hour == _CLOSE_HOUR and ts.minute == _CLOSE_MIN:
-            self._on_market_close(ts)
+            if self._session_decision_valid(ts, _CLOSE_WINDOW_ET, "Close"):
+                self._on_market_close(ts)
+
+    def _now_ny(self) -> datetime:
+        """Current wall-clock time in New York (overridable in tests)."""
+        return datetime.now(_NY_TZ)
+
+    def _session_decision_valid(self, ts: datetime, window, label: str) -> bool:
+        """A session decision must be for TODAY's bar and executed while it
+        can still act on this session (see _OPEN/_CLOSE_WINDOW_ET). Refusing
+        outside the window turns a stale re-delivered session bar (e.g. on an
+        after-hours restart) into a logged no-op instead of a next-session
+        order."""
+        now = self._now_ny()
+        (sh, sm), (eh, em) = window
+        minutes = now.hour * 60 + now.minute
+        ok = (ts.date() == now.date()
+              and sh * 60 + sm <= minutes < eh * 60 + em)
+        if not ok:
+            logger.warning(
+                f"{label} decision for bar {ts} refused — wall clock "
+                f"{now:%Y-%m-%d %H:%M %Z} is outside the decision's validity "
+                f"window ({sh:02d}:{sm:02d}–{eh:02d}:{em:02d} ET). Stale "
+                f"session bar (e.g. re-delivered on an after-hours restart); "
+                f"acting now would produce a next-session order."
+            )
+        return ok
 
     # =========================================================================
     # COMPOSITE REGIME

@@ -150,15 +150,21 @@ class WatchdogPlugin(PluginBase):
         self._start_monitor()
         return True
 
-    def _save_state(self) -> None:
-        self.save_state({
+    def get_state_for_save(self) -> Dict:
+        """Persistable state — also consumed by the executive's auto-save
+        (implementing this keeps the executive from overwriting state.json
+        with its generic stub)."""
+        return {
             "check_interval_seconds":     self.check_interval_seconds,
             "bar_staleness_seconds":      self.bar_staleness_seconds,
             "order_stuck_seconds":        self.order_stuck_seconds,
             "reconcile_interval_seconds": self.reconcile_interval_seconds,
             "rth_only":                   self.rth_only,
             "webhook_url":                self.webhook_url,
-        })
+        }
+
+    def _save_state(self) -> None:
+        self.save_state(self.get_state_for_save())
 
     # =========================================================================
     # MONITOR THREAD

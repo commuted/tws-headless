@@ -2994,24 +2994,27 @@ class PluginExecutive:
         logger.debug("Health monitor task stopped")
 
     def _auto_save_all_states(self):
-        """Auto-save state for all running plugins"""
+        """Auto-save state for running plugins that expose it.
+
+        Only plugins implementing get_state_for_save() are saved. Plugins
+        without it are SKIPPED ENTIRELY: the old fallback wrote a generic
+        {"auto_saved": ...} stub over their state.json every health-monitor
+        cycle, destroying whatever the plugin had persisted itself (for
+        gld_usd_swap: regime, counters, and the pending-order records that
+        back its crash recovery). A plugin's state file belongs to the
+        plugin; the executive must never overwrite it with content of its
+        own invention.
+        """
         for iid, config in self._plugins.items():
             plugin = config.plugin
-            if plugin.state in (PluginState.STARTED, PluginState.FROZEN):
-                try:
-                    # Let plugin save its own state
-                    if hasattr(plugin, 'get_state_for_save'):
-                        state = plugin.get_state_for_save()
-                        plugin.save_state(state)
-                    else:
-                        # Basic state save
-                        plugin.save_state({
-                            "auto_saved": True,
-                            "run_count": config.run_count,
-                            "last_run": config.last_run.isoformat() if config.last_run else None,
-                        })
-                except Exception as e:
-                    logger.error(f"Error auto-saving state for plugin '{plugin.name}': {e}")
+            if plugin.state not in (PluginState.STARTED, PluginState.FROZEN):
+                continue
+            if not hasattr(plugin, 'get_state_for_save'):
+                continue
+            try:
+                plugin.save_state(plugin.get_state_for_save())
+            except Exception as e:
+                logger.error(f"Error auto-saving state for plugin '{plugin.name}': {e}")
 
     def _add_to_history(self, result: ExecutionResult):
         """Add result to execution history"""
