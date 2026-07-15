@@ -437,6 +437,26 @@ class TestPluginExecutiveTransfers:
         positions = pe.get_transferable_positions("plugin_b")
         assert positions == []
 
+    def test_get_transferable_positions_zero_market_value_falls_back(self):
+        """Plugin ledgers rarely maintain market_value (fills/transfers store
+        quantity/cost/price only) — a stored 0.0 must not display as $0.00
+        when quantity x current_price is available."""
+        from ib.plugin_executive import PluginExecutive
+
+        plugin = MockPlugin("gld_swap", cash=20000.0, positions=[
+            {"symbol": "GLD", "quantity": 10, "cost_basis": 420.79,
+             "current_price": 367.13},
+        ])
+        # Mirror the real ledger state: market_value present but never set
+        plugin.holdings.get_position("GLD").market_value = 0.0
+
+        pe = object.__new__(PluginExecutive)
+        pe._lock = MagicMock()
+        pe._plugins = {"gld_swap": MockPluginConfig(plugin)}
+
+        positions = pe.get_transferable_positions("gld_swap")
+        assert positions[0]["value"] == pytest.approx(10 * 367.13)
+
 
 class TestTransferCommand:
     """Test transfer socket command"""
