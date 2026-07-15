@@ -411,6 +411,23 @@ saved = self.load_state()
 self._bar_count = saved.get("bar_count", 0)
 ```
 
+### `get_state_for_save() -> Dict[str, Any]` (optional, recommended)
+
+If your plugin defines this method, the executive's periodic auto-save
+persists its result to `state.json` every health-monitor cycle — free
+crash protection between your own `save_state()` calls. Plugins without
+it are left alone (the executive never writes anything of its own
+invention over your state file). The natural pattern is to share one
+state dict:
+
+```python
+def get_state_for_save(self) -> dict:
+    return {"bar_count": self._bar_count, "last_signal": self._last_signal}
+
+def _save_state(self) -> None:
+    self.save_state(self.get_state_for_save())
+```
+
 ### Custom storage
 
 You can drop any files, JSON documents, or SQLite databases into your

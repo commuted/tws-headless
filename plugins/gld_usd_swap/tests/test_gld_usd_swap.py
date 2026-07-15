@@ -532,6 +532,95 @@ class TestPendingOrderRestore:
 
 
 # ---------------------------------------------------------------------------
+# Session-decision wall-clock windows — stale bars must not act late
+# ---------------------------------------------------------------------------
+
+class TestSessionDecisionWindow:
+    """Observed live: IB re-delivered the day's 15:45 bar through the
+    live-update path on a 19:53 ET restart, and the close decision placed
+    an MOC that IB queued for the NEXT day's close. The wall-clock window
+    is the absolute bound: open decisions only 09:30-09:45 ET, close
+    decisions only 15:45-15:55 ET, and only for today's bar."""
+
+    def _clocked(self, tmp_path, now_et):
+        plugin = _make_plugin(tmp_path)
+        plugin._now_ny = lambda: now_et
+        fired = {"open": 0, "close": 0}
+        plugin._on_market_open = lambda ts: fired.__setitem__("open", fired["open"] + 1)
+        plugin._on_market_close = lambda ts: fired.__setitem__("close", fired["close"] + 1)
+        return plugin, fired
+
+    def test_close_fires_inside_window(self, tmp_path):
+        plugin, fired = self._clocked(tmp_path, datetime(2026, 7, 14, 15, 46))
+        plugin._handle_session_event(datetime(2026, 7, 14, 15, 45))
+        assert fired["close"] == 1
+
+    def test_close_refused_after_hours(self, tmp_path):
+        """The exact live incident: 15:45 bar re-delivered at 19:53 ET."""
+        plugin, fired = self._clocked(tmp_path, datetime(2026, 7, 14, 19, 53))
+        plugin._handle_session_event(datetime(2026, 7, 14, 15, 45))
+        assert fired["close"] == 0
+
+    def test_close_refused_past_moc_cutoff(self, tmp_path):
+        plugin, fired = self._clocked(tmp_path, datetime(2026, 7, 14, 15, 56))
+        plugin._handle_session_event(datetime(2026, 7, 14, 15, 45))
+        assert fired["close"] == 0
+
+    def test_close_refused_for_yesterdays_bar(self, tmp_path):
+        plugin, fired = self._clocked(tmp_path, datetime(2026, 7, 15, 15, 46))
+        plugin._handle_session_event(datetime(2026, 7, 14, 15, 45))
+        assert fired["close"] == 0
+
+    def test_open_fires_inside_window(self, tmp_path):
+        plugin, fired = self._clocked(tmp_path, datetime(2026, 7, 14, 9, 31))
+        plugin._handle_session_event(datetime(2026, 7, 14, 9, 30))
+        assert fired["open"] == 1
+
+    def test_open_refused_outside_window(self, tmp_path):
+        plugin, fired = self._clocked(tmp_path, datetime(2026, 7, 14, 16, 34))
+        plugin._handle_session_event(datetime(2026, 7, 14, 9, 30))
+        assert fired["open"] == 0
+
+    def test_non_session_bar_ignored(self, tmp_path):
+        plugin, fired = self._clocked(tmp_path, datetime(2026, 7, 14, 12, 0))
+        plugin._handle_session_event(datetime(2026, 7, 14, 12, 0))
+        assert fired == {"open": 0, "close": 0}
+
+
+# ---------------------------------------------------------------------------
+# Auto-save protocol — the executive must persist REAL state, never a stub
+# ---------------------------------------------------------------------------
+
+class TestGetStateForSave:
+    def test_contains_full_strategy_state(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin._holding_gld = True
+        plugin._regime_at_prior_close = REGIME_CASH
+        plugin._pending_order_actions[118] = "BUY"
+
+        state = plugin.get_state_for_save()
+        assert state["holding_gld"] is True
+        assert state["regime_at_prior_close"] == REGIME_CASH
+        assert state["pending_orders"] == {"118": "BUY"}
+
+    def test_autosave_roundtrip_preserves_pending_orders(self, tmp_path):
+        """Simulates the executive's periodic auto-save between the MOC
+        placement and a crash: the pending order must survive into the
+        next session (the clobbering stub destroyed it)."""
+        plugin = _make_plugin(tmp_path)
+        plugin.start()
+        plugin._pending_order_actions[118] = "BUY"
+
+        # What the executive's _auto_save_all_states now does
+        plugin.save_state(plugin.get_state_for_save())
+
+        plugin2 = _make_plugin(tmp_path)
+        plugin2.start()
+        assert plugin2._pending_order_actions == {118: "BUY"}
+        assert plugin2._holding_gld is True   # conservative pending-BUY flag
+
+
+# ---------------------------------------------------------------------------
 # Reconnect handling — live-bar subscriptions must be re-created
 # ---------------------------------------------------------------------------
 
