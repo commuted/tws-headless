@@ -334,7 +334,13 @@ def format_result(result: CommandResult, verbose: bool = False):
 
         elif "positions" in result.data:
             positions = result.data["positions"]
-            if positions:
+            # Only render the portfolio-style table when rows actually carry
+            # that schema. Other commands (e.g. transfer list) reuse the
+            # "positions" key with different row shapes and already list
+            # their positions in the message body — indexing portfolio keys
+            # on those rows crashed with KeyError.
+            _table_keys = ("symbol", "quantity", "price", "value", "pnl", "allocation")
+            if positions and all(k in positions[0] for k in _table_keys):
                 print(f"\n{'Symbol':<8} {'Qty':>10} {'Price':>12} {'Value':>14} {'P&L':>12} {'Alloc':>8}")
                 print("-" * 70)
                 for p in positions:
