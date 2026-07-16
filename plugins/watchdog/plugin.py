@@ -13,7 +13,10 @@ A monitor thread wakes every check_interval_seconds and runs three checks:
      bar_staleness_seconds during regular trading hours. A silent feed —
      e.g. a subscription lost across a TWS reconnect — is the single most
      dangerous failure mode: a strategy holds a position with no exit
-     signals and no errors.
+     signals and no errors. Detection closes into ACTION: when feeds are
+     stale (and auto_remediate_stale_feeds is on), the watchdog asks the
+     executive to have plugins re-create their subscriptions (the
+     on_reconnect contract), rate-limited by remediation_cooldown_seconds.
 
   2. Stuck orders — any order in portfolio.pending_orders with no fill or
      terminal status after order_stuck_seconds (covers the overnight MOC
@@ -79,6 +82,13 @@ class WatchdogPlugin(PluginBase):
         self.reconcile_interval_seconds: float = 3600.0   # hourly drift check
         self.rth_only:                   bool  = True
         self.webhook_url:                str   = ""       # "" = file sink only
+        # Stale-feed auto-remediation: when feeds stay stale, ask the
+        # executive to have plugins re-create their live-bar subscriptions
+        # (the on_reconnect contract). Observed live 2026-07-15: three of
+        # four feeds silent a full session with a healthy socket — detected
+        # at the first RTH check, but nothing acted until a human restart.
+        self.auto_remediate_stale_feeds:  bool  = True
+        self.remediation_cooldown_seconds: float = 900.0  # min gap between nudges
 
         # --- monitor thread ---
         self._monitor_thread: Optional[threading.Thread] = None
@@ -92,6 +102,8 @@ class WatchdogPlugin(PluginBase):
         self._stuck_alerted: set = set()    # order_ids already alerted
         self._last_reconcile: float = 0.0
         self._last_check_at: Optional[str] = None
+        self._last_remediation: float = 0.0
+        self._remediations: int = 0
 
         # --- counters (diagnostics) ---
         self._checks_run:     int = 0
@@ -120,6 +132,8 @@ class WatchdogPlugin(PluginBase):
             self.reconcile_interval_seconds = saved.get("reconcile_interval_seconds", self.reconcile_interval_seconds)
             self.rth_only                   = saved.get("rth_only",                   self.rth_only)
             self.webhook_url                = saved.get("webhook_url",                self.webhook_url)
+            self.auto_remediate_stale_feeds  = saved.get("auto_remediate_stale_feeds",  self.auto_remediate_stale_feeds)
+            self.remediation_cooldown_seconds = saved.get("remediation_cooldown_seconds", self.remediation_cooldown_seconds)
 
         # Engine startup already reconciles; first periodic run comes later.
         self._last_reconcile = time.time()
@@ -161,6 +175,8 @@ class WatchdogPlugin(PluginBase):
             "reconcile_interval_seconds": self.reconcile_interval_seconds,
             "rth_only":                   self.rth_only,
             "webhook_url":                self.webhook_url,
+            "auto_remediate_stale_feeds":  self.auto_remediate_stale_feeds,
+            "remediation_cooldown_seconds": self.remediation_cooldown_seconds,
         }
 
     def _save_state(self) -> None:
@@ -244,7 +260,48 @@ class WatchdogPlugin(PluginBase):
         for req_id in recovered:
             self._stale_alerted.discard(req_id)
             logger.info(f"Watchdog: feed req_id={req_id} delivering bars again")
+        # Prune dedupe entries for req_ids that no longer exist (a
+        # resubscription replaces them with fresh ids).
+        current_ids = {f["req_id"] for f in self.portfolio.keep_up_to_date_feeds()}
+        self._stale_alerted &= current_ids
+
+        if stale:
+            self._maybe_remediate_stale(stale)
         return stale
+
+    def _maybe_remediate_stale(self, stale_feeds: List[Dict]) -> None:
+        """Close the detection→action loop: nudge plugins to resubscribe.
+
+        Rate-limited by remediation_cooldown_seconds so a genuine outage
+        produces periodic (cheap) resubscription attempts plus alerts, not
+        a flood. Detection alone left three dead feeds unattended for a
+        full session (2026-07-15); the nudge is what a human restart was
+        doing manually."""
+        if not self.auto_remediate_stale_feeds or not self._executive:
+            return
+        now = time.time()
+        if now - self._last_remediation < self.remediation_cooldown_seconds:
+            return
+        self._last_remediation = now
+        self._remediations += 1
+        symbols = sorted({f["symbol"] for f in stale_feeds})
+        self._raise_alert(
+            "stale_feed_remediation",
+            f"{len(stale_feeds)} live-bar feed(s) stale ({', '.join(symbols)}) — "
+            f"asking plugins to re-create their subscriptions "
+            f"(remediation #{self._remediations}, cooldown "
+            f"{self.remediation_cooldown_seconds:.0f}s)",
+            symbols=symbols,
+            remediation_count=self._remediations,
+        )
+        try:
+            notified = self._executive.request_feed_resubscription(
+                f"watchdog: feeds stale ({', '.join(symbols)})"
+            )
+            logger.info(f"Watchdog remediation: resubscription requested "
+                        f"from {notified}")
+        except Exception as e:
+            logger.error(f"Watchdog remediation failed: {e}")
 
     def _check_stuck_orders(self) -> List[Dict]:
         """Alert once per order with no fill/terminal status past threshold."""
@@ -430,6 +487,8 @@ class WatchdogPlugin(PluginBase):
                     "stale_feeds_active":  sorted(self._stale_alerted),
                     "stuck_orders_active": sorted(self._stuck_alerted),
                     "in_rth":          self._in_rth(),
+                    "remediations":    self._remediations,
+                    "last_remediation": self._last_remediation or None,
                     # The feeds actually registered — an empty list during
                     # market hours means no plugin has a live bar
                     # subscription at all (e.g. a plugin loaded without a
@@ -449,6 +508,8 @@ class WatchdogPlugin(PluginBase):
                     "reconcile_interval_seconds": self.reconcile_interval_seconds,
                     "rth_only":                   self.rth_only,
                     "webhook_url":                self.webhook_url,
+                    "auto_remediate_stale_feeds":  self.auto_remediate_stale_feeds,
+                    "remediation_cooldown_seconds": self.remediation_cooldown_seconds,
                 },
             }
 
@@ -493,6 +554,11 @@ class WatchdogPlugin(PluginBase):
             elif key == "rth_only":
                 self.rth_only = bool(value) if not isinstance(value, str) \
                     else value.strip().lower() in ("1", "true", "yes", "on")
+            elif key == "auto_remediate_stale_feeds":
+                self.auto_remediate_stale_feeds = bool(value) if not isinstance(value, str) \
+                    else value.strip().lower() in ("1", "true", "yes", "on")
+            elif key == "remediation_cooldown_seconds":
+                self.remediation_cooldown_seconds = max(60.0, float(value))
             elif key == "webhook_url":
                 url = str(value).strip()
                 if url and not url.startswith(("http://", "https://")):

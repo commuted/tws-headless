@@ -3489,20 +3489,42 @@ class PluginExecutive:
         subscriptions via on_reconnect(), and raises an alert so the event
         is visible outside the logs.
         """
+        self._invoke_on_reconnect_all("reconnected", (
+            "IB connection re-established after unexpected drop; "
+            "notifying plugins to re-create live-bar subscriptions"
+        ))
+
+    def request_feed_resubscription(self, reason: str) -> List[str]:
+        """Ask every STARTED plugin to re-create its live-bar subscriptions.
+
+        The remediation lever for feeds that die WITHOUT a connection drop —
+        observed live (2026-07-15): three of four keepUpToDate subscriptions
+        delivered nothing for a full session while the API socket stayed
+        healthy, so the reconnect chain never fired; only the watchdog's
+        staleness check saw it. Reuses the plugins' on_reconnect() contract
+        (cancel + resubscribe), under its own alert kind so the record
+        distinguishes a nudge from a reconnect.
+
+        Returns the names of the plugins notified.
+        """
+        return self._invoke_on_reconnect_all("feed_resubscription", reason)
+
+    def _invoke_on_reconnect_all(self, alert_kind: str, message: str) -> List[str]:
         started = [
             config.plugin for config in list(self._plugins.values())
             if config.plugin.state == PluginState.STARTED
         ]
-        self.publish_alert("reconnected", {
-            "message": "IB connection re-established after unexpected drop; "
-                       "notifying plugins to re-create live-bar subscriptions",
-            "plugins_notified": [p.name for p in started],
+        names = [p.name for p in started]
+        self.publish_alert(alert_kind, {
+            "message": message,
+            "plugins_notified": names,
         })
         for plugin in started:
             try:
                 plugin.on_reconnect()
             except Exception as e:
                 logger.error(f"[{plugin.name}] on_reconnect error: {e}")
+        return names
 
     def _handle_order_status_for_plugins(self, order_record) -> None:
         """
