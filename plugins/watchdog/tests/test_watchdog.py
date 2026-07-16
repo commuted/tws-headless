@@ -162,6 +162,79 @@ class TestFeedStaleness:
         assert plugin._check_feed_staleness() == []
         assert _alerts(plugin) == []
 
+    def test_vanished_req_ids_pruned_from_dedupe(self, tmp_path):
+        """A resubscription replaces req_ids; stale-alert dedupe entries for
+        vanished ids must not linger (they'd block alerts on nothing)."""
+        plugin = _make_plugin(tmp_path)
+        plugin.portfolio = self._portfolio(
+            [{"req_id": 7, "symbol": "GLD", "seconds_since_last_bar": 1000}]
+        )
+        plugin._check_feed_staleness()
+        assert plugin._stale_alerted == {7}
+        # feed 7 replaced by feed 30 (fresh)
+        plugin.portfolio = self._portfolio(
+            [{"req_id": 30, "symbol": "GLD", "seconds_since_last_bar": 5}]
+        )
+        plugin._check_feed_staleness()
+        assert plugin._stale_alerted == set()
+
+
+# ---------------------------------------------------------------------------
+# Stale-feed auto-remediation — detection closes into action
+# ---------------------------------------------------------------------------
+
+class TestStaleFeedRemediation:
+    def _stale_plugin(self, tmp_path, **kw):
+        plugin = _make_plugin(tmp_path, **kw)
+        p = Mock()
+        p.connected = True
+        p.keep_up_to_date_feeds.return_value = [
+            {"req_id": 24, "symbol": "UUP", "seconds_since_last_bar": 29156},
+            {"req_id": 25, "symbol": "TLT", "seconds_since_last_bar": 29156},
+        ]
+        p.pending_orders = []
+        plugin.portfolio = p
+        executive = Mock()
+        executive.request_feed_resubscription.return_value = ["gld_usd_swap"]
+        plugin.set_executive(executive)
+        return plugin, executive
+
+    def test_stale_feeds_trigger_resubscription(self, tmp_path):
+        plugin, executive = self._stale_plugin(tmp_path)
+        plugin._check_feed_staleness()
+        executive.request_feed_resubscription.assert_called_once()
+        reason = executive.request_feed_resubscription.call_args[0][0]
+        assert "TLT" in reason and "UUP" in reason
+        kinds = [a["payload"]["kind"] for a in _alerts(plugin)]
+        assert "stale_feed_remediation" in kinds
+
+    def test_cooldown_limits_nudges(self, tmp_path):
+        plugin, executive = self._stale_plugin(tmp_path)
+        plugin._check_feed_staleness()
+        plugin._check_feed_staleness()     # still stale, inside cooldown
+        assert executive.request_feed_resubscription.call_count == 1
+
+    def test_nudges_again_after_cooldown(self, tmp_path):
+        import time as _time
+        plugin, executive = self._stale_plugin(tmp_path)
+        plugin._check_feed_staleness()
+        plugin._last_remediation = _time.time() - plugin.remediation_cooldown_seconds - 1
+        plugin._stale_alerted.clear()      # feeds re-alert after replacement
+        plugin._check_feed_staleness()
+        assert executive.request_feed_resubscription.call_count == 2
+
+    def test_disabled_flag_respected(self, tmp_path):
+        plugin, executive = self._stale_plugin(tmp_path)
+        plugin.auto_remediate_stale_feeds = False
+        plugin._check_feed_staleness()
+        executive.request_feed_resubscription.assert_not_called()
+
+    def test_no_executive_is_safe(self, tmp_path):
+        plugin, _ = self._stale_plugin(tmp_path)
+        plugin._executive = None
+        plugin._check_feed_staleness()     # must not raise
+        assert plugin._remediations == 0
+
 
 # ---------------------------------------------------------------------------
 # Stuck orders

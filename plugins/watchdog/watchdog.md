@@ -15,9 +15,21 @@ A monitor thread wakes every `check_interval_seconds` (default 60) and runs:
 
 | Check | Detects | Default threshold |
 |-------|---------|-------------------|
-| **Bar-feed staleness** | A keepUpToDate live-bar subscription that has stopped delivering (e.g. lost across a TWS reconnect) while strategies may be holding positions with no exit signals | 600 s without a bar, during RTH |
+| **Bar-feed staleness** | A keepUpToDate live-bar subscription that has stopped delivering (e.g. lost across a TWS reconnect, or a data-farm drop with a healthy socket) while strategies may be holding positions with no exit signals | 600 s without a bar, during RTH |
 | **Stuck orders** | Any order with no fill or terminal status (covers the overnight MOC window on wall clock) | 1800 s |
 | **Reconciliation drift** | Position/cash divergence between plugin ledgers and the real account, without waiting for the next engine restart | every 3600 s |
+
+**Stale feeds are auto-remediated** (`auto_remediate_stale_feeds`, default
+on): when feeds are stale, the watchdog asks the executive to have every
+started plugin re-create its live-bar subscriptions — the same
+`on_reconnect()` contract the reconnect chain uses — rate-limited by
+`remediation_cooldown_seconds` (default 900 s) so a genuine outage produces
+periodic cheap retries plus alerts, not a flood. Each nudge raises a
+`stale_feed_remediation` alert. Motivated by 2026-07-15: three of four
+signal feeds died after an off-hours data-farm drop while the API socket
+stayed healthy; detection fired at the first in-RTH check but the feeds
+stayed dead until a manual restart, and the strategy ran a full session on
+frozen signal inputs.
 
 Each condition alerts **once** until it recovers (staleness/stuck dedupe),
 so a persistent fault doesn't flood the sink.
@@ -76,6 +88,8 @@ Known `kind` values: `stale_feed`, `stuck_order`, `reconciliation_drift`
 | `reconcile_interval_seconds` | 3600 | Holdings/account drift check interval (min 300) |
 | `rth_only` | true | Only check feed staleness during NY regular trading hours |
 | `webhook_url` | "" | POST each alert as JSON; empty = file sink only |
+| `auto_remediate_stale_feeds` | true | On stale feeds, ask plugins to re-create subscriptions |
+| `remediation_cooldown_seconds` | 900 | Minimum gap between resubscription nudges (min 60) |
 
 ## Commands
 
