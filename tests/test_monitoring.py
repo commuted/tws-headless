@@ -216,6 +216,23 @@ class TestExecutiveAlerts:
         assert "p_started" in alert.payload["plugins_notified"]
         assert "p_frozen" not in alert.payload["plugins_notified"]
 
+    def test_request_feed_resubscription_nudges_started_plugins(self, tmp_path):
+        """The watchdog's stale-feed remediation lever: same on_reconnect
+        contract, distinct alert kind so the record distinguishes a nudge
+        from a reconnect."""
+        executive, received, base = self._wired(tmp_path)
+        started = ReconnectProbePlugin("p_live", base / "a")
+        executive.register_plugin(started, execution_mode=ExecutionMode.MANUAL)
+        started._state = PluginState.STARTED
+
+        notified = executive.request_feed_resubscription("watchdog: feeds stale (UUP)")
+
+        assert started.reconnect_calls == 1
+        assert "p_live" in notified
+        alert = next(m for m in received
+                     if m.payload["kind"] == "feed_resubscription")
+        assert "UUP" in alert.payload["message"]
+
     def test_notify_reconnected_survives_plugin_error(self, tmp_path):
         executive, received, base = self._wired(tmp_path)
         bad = ReconnectProbePlugin("p_bad", base / "a")
