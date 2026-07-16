@@ -499,6 +499,60 @@ class TestReconcileWithAccount:
         assert adj["symbol"] == "SPY" and adj["quantity"] == 25
         assert unassigned.holdings.get_position("SPY") is None
 
+    def test_short_positions_ignored(self):
+        """SHORT account positions are outside the long-only plugin-ledger
+        model: a zero claim against a negative quantity must not be reported
+        as over_claimed (observed live: 7 spurious discrepancies re-reported
+        every hourly reconcile against a paper account holding shorts)."""
+        portfolio = MockPortfolio(
+            positions=[MockPosition("SPXU", -4, 20.0, 21.0),
+                       MockPosition("EUR.USD", -20292.42, 1.1, 1.1),
+                       MockPosition("SPY", 100, 450.0, 455.0)],
+            cash=0.0
+        )
+        plugin = MockPlugin("momentum", cash=0.0, positions=[
+            {"symbol": "SPY", "quantity": 100, "cost_basis": 450.0}
+        ])
+        unassigned = MockPlugin("_unassigned", cash=0.0, is_system=True)
+        pe = self.create_executive(
+            portfolio=portfolio,
+            plugins={"momentum": plugin, "_unassigned": unassigned},
+            unassigned_plugin=unassigned
+        )
+
+        report = pe.reconcile_with_account()
+        assert report["discrepancies"] == []
+        # and idempotent: nothing to re-report next cycle either
+        second = pe.reconcile_with_account()
+        assert second["discrepancies"] == []
+
+    def test_cash_adjustment_sticks(self):
+        """The cash adjustment must update every representation of
+        unassigned cash. Writing only _cash_balance while the comparison
+        reads holdings.current_cash re-reported the same cash_mismatch
+        every reconcile (observed live, drifting by exactly the plugins'
+        traded cash delta)."""
+        portfolio = MockPortfolio(positions=[], cash=100_000.0)
+        plugin = MockPlugin("gld", cash=14_044.28, positions=[])
+        unassigned = MockPlugin("_unassigned", cash=0.0, is_system=True)
+        # stale _cash_balance from an old sync; holdings read differently
+        unassigned._cash_balance = 80_000.0
+        unassigned.holdings.current_cash = 80_000.0
+        pe = self.create_executive(
+            portfolio=portfolio,
+            plugins={"gld": plugin, "_unassigned": unassigned},
+            unassigned_plugin=unassigned
+        )
+
+        first = pe.reconcile_with_account()
+        assert any(d["type"] == "cash_mismatch" for d in first["discrepancies"])
+        expected = 100_000.0 - 14_044.28
+        assert unassigned.holdings.current_cash == pytest.approx(expected)
+
+        second = pe.reconcile_with_account()
+        assert [d for d in second["discrepancies"]
+                if d["type"] == "cash_mismatch"] == []
+
     def test_stale_unassigned_position_removed(self):
         """A symbol _unassigned holds but the account doesn't is stale
         bookkeeping and gets dropped."""
