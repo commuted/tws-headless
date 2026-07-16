@@ -1200,6 +1200,15 @@ class PluginExecutive:
         #    steady-state web reports zero discrepancies, and the hourly
         #    watchdog run only alerts on real drift.
         for symbol, acct_pos in account_positions.items():
+            # SHORT account positions are outside the plugin-ledger model:
+            # plugin claims and _unassigned holdings are long-only (qty > 0
+            # everywhere). Without this skip, a zero claim against a negative
+            # account quantity satisfies claimed > account and re-reports the
+            # same spurious "over_claimed" every reconcile, forever — 7 of
+            # them, hourly, observed live on a paper account holding shorts.
+            if acct_pos["quantity"] <= 0:
+                continue
+
             claimed_qty = all_plugin_positions.get(symbol, 0)
 
             if claimed_qty > acct_pos["quantity"]:
@@ -1355,8 +1364,21 @@ class PluginExecutive:
                         "difference": cash_diff,
                     })
 
-                    if hasattr(unassigned_plugin, '_cash_balance'):
+                    # Update EVERY representation of unassigned cash.
+                    # set_cash_balance writes both _cash_balance and
+                    # holdings.current_cash; writing only _cash_balance while
+                    # get_effective_cash() reads holdings.current_cash made
+                    # this adjustment unable to stick — the same cash_mismatch
+                    # re-reported (and re-"adjusted") every hourly reconcile,
+                    # observed live drifting by exactly the plugins' traded
+                    # cash delta.
+                    if hasattr(unassigned_plugin, 'set_cash_balance'):
+                        unassigned_plugin.set_cash_balance(unassigned_cash)
+                        unassigned_plugin.save_holdings()
+                    elif hasattr(unassigned_plugin, '_cash_balance'):
                         unassigned_plugin._cash_balance = unassigned_cash
+                        if unassigned_plugin.holdings:
+                            unassigned_plugin.holdings.current_cash = unassigned_cash
                         unassigned_plugin.save_holdings()
                     elif unassigned_plugin.holdings:
                         unassigned_plugin.holdings.current_cash = unassigned_cash
