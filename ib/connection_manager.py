@@ -310,6 +310,34 @@ class ConnectionManager:
             except Exception as e:
                 logger.error(f"Error in on_connected callback: {e}")
 
+    async def force_reconnect(self, reason: str = "") -> bool:
+        """
+        Force a full API disconnect/reconnect cycle on demand, without
+        touching the TWS/Gateway process itself — the cheap, credential-free
+        middle rung between per-symbol resubscription and a full TWS
+        relaunch (which requires a human to log back in). Deliberately
+        reuses _handle_disconnection(), the exact path a genuine socket drop
+        already takes (stream-state save, on_disconnected callback, the
+        proven backoff reconnect loop), rather than a bespoke connect path
+        that would need to be trusted separately.
+
+        Returns False (does nothing) if a connect/reconnect is already in
+        progress — piling a second one on top would only race the first.
+        """
+        if self.state in (ConnectionState.CONNECTING, ConnectionState.RECONNECTING,
+                          ConnectionState.SHUTTING_DOWN):
+            logger.warning(
+                f"force_reconnect skipped — already in state {self.state.value} "
+                f"(reason: {reason})"
+            )
+            return False
+
+        logger.warning(f"Forcing reconnect: {reason}")
+        if self.portfolio.connected:
+            await self.portfolio.disconnect()
+        self._handle_disconnection()
+        return True
+
     def _handle_disconnection(self):
         """Handle unexpected disconnection"""
         if self.state == ConnectionState.SHUTTING_DOWN:

@@ -624,6 +624,56 @@ class TestGetStateForSave:
 # Reconnect handling — live-bar subscriptions must be re-created
 # ---------------------------------------------------------------------------
 
+class TestSubscriptionDataType:
+    """UUP/TLT/RINF are thin, signal-only feeds; a TRADES-basis subscription
+    goes stale whenever the exchange hasn't printed a trade recently (observed
+    live: the watchdog's stale_feed alert firing on these three most trading
+    sessions). MIDPOINT updates from the live quote instead, so it can't starve
+    for want of a print. GLD is the instrument actually filled and stays on
+    the TRADES default."""
+
+    def test_signal_only_symbols_use_midpoint(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        calls = {}
+
+        def _fake_subscribe(contract, on_bar, on_live_bar=None, **kwargs):
+            calls[contract.symbol] = kwargs.get("what_to_show")
+            return 1
+
+        plugin.subscribe_live_bars = _fake_subscribe
+        plugin._start_subscriptions()
+
+        assert calls["UUP"] == "MIDPOINT"
+        assert calls["TLT"] == "MIDPOINT"
+        assert calls["RINF"] == "MIDPOINT"
+
+    def test_traded_symbol_keeps_trades_default(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        calls = {}
+
+        def _fake_subscribe(contract, on_bar, on_live_bar=None, **kwargs):
+            calls[contract.symbol] = kwargs.get("what_to_show")
+            return 1
+
+        plugin.subscribe_live_bars = _fake_subscribe
+        plugin._start_subscriptions()
+
+        assert calls["GLD"] is None   # no override -> subscribe_live_bars' own TRADES default
+
+
+class TestTradingHours:
+    """Declared to PluginExecutive.aggregate_trading_windows() so the
+    watchdog's auto-relaunch escalation knows when this plugin is actively
+    trading (a little before the open through a little after the MOC
+    submission cutoff) versus off-hours."""
+
+    def test_declares_a_single_window_spanning_open_to_close(self, tmp_path):
+        from datetime import time as dt_time
+        plugin = _make_plugin(tmp_path)
+        windows = plugin.trading_hours()
+        assert windows == [(dt_time(9, 15), dt_time(16, 0))]
+
+
 class TestOnReconnect:
     def test_on_reconnect_cancels_and_resubscribes(self, tmp_path):
         plugin = _make_plugin(tmp_path)

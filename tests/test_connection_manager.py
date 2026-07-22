@@ -250,6 +250,96 @@ class TestConnectionManagerStop:
         assert manager.state == ConnectionState.DISCONNECTED
 
 
+class TestForceReconnect:
+    """Tests for force_reconnect() — the on-demand disconnect/reconnect
+    cycle (no TWS process involved) that sits between per-symbol
+    resubscription and a full TWS relaunch in the watchdog's escalation
+    ladder. Deliberately reuses _handle_disconnection() rather than a
+    bespoke connect path, so these mostly confirm that reuse is wired
+    correctly, not re-test _handle_disconnection() itself."""
+
+    def _cleanup(self, manager):
+        if manager._reconnect_task:
+            manager._reconnect_task.cancel()
+
+    async def test_disconnects_and_starts_reconnect_when_connected(self):
+        portfolio = create_mock_portfolio()
+        portfolio.connected = True
+        config = ConnectionConfig(auto_reconnect=True, reconnect_delay_initial=100.0)
+        manager = ConnectionManager(portfolio, config)
+        manager._state = ConnectionState.CONNECTED
+
+        result = await manager.force_reconnect("test reason")
+        # _handle_disconnection() only schedules _reconnect_loop() via
+        # create_task(); yield once so the scheduled task actually runs its
+        # first line (which sets RECONNECTING) before asserting on it.
+        await asyncio.sleep(0)
+
+        assert result is True
+        assert portfolio.disconnect.called
+        assert manager.state == ConnectionState.RECONNECTING
+        self._cleanup(manager)
+
+    async def test_skips_disconnect_call_when_already_disconnected(self):
+        """Nothing to tear down — but still kicks off the reconnect loop,
+        which is idempotent (_start_reconnect_task no-ops if one is
+        already running)."""
+        portfolio = create_mock_portfolio()
+        portfolio.connected = False
+        config = ConnectionConfig(auto_reconnect=True, reconnect_delay_initial=100.0)
+        manager = ConnectionManager(portfolio, config)
+        manager._state = ConnectionState.DISCONNECTED
+
+        result = await manager.force_reconnect("test reason")
+
+        assert result is True
+        assert not portfolio.disconnect.called
+        self._cleanup(manager)
+
+    async def test_refuses_while_already_reconnecting(self):
+        portfolio = create_mock_portfolio()
+        manager = ConnectionManager(portfolio)
+        manager._state = ConnectionState.RECONNECTING
+
+        result = await manager.force_reconnect("test reason")
+
+        assert result is False
+        assert not portfolio.disconnect.called
+
+    async def test_refuses_while_connecting(self):
+        portfolio = create_mock_portfolio()
+        manager = ConnectionManager(portfolio)
+        manager._state = ConnectionState.CONNECTING
+
+        result = await manager.force_reconnect("test reason")
+
+        assert result is False
+
+    async def test_refuses_while_shutting_down(self):
+        portfolio = create_mock_portfolio()
+        manager = ConnectionManager(portfolio)
+        manager._state = ConnectionState.SHUTTING_DOWN
+
+        result = await manager.force_reconnect("test reason")
+
+        assert result is False
+
+    async def test_notifies_reconnect_for_plugin_resubscription(self):
+        """_handle_disconnection() sets _notify_reconnected so on_reconnect()
+        fires on every plugin once back up — must not be skipped just
+        because this was a deliberate, not a real, disconnection."""
+        portfolio = create_mock_portfolio()
+        portfolio.connected = True
+        config = ConnectionConfig(auto_reconnect=True, reconnect_delay_initial=100.0)
+        manager = ConnectionManager(portfolio, config)
+        manager._state = ConnectionState.CONNECTED
+
+        await manager.force_reconnect("test reason")
+
+        assert manager._notify_reconnected is True
+        self._cleanup(manager)
+
+
 class TestConnectionManagerState:
     """Tests for connection state management"""
 

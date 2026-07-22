@@ -175,6 +175,7 @@ class TradingEngine:
             self._portfolio,
             self._data_feed,
             message_bus=self._message_bus,
+            connection_manager=self._connection_manager,
             order_mode=self.config.order_mode,
             order_rate_limit=self.config.order_rate_limit,
             order_burst_size=self.config.order_burst_size,

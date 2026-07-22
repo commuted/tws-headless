@@ -17,7 +17,9 @@ import pytest
 from ibapi.contract import Contract
 
 from plugins.base import PluginBase, TradeSignal
-from ib.plugin_executive import PluginExecutive, StreamManager, _IB_INFO_CODES
+from ib.plugin_executive import (
+    PluginExecutive, StreamManager, _IB_INFO_CODES, _FARM_BROKEN_CODES,
+)
 from ib.models import OrderRecord, OrderStatus
 from order_reconciler import OrderReconciler
 
@@ -611,6 +613,21 @@ class TestIBInfoCodes:
         assert 504 not in _IB_INFO_CODES   # not connected
 
 
+class TestFarmBrokenCodes:
+    """_FARM_BROKEN_CODES — the 'connection is broken' family, one per farm
+    type. Disjoint from _IB_INFO_CODES (their 'OK' counterparts) since the
+    two sets are handled oppositely: info codes are dropped, these publish
+    an alert."""
+
+    def test_contains_known_broken_codes(self):
+        assert 2103 in _FARM_BROKEN_CODES   # market data farm
+        assert 2105 in _FARM_BROKEN_CODES   # HMDS farm
+        assert 2157 in _FARM_BROKEN_CODES   # sec-def farm
+
+    def test_disjoint_from_info_codes(self):
+        assert not (_FARM_BROKEN_CODES & _IB_INFO_CODES)
+
+
 # ===========================================================================
 # 3b. StreamManager.plugins_for_symbol
 # ===========================================================================
@@ -677,6 +694,94 @@ class TestHandleIBErrorForPlugins:
             ex._handle_ib_error_for_plugins(1, code, "info")
 
         assert plugin.error_calls == []
+
+    # --- farm-broken early warning ---
+    # 2103/2105/2157 are req_id == -1 system messages like the info codes
+    # above, but unlike those, they publish an alert (consumed by the
+    # watchdog's existing generic alert sink) before the req_id == -1
+    # filter would otherwise have silently dropped them.
+
+    def _alerts(self, ex):
+        received = []
+        ex.message_bus.subscribe(
+            "alerts", lambda msg: received.append(msg.payload), "test"
+        )
+        return received
+
+    def test_farm_broken_code_still_not_routed_to_plugins(self):
+        """Unchanged behaviour: plugins still never see this via on_ib_error
+        — only the alert path is new."""
+        plugin = ConcretePlugin()
+        ex = self._exec_with_plugin(plugin)
+
+        ex._handle_ib_error_for_plugins(-1, 2103, "Market data farm connection is broken:hfarm")
+
+        assert plugin.error_calls == []
+
+    def test_farm_broken_publishes_alert_with_farm_name(self):
+        ex = make_executive()
+        received = self._alerts(ex)
+
+        ex._handle_ib_error_for_plugins(-1, 2103, "Market data farm connection is broken:hfarm")
+
+        assert len(received) == 1
+        assert received[0]["kind"] == "farm_connection_broken"
+        assert received[0]["farm"] == "hfarm"
+        assert received[0]["error_code"] == 2103
+
+    def test_all_farm_broken_codes_publish_alert(self):
+        ex = make_executive()
+        received = self._alerts(ex)
+
+        for code in _FARM_BROKEN_CODES:
+            ex._farm_broken_last_alert.clear()   # bypass cooldown between codes
+            ex._handle_ib_error_for_plugins(-1, code, f"Some farm connection is broken:farm{code}")
+
+        assert len(received) == len(_FARM_BROKEN_CODES)
+
+    def test_repeated_break_within_cooldown_alerts_once(self):
+        """A flapping farm (observed live: 5 breaks in under 15s) must not
+        spam the alert channel."""
+        ex = make_executive()
+        received = self._alerts(ex)
+
+        for _ in range(5):
+            ex._handle_ib_error_for_plugins(-1, 2103, "Market data farm connection is broken:cashfarm")
+
+        assert len(received) == 1
+
+    def test_different_farms_each_get_their_own_alert(self):
+        """Cooldown is per-farm — a second, DIFFERENT farm breaking must not
+        be suppressed by the first one's cooldown."""
+        ex = make_executive()
+        received = self._alerts(ex)
+
+        ex._handle_ib_error_for_plugins(-1, 2103, "Market data farm connection is broken:hfarm")
+        ex._handle_ib_error_for_plugins(-1, 2103, "Market data farm connection is broken:jfarm")
+
+        assert len(received) == 2
+        assert {r["farm"] for r in received} == {"hfarm", "jfarm"}
+
+    def test_cooldown_expires(self, monkeypatch):
+        ex = make_executive()
+        received = self._alerts(ex)
+
+        ex._handle_ib_error_for_plugins(-1, 2103, "Market data farm connection is broken:hfarm")
+        ex._farm_broken_last_alert["hfarm"] -= 301   # simulate cooldown elapsed
+        ex._handle_ib_error_for_plugins(-1, 2103, "Market data farm connection is broken:hfarm")
+
+        assert len(received) == 2
+
+    def test_malformed_error_string_falls_back_gracefully(self):
+        """No colon to split on — must not raise, and must still alert with
+        something rather than silently dropping it."""
+        ex = make_executive()
+        received = self._alerts(ex)
+
+        ex._handle_ib_error_for_plugins(-1, 2103, "farm broken")   # no ':<name>'
+
+        assert len(received) == 1
+        assert received[0]["farm"] == "farm broken"
 
     # --- order routing ---
 

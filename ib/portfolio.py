@@ -1849,7 +1849,21 @@ class Portfolio(IBClient):
             self.historicalDataEnd(reqId, "", "")
 
     def historicalData(self, reqId: int, bar) -> None:
-        """IB callback: one bar of historical data has arrived (backfill)."""
+        """IB callback: one bar of historical data has arrived (backfill).
+
+        Logged unconditionally, before the entry lookup, so this is direct
+        proof IB called us — the base ibapi.wrapper.EWrapper.historicalData
+        would log this itself via logAnswer(), but our override replaces the
+        base method entirely and never replicated that call, leaving zero
+        evidence in the log of a bar's arrival either way. Without this, a
+        silently-dropped entry (entry is None, next line) and IB genuinely
+        never delivering a bar are indistinguishable from the log alone.
+        """
+        logger.info(
+            f"historicalData reqId={reqId} date={getattr(bar, 'date', '?')} "
+            f"close={getattr(bar, 'close', '?')} "
+            f"entry_found={reqId in self._historical_requests}"
+        )
         entry = self._historical_requests.get(reqId)
         if entry is None:
             return
@@ -1894,7 +1908,18 @@ class Portfolio(IBClient):
 
         Routes to on_bar_update when the requester provided one (so callers can
         tell live bars from the backfill replay); falls back to on_bar otherwise.
+
+        Logged unconditionally, before the entry lookup — see historicalData's
+        docstring for why: our override replaces the base ibapi wrapper method
+        (which would have logged this itself) without replicating that
+        logging, so a genuinely-delivered bar and a silently-dropped one
+        (entry is None, next line) were indistinguishable from the log alone.
         """
+        logger.info(
+            f"historicalDataUpdate reqId={reqId} date={getattr(bar, 'date', '?')} "
+            f"close={getattr(bar, 'close', '?')} "
+            f"entry_found={reqId in self._historical_requests}"
+        )
         entry = self._historical_requests.get(reqId)
         if entry is None:
             return
