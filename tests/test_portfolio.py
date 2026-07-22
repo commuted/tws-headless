@@ -1249,6 +1249,72 @@ class TestHistoricalBarRouting:
         assert received == [bar, bar]
 
 
+class TestHistoricalBarLogging:
+    """Both callbacks must log unconditionally, before the entry lookup —
+    the base ibapi.wrapper.EWrapper would have logged this itself
+    (logAnswer()), but our override replaces the base method entirely
+    without replicating that call. Without an unconditional log line here,
+    IB genuinely never delivering a bar and our own bookkeeping silently
+    dropping one (entry is None) are indistinguishable from the log alone —
+    exactly the ambiguity that made a week of live-feed debugging harder
+    than it needed to be."""
+
+    def test_historical_data_logs_when_entry_found(self, portfolio_instance, caplog):
+        portfolio_instance._historical_requests = {7: (lambda b: None, None, None, True, [])}
+        bar = MagicMock(date="20260721 09:35:00", close=368.5)
+
+        with caplog.at_level("INFO"):
+            portfolio_instance.historicalData(7, bar)
+
+        assert "historicalData reqId=7" in caplog.text
+        assert "entry_found=True" in caplog.text
+
+    def test_historical_data_logs_when_entry_missing(self, portfolio_instance, caplog):
+        """The silent-drop case: no entry for this reqId. Must still log,
+        not return before anything is recorded."""
+        portfolio_instance._historical_requests = {}
+        bar = MagicMock(date="20260721 09:35:00", close=368.5)
+
+        with caplog.at_level("INFO"):
+            portfolio_instance.historicalData(99, bar)
+
+        assert "historicalData reqId=99" in caplog.text
+        assert "entry_found=False" in caplog.text
+
+    def test_historical_data_update_logs_when_entry_found(self, portfolio_instance, caplog):
+        portfolio_instance._historical_requests = {7: (lambda b: None, None, None, True, [])}
+        bar = MagicMock(date="20260721 09:35:00", close=368.5)
+
+        with caplog.at_level("INFO"):
+            portfolio_instance.historicalDataUpdate(7, bar)
+
+        assert "historicalDataUpdate reqId=7" in caplog.text
+        assert "entry_found=True" in caplog.text
+
+    def test_historical_data_update_logs_when_entry_missing(self, portfolio_instance, caplog):
+        portfolio_instance._historical_requests = {}
+        bar = MagicMock(date="20260721 09:35:00", close=368.5)
+
+        with caplog.at_level("INFO"):
+            portfolio_instance.historicalDataUpdate(99, bar)
+
+        assert "historicalDataUpdate reqId=99" in caplog.text
+        assert "entry_found=False" in caplog.text
+
+    def test_log_line_includes_bar_date_and_close(self, portfolio_instance, caplog):
+        """The whole point is diagnosing a live feed — the log line must
+        carry enough of the bar to be useful without cross-referencing
+        anything else."""
+        portfolio_instance._historical_requests = {7: (lambda b: None, None, None, True, [])}
+        bar = MagicMock(date="20260721 09:35:00", close=368.5)
+
+        with caplog.at_level("INFO"):
+            portfolio_instance.historicalDataUpdate(7, bar)
+
+        assert "20260721 09:35:00" in caplog.text
+        assert "368.5" in caplog.text
+
+
 # =============================================================================
 # Order Cancellation Tests
 # =============================================================================

@@ -6,7 +6,7 @@ import asyncio
 import pytest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, AsyncMock
 
 from ib.plugin_executive import (
     PluginExecutive,
@@ -1450,3 +1450,120 @@ class TestTestPlugin:
         help_text = p.cli_help()
         assert isinstance(help_text, str)
         assert len(help_text) > 0
+
+
+class WindowedPlugin(MockPlugin):
+    """MockPlugin variant that declares a fixed trading_hours() window."""
+
+    def __init__(self, name, windows, **kwargs):
+        super().__init__(name, **kwargs)
+        self._windows = windows
+
+    def trading_hours(self):
+        return self._windows
+
+
+class TestAggregateTradingWindows:
+    """PluginExecutive.aggregate_trading_windows() — used by the watchdog to
+    tell 'some plugin is actively trading' from 'nothing is' without a
+    hardcoded market calendar."""
+
+    def test_no_plugins_returns_none(self):
+        executive = PluginExecutive(None, None)
+        assert executive.aggregate_trading_windows() is None
+
+    def test_plugin_with_no_opinion_returns_none(self):
+        executive = PluginExecutive(None, None)
+        plugin = MockPlugin("silent")
+        executive.register_plugin(plugin)
+        executive.start_plugin("silent")
+        assert executive.aggregate_trading_windows() is None
+
+    def test_single_plugin_window_returned(self):
+        from datetime import time as dt_time
+        executive = PluginExecutive(None, None)
+        plugin = WindowedPlugin("a", [(dt_time(9, 30), dt_time(16, 0))])
+        executive.register_plugin(plugin)
+        executive.start_plugin("a")
+        assert executive.aggregate_trading_windows() == [(dt_time(9, 30), dt_time(16, 0))]
+
+    def test_overlapping_windows_merged(self):
+        from datetime import time as dt_time
+        executive = PluginExecutive(None, None)
+        a = WindowedPlugin("a", [(dt_time(9, 0), dt_time(12, 0))])
+        b = WindowedPlugin("b", [(dt_time(11, 0), dt_time(15, 0))])
+        executive.register_plugin(a)
+        executive.register_plugin(b)
+        executive.start_plugin("a")
+        executive.start_plugin("b")
+        assert executive.aggregate_trading_windows() == [(dt_time(9, 0), dt_time(15, 0))]
+
+    def test_disjoint_windows_kept_separate(self):
+        from datetime import time as dt_time
+        executive = PluginExecutive(None, None)
+        a = WindowedPlugin("a", [(dt_time(4, 0), dt_time(6, 0))])
+        b = WindowedPlugin("b", [(dt_time(9, 30), dt_time(16, 0))])
+        executive.register_plugin(a)
+        executive.register_plugin(b)
+        executive.start_plugin("a")
+        executive.start_plugin("b")
+        result = executive.aggregate_trading_windows()
+        assert result == [(dt_time(4, 0), dt_time(6, 0)), (dt_time(9, 30), dt_time(16, 0))]
+
+    def test_non_started_plugin_excluded(self):
+        """A loaded-but-not-started plugin shouldn't force the aggregate
+        window open — it isn't actually running."""
+        from datetime import time as dt_time
+        executive = PluginExecutive(None, None)
+        plugin = WindowedPlugin("a", [(dt_time(0, 0), dt_time(23, 59))])
+        executive.register_plugin(plugin)   # LOADED, not started
+        assert executive.aggregate_trading_windows() is None
+
+    def test_plugin_raising_is_skipped_not_fatal(self):
+        from datetime import time as dt_time
+        executive = PluginExecutive(None, None)
+
+        class Broken(WindowedPlugin):
+            def trading_hours(self):
+                raise RuntimeError("boom")
+
+        broken = Broken("broken", [])
+        good = WindowedPlugin("good", [(dt_time(9, 30), dt_time(16, 0))])
+        executive.register_plugin(broken)
+        executive.register_plugin(good)
+        executive.start_plugin("broken")
+        executive.start_plugin("good")
+        assert executive.aggregate_trading_windows() == [(dt_time(9, 30), dt_time(16, 0))]
+
+
+class TestForceReconnect:
+    """PluginExecutive.force_reconnect() — proxies to
+    ConnectionManager.force_reconnect() from whichever thread the caller is
+    on (the watchdog's escalation runs on its own monitor thread, not the
+    engine's asyncio loop)."""
+
+    async def test_schedules_connection_manager_force_reconnect(self):
+        cm = Mock()
+        cm.force_reconnect = AsyncMock(return_value=True)
+        executive = PluginExecutive(None, None, connection_manager=cm)
+
+        result = executive.force_reconnect("test reason")
+        assert result is True
+
+        # Scheduled via create_task(), not yet run — yield once.
+        await asyncio.sleep(0)
+        cm.force_reconnect.assert_called_once_with("test reason")
+
+    def test_returns_false_without_connection_manager(self):
+        executive = PluginExecutive(None, None)
+        assert executive.force_reconnect("test reason") is False
+
+    async def test_exception_in_connection_manager_is_caught(self):
+        """A failure inside the scheduled task must not escape and kill the
+        engine's event loop — it's logged, not raised."""
+        cm = Mock()
+        cm.force_reconnect = AsyncMock(side_effect=RuntimeError("boom"))
+        executive = PluginExecutive(None, None, connection_manager=cm)
+
+        executive.force_reconnect("test reason")
+        await asyncio.sleep(0)   # let the task run and raise internally

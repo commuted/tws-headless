@@ -476,3 +476,392 @@ class TestRequests:
         plugin = _make_plugin(tmp_path)
         result = plugin.handle_request("nonexistent", {})
         assert result["success"] is False
+
+
+# ---------------------------------------------------------------------------
+# Automatic TWS relaunch escalation
+# ---------------------------------------------------------------------------
+
+class TestRelaunchEscalation:
+    def _stale_plugin(self, tmp_path, seconds_since_last_bar=99999, **kw):
+        plugin = _make_plugin(tmp_path, **kw)
+        plugin.auto_relaunch_tws = True
+        p = Mock()
+        p.connected = True
+        p.keep_up_to_date_feeds.return_value = [
+            {"req_id": 1, "symbol": "GLD", "seconds_since_last_bar": seconds_since_last_bar},
+        ]
+        p.pending_orders = []
+        plugin.portfolio = p
+        plugin._relaunch_tws = Mock(wraps=plugin._relaunch_tws)
+        return plugin
+
+    def test_disabled_by_default(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        assert plugin.auto_relaunch_tws is False
+
+    def test_no_escalation_while_fresh(self, tmp_path):
+        plugin = self._stale_plugin(tmp_path, seconds_since_last_bar=5)
+        plugin.relaunch_in_session_timeout_seconds = 1.0
+        plugin._check_stale_feed_escalation()
+        plugin._relaunch_tws.assert_not_called()
+
+    def test_escalates_once_timeout_exceeded(self, tmp_path, monkeypatch):
+        plugin = self._stale_plugin(tmp_path)
+        plugin.relaunch_in_session_timeout_seconds = 1.0
+        plugin.relaunch_off_hours_timeout_seconds = 1.0
+        plugin._in_declared_session = lambda now=None: True
+        plugin._in_blackout = lambda now=None: False
+        # First check starts the stale-since clock; nothing fires yet.
+        plugin._check_stale_feed_escalation()
+        plugin._relaunch_tws.assert_not_called()
+        # Advance past the 1s timeout.
+        plugin._stale_since = time.time() - 2.0
+        plugin._check_stale_feed_escalation()
+        plugin._relaunch_tws.assert_called_once()
+
+    def test_off_hours_uses_looser_timeout(self, tmp_path):
+        """A duration that would trigger in-session must NOT trigger
+        off-hours when the off-hours timeout is longer — "timeout, not
+        keep-out" only works if the two clocks are actually independent."""
+        plugin = self._stale_plugin(tmp_path)
+        plugin.relaunch_in_session_timeout_seconds = 5.0
+        plugin.relaunch_off_hours_timeout_seconds = 99999.0
+        plugin._in_declared_session = lambda now=None: False
+        plugin._in_blackout = lambda now=None: False
+        plugin._stale_since = time.time() - 10.0   # past in-session, not off-hours
+        plugin._check_stale_feed_escalation()
+        plugin._relaunch_tws.assert_not_called()
+
+    def test_blackout_suppresses_without_resetting_clock(self, tmp_path):
+        plugin = self._stale_plugin(tmp_path)
+        plugin.relaunch_in_session_timeout_seconds = 1.0
+        plugin._in_declared_session = lambda now=None: True
+        plugin._in_blackout = lambda now=None: True
+        started = time.time() - 5.0
+        plugin._stale_since = started
+        plugin._check_stale_feed_escalation()
+        plugin._relaunch_tws.assert_not_called()
+        assert plugin._stale_since == started   # clock kept running, not reset
+
+    def test_cooldown_blocks_second_relaunch(self, tmp_path):
+        plugin = self._stale_plugin(tmp_path)
+        plugin.relaunch_in_session_timeout_seconds = 1.0
+        plugin.relaunch_cooldown_seconds = 99999.0
+        plugin.relaunch_warmup_seconds = 0.0
+        plugin._in_declared_session = lambda now=None: True
+        plugin._in_blackout = lambda now=None: False
+        plugin._last_relaunch = time.time() - 10.0   # a "recent" relaunch
+        plugin._stale_since = time.time() - 5.0
+        plugin._check_stale_feed_escalation()
+        plugin._relaunch_tws.assert_not_called()
+
+    def test_warmup_suppresses_evaluation_and_resets_clock(self, tmp_path):
+        plugin = self._stale_plugin(tmp_path)
+        plugin.relaunch_warmup_seconds = 99999.0
+        plugin._last_relaunch = time.time() - 5.0
+        plugin._stale_since = time.time() - 999.0   # would otherwise be well past any timeout
+        plugin._check_stale_feed_escalation()
+        plugin._relaunch_tws.assert_not_called()
+        assert plugin._stale_since is None
+
+    def test_disconnected_never_escalates(self, tmp_path):
+        plugin = self._stale_plugin(tmp_path)
+        plugin.portfolio.connected = False
+        plugin.relaunch_in_session_timeout_seconds = 1.0
+        plugin._stale_since = time.time() - 999.0
+        plugin._check_stale_feed_escalation()
+        plugin._relaunch_tws.assert_not_called()
+
+    def test_recovery_clears_stale_since(self, tmp_path):
+        plugin = self._stale_plugin(tmp_path, seconds_since_last_bar=99999)
+        plugin._check_stale_feed_escalation()
+        assert plugin._stale_since is not None
+        plugin.portfolio.keep_up_to_date_feeds.return_value = [
+            {"req_id": 1, "symbol": "GLD", "seconds_since_last_bar": 5},
+        ]
+        plugin._check_stale_feed_escalation()
+        assert plugin._stale_since is None
+
+    def test_relaunch_invokes_configured_script(self, tmp_path, monkeypatch):
+        """_relaunch_tws must actually shell out to relaunch_script_path,
+        detached from our own process group, and record the attempt."""
+        plugin = _make_plugin(tmp_path)
+        plugin.relaunch_script_path = "/bin/true"
+        captured = {}
+
+        def _fake_popen(args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return Mock()
+
+        monkeypatch.setattr("plugins.watchdog.plugin.subprocess.Popen", _fake_popen)
+        before = plugin._relaunches
+        plugin._relaunch_tws("test reason")
+
+        assert captured["args"] == ["/bin/true"]
+        assert captured["kwargs"]["start_new_session"] is True
+        assert plugin._relaunches == before + 1
+        assert plugin._stale_since is None
+        alerts = _alerts(plugin)
+        assert alerts[-1]["payload"]["kind"] == "tws_relaunch_triggered"
+
+    def test_relaunch_failure_does_not_raise(self, tmp_path, monkeypatch):
+        plugin = _make_plugin(tmp_path)
+
+        def _boom(*a, **kw):
+            raise OSError("no such file")
+
+        monkeypatch.setattr("plugins.watchdog.plugin.subprocess.Popen", _boom)
+        plugin._relaunch_tws("test reason")   # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Reconnect escalation — the cheap, no-credentials tier between
+# resubscription and a full TWS relaunch
+# ---------------------------------------------------------------------------
+
+class TestReconnectEscalation:
+    def _stale_plugin(self, tmp_path, seconds_since_last_bar=99999, **kw):
+        plugin = _make_plugin(tmp_path, **kw)
+        plugin.auto_reconnect_on_stale = True
+        p = Mock()
+        p.connected = True
+        p.keep_up_to_date_feeds.return_value = [
+            {"req_id": 1, "symbol": "GLD", "seconds_since_last_bar": seconds_since_last_bar},
+        ]
+        p.pending_orders = []
+        plugin.portfolio = p
+        plugin._force_reconnect = Mock(wraps=plugin._force_reconnect)
+        plugin._executive = Mock()
+        plugin._executive.force_reconnect = Mock(return_value=True)
+        return plugin
+
+    def test_disabled_by_default(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        assert plugin.auto_reconnect_on_stale is False
+
+    def test_escalates_once_timeout_exceeded(self, tmp_path):
+        plugin = self._stale_plugin(tmp_path)
+        plugin.reconnect_in_session_timeout_seconds = 1.0
+        plugin._in_declared_session = lambda now=None: True
+        plugin._in_blackout = lambda now=None: False
+        plugin._check_stale_feed_escalation()
+        plugin._force_reconnect.assert_not_called()
+        plugin._stale_since = time.time() - 2.0
+        plugin._check_stale_feed_escalation()
+        plugin._force_reconnect.assert_called_once()
+
+    def test_off_hours_uses_looser_timeout(self, tmp_path):
+        plugin = self._stale_plugin(tmp_path)
+        plugin.reconnect_in_session_timeout_seconds = 5.0
+        plugin.reconnect_off_hours_timeout_seconds = 99999.0
+        plugin._in_declared_session = lambda now=None: False
+        plugin._in_blackout = lambda now=None: False
+        plugin._stale_since = time.time() - 10.0
+        plugin._check_stale_feed_escalation()
+        plugin._force_reconnect.assert_not_called()
+
+    def test_cooldown_blocks_second_reconnect(self, tmp_path):
+        plugin = self._stale_plugin(tmp_path)
+        plugin.reconnect_in_session_timeout_seconds = 1.0
+        plugin.reconnect_cooldown_seconds = 99999.0
+        plugin.reconnect_warmup_seconds = 0.0
+        plugin._in_declared_session = lambda now=None: True
+        plugin._in_blackout = lambda now=None: False
+        plugin._last_reconnect = time.time() - 10.0
+        plugin._stale_since = time.time() - 5.0
+        plugin._check_stale_feed_escalation()
+        plugin._force_reconnect.assert_not_called()
+
+    def test_warmup_suppresses_evaluation_and_resets_clock(self, tmp_path):
+        plugin = self._stale_plugin(tmp_path)
+        plugin.reconnect_warmup_seconds = 99999.0
+        plugin._last_reconnect = time.time() - 5.0
+        plugin._stale_since = time.time() - 999.0
+        plugin._check_stale_feed_escalation()
+        plugin._force_reconnect.assert_not_called()
+        assert plugin._stale_since is None
+
+    def test_force_reconnect_invokes_executive_and_records_attempt(self, tmp_path):
+        plugin = self._stale_plugin(tmp_path)
+        before = plugin._reconnects
+        plugin._force_reconnect("test reason")
+
+        plugin._executive.force_reconnect.assert_called_once_with("test reason")
+        assert plugin._reconnects == before + 1
+        assert plugin._stale_since is None
+        alerts = _alerts(plugin)
+        assert alerts[-1]["payload"]["kind"] == "tws_reconnect_triggered"
+
+    def test_force_reconnect_without_executive_does_not_raise(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin._executive = None
+        plugin._force_reconnect("test reason")   # must not raise
+
+    def test_force_reconnect_executive_failure_does_not_raise(self, tmp_path):
+        plugin = self._stale_plugin(tmp_path)
+        plugin._executive.force_reconnect = Mock(side_effect=RuntimeError("boom"))
+        plugin._force_reconnect("test reason")   # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Escalation ladder ordering — reconnect (cheap) must always get first
+# refusal before relaunch (expensive, may need a human to log back in)
+# ---------------------------------------------------------------------------
+
+class TestEscalationLadderOrdering:
+    def _plugin(self, tmp_path, seconds_since_last_bar=99999):
+        plugin = _make_plugin(tmp_path)
+        p = Mock()
+        p.connected = True
+        p.keep_up_to_date_feeds.return_value = [
+            {"req_id": 1, "symbol": "GLD", "seconds_since_last_bar": seconds_since_last_bar},
+        ]
+        p.pending_orders = []
+        plugin.portfolio = p
+        plugin._executive = Mock()
+        plugin._executive.force_reconnect = Mock(return_value=True)
+        plugin._force_reconnect = Mock(wraps=plugin._force_reconnect)
+        plugin._relaunch_tws = Mock(wraps=plugin._relaunch_tws)
+        plugin._in_declared_session = lambda now=None: True
+        plugin._in_blackout = lambda now=None: False
+        return plugin
+
+    def test_reconnect_fires_before_relaunch_threshold_reached(self, tmp_path):
+        """Both enabled, duration past reconnect's timeout but not yet
+        relaunch's (much larger) one: only reconnect should fire."""
+        plugin = self._plugin(tmp_path)
+        plugin.auto_reconnect_on_stale = True
+        plugin.auto_relaunch_tws = True
+        plugin.reconnect_in_session_timeout_seconds = 10.0
+        plugin.relaunch_in_session_timeout_seconds = 99999.0
+        plugin._stale_since = time.time() - 20.0
+
+        plugin._check_stale_feed_escalation()
+
+        plugin._force_reconnect.assert_called_once()
+        plugin._relaunch_tws.assert_not_called()
+
+    def test_relaunch_fires_once_its_own_threshold_reached(self, tmp_path):
+        """Once duration passes relaunch's (larger) threshold too, relaunch
+        fires instead of a redundant reconnect — reconnect already had its
+        chance on an earlier cycle."""
+        plugin = self._plugin(tmp_path)
+        plugin.auto_reconnect_on_stale = True
+        plugin.auto_relaunch_tws = True
+        plugin.reconnect_in_session_timeout_seconds = 10.0
+        plugin.relaunch_in_session_timeout_seconds = 20.0
+        plugin._stale_since = time.time() - 30.0
+
+        plugin._check_stale_feed_escalation()
+
+        plugin._relaunch_tws.assert_called_once()
+        plugin._force_reconnect.assert_not_called()
+
+    def test_relaunch_only_flag_skips_reconnect_tier_entirely(self, tmp_path):
+        """auto_reconnect_on_stale off, auto_relaunch_tws on: relaunch must
+        still fire on its own — the reconnect tier being disabled must not
+        block the ladder (this is exactly the pre-existing, tested
+        single-tier behavior; it must survive the ladder refactor)."""
+        plugin = self._plugin(tmp_path)
+        plugin.auto_reconnect_on_stale = False
+        plugin.auto_relaunch_tws = True
+        plugin.relaunch_in_session_timeout_seconds = 10.0
+        plugin._stale_since = time.time() - 20.0
+
+        plugin._check_stale_feed_escalation()
+
+        plugin._relaunch_tws.assert_called_once()
+
+    def test_reconnect_only_flag_never_escalates_to_relaunch(self, tmp_path):
+        plugin = self._plugin(tmp_path)
+        plugin.auto_reconnect_on_stale = True
+        plugin.auto_relaunch_tws = False
+        plugin.reconnect_in_session_timeout_seconds = 10.0
+        plugin._stale_since = time.time() - 99999.0   # would be well past any relaunch timeout
+
+        plugin._check_stale_feed_escalation()
+
+        plugin._force_reconnect.assert_called_once()
+        plugin._relaunch_tws.assert_not_called()
+
+    def test_relaunch_warmup_also_suppresses_reconnect_tier(self, tmp_path):
+        """A relaunch just fired: the whole ladder should hold off, not just
+        the relaunch tier — a fresh TWS process needs time to settle before
+        ANY further action is judged, including the cheaper one."""
+        plugin = self._plugin(tmp_path)
+        plugin.auto_reconnect_on_stale = True
+        plugin.auto_relaunch_tws = True
+        plugin.reconnect_in_session_timeout_seconds = 1.0
+        plugin.relaunch_warmup_seconds = 99999.0
+        plugin._last_relaunch = time.time() - 5.0
+        plugin._stale_since = time.time() - 999.0
+
+        plugin._check_stale_feed_escalation()
+
+        plugin._force_reconnect.assert_not_called()
+        plugin._relaunch_tws.assert_not_called()
+        assert plugin._stale_since is None
+
+    def test_reconnect_warmup_also_suppresses_relaunch_tier(self, tmp_path):
+        """Symmetric case: a reconnect just fired, relaunch's own threshold
+        has technically been exceeded already, but the ladder should still
+        give the cheap reconnect a chance to prove itself first."""
+        plugin = self._plugin(tmp_path)
+        plugin.auto_reconnect_on_stale = True
+        plugin.auto_relaunch_tws = True
+        plugin.relaunch_in_session_timeout_seconds = 1.0
+        plugin.reconnect_warmup_seconds = 99999.0
+        plugin._last_reconnect = time.time() - 5.0
+        plugin._stale_since = time.time() - 999.0
+
+        plugin._check_stale_feed_escalation()
+
+        plugin._force_reconnect.assert_not_called()
+        plugin._relaunch_tws.assert_not_called()
+        assert plugin._stale_since is None
+
+
+# ---------------------------------------------------------------------------
+# In-session / blackout window evaluation
+# ---------------------------------------------------------------------------
+
+class TestSessionAndBlackoutWindows:
+    def _at(self, hour, minute):
+        return datetime(2026, 7, 20, hour, minute, tzinfo=_NY)
+
+    def test_default_blackout_covers_0530_et(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        assert plugin._in_blackout(self._at(5, 30)) is True
+        assert plugin._in_blackout(self._at(6, 0)) is False
+
+    def test_custom_blackout_window(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin.blackout_windows = [{"start": "12:00", "end": "12:15"}]
+        assert plugin._in_blackout(self._at(12, 5)) is True
+        assert plugin._in_blackout(self._at(5, 30)) is False   # default replaced, not merged
+
+    def test_falls_back_to_regular_hours_with_no_executive(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin._executive = None
+        assert plugin._in_declared_session(self._at(10, 0)) is True
+        assert plugin._in_declared_session(self._at(20, 0)) is False
+
+    def test_uses_plugin_aggregated_window_when_available(self, tmp_path):
+        from datetime import time as dt_time
+        plugin = _make_plugin(tmp_path)
+        executive = Mock()
+        executive.aggregate_trading_windows.return_value = [
+            (dt_time(4, 0), dt_time(9, 30)),   # pre-market only, no regular session
+        ]
+        plugin.set_executive(executive)
+        assert plugin._in_declared_session(self._at(6, 0)) is True
+        assert plugin._in_declared_session(self._at(11, 0)) is False
+
+    def test_aggregate_error_falls_back_to_default(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        executive = Mock()
+        executive.aggregate_trading_windows.side_effect = RuntimeError("boom")
+        plugin.set_executive(executive)
+        assert plugin._in_declared_session(self._at(10, 0)) is True

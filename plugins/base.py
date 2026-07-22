@@ -17,7 +17,7 @@ import threading
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -786,6 +786,24 @@ class PluginBase(ABC):
         subscriptions, or it will run blind (no bars, no errors) after a
         reconnect.
         """
+
+    def trading_hours(self) -> Optional[List[Tuple[time, time]]]:
+        """
+        Declare the wall-clock windows (America/New_York, exchange-local) this
+        plugin needs its feeds and connection alive for — e.g. pre-market
+        through its last close-of-day decision. Used to aggregate an
+        account-wide "in-session" window across every loaded plugin (see
+        PluginExecutive.aggregate_trading_windows()), so infrastructure-level
+        recovery actions (e.g. an automatic TWS relaunch) can apply a tighter
+        timeout while any plugin is active and a looser one when none are.
+
+        Return None (the default) to express no opinion — a plugin that
+        never trades on a wall-clock schedule (e.g. a manual/signal-only
+        plugin) shouldn't force the aggregate window open. Return a list of
+        (start, end) pairs if the plugin needs several disjoint windows,
+        e.g. [(pre_market_start, pre_market_end), (open, close)].
+        """
+        return None
 
     def on_ib_error(self, req_id: int, error_code: int, error_string: str) -> None:
         """

@@ -16,7 +16,7 @@ import logging
 import os
 from decimal import Decimal
 from typing import Optional, Callable, Dict, List, Set, Any, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import OrderedDict
@@ -41,6 +41,22 @@ logger = logging.getLogger(__name__)
 
 # IB error codes that are informational/system-level and not plugin-actionable
 _IB_INFO_CODES: frozenset = frozenset({2104, 2106, 2158, 2119, 10167})
+
+# "Data farm connection is broken" family (market data / HMDS / sec-def
+# farms respectively). Genuinely req_id == -1 system messages like the
+# _IB_INFO_CODES above, so they'd otherwise never reach a plugin — but
+# unlike those, a farm outage is actionable (see WatchdogPlugin.
+# on_farm_broken), so it's dispatched to every started plugin as a special
+# case ahead of the req_id == -1 filter, not folded into the info-codes
+# exclusion.
+_FARM_BROKEN_CODES: frozenset = frozenset({2103, 2105, 2157})
+
+# A single farm can flap repeatedly within seconds (observed live: cashfarm
+# reported broken 5 times in under 15 seconds on 2026-07-15) — this bounds
+# alert volume per farm without needing a full watchdog-style dedup/cooldown
+# setting for what is meant to be a cheap, always-on early warning, not a
+# tunable feature.
+_FARM_BROKEN_ALERT_COOLDOWN_SECONDS = 300.0
 
 
 @dataclass
@@ -565,6 +581,7 @@ class PluginExecutive:
         portfolio,
         data_feed: DataFeed,
         message_bus: Optional[MessageBus] = None,
+        connection_manager: Optional[Any] = None,
         order_mode: OrderExecutionMode = OrderExecutionMode.DRY_RUN,
         reconciliation_mode: ReconciliationMode = ReconciliationMode.NET,
         circuit_breaker_failures: int = 5,
@@ -581,6 +598,10 @@ class PluginExecutive:
             portfolio: Portfolio instance for order execution
             data_feed: DataFeed instance for market data
             message_bus: Optional MessageBus for pub/sub communication
+            connection_manager: Optional ConnectionManager — wired so
+                force_reconnect() can trigger an on-demand disconnect/
+                reconnect cycle (e.g. the watchdog's stale-feed escalation)
+                without every caller needing its own reference
             order_mode: How orders should be executed
             reconciliation_mode: How to reconcile orders from multiple plugins
             circuit_breaker_failures: Consecutive failures before disabling plugin
@@ -593,6 +614,7 @@ class PluginExecutive:
         self.portfolio = portfolio
         self.data_feed = data_feed
         self.message_bus = message_bus or MessageBus()
+        self.connection_manager = connection_manager
         self.order_mode = order_mode
 
         # Stream manager for plugin stream lifecycle
@@ -623,6 +645,10 @@ class PluginExecutive:
 
         # Registered plugins
         self._plugins: Dict[str, PluginConfig] = {}
+
+        # Per-farm cooldown for _maybe_alert_farm_broken (farm name -> epoch
+        # of last alert)
+        self._farm_broken_last_alert: Dict[str, float] = {}
 
         # Order execution
         self._order_queue: asyncio.Queue = asyncio.Queue()
@@ -3479,6 +3505,37 @@ class PluginExecutive:
         except Exception as e:
             logger.error(f"Failed to publish alert '{kind}': {e}")
 
+    def _maybe_alert_farm_broken(self, farm: str, error_code: int,
+                                  error_string: str) -> None:
+        """Early-warning alert for a data-farm outage (error 2103/2105/2157),
+        rate-limited per farm.
+
+        IB does not reliably announce recovery — confirmed against 5 days of
+        live logs, the matching "connection is OK" message (2104/2106/2158)
+        is only ever seen as part of a fresh connection's initial handshake
+        burst, never as a standalone mid-session recovery notice. So this is
+        deliberately a one-way notification ("something broke, watch
+        closely"), not a state machine waiting to clear itself — there is no
+        future signal to wait for. Bar staleness (the watchdog's own
+        check_feed_staleness) remains the only reliable recovery signal, and
+        the only thing that should ever trigger reconnect/relaunch action;
+        this alert exists purely to get a human's attention faster than that
+        multi-minute timeout would.
+        """
+        now = time.time()
+        last = self._farm_broken_last_alert.get(farm, 0.0)
+        if now - last < _FARM_BROKEN_ALERT_COOLDOWN_SECONDS:
+            return
+        self._farm_broken_last_alert[farm] = now
+        self.publish_alert("farm_connection_broken", {
+            "message": f"IB reports farm '{farm}' broken ({error_string}) — "
+                       f"early warning only; IB does not reliably announce "
+                       f"recovery, so watch feeds directly rather than "
+                       f"waiting for a recovered signal",
+            "farm": farm,
+            "error_code": error_code,
+        })
+
     def notify_reconnected(self) -> None:
         """Called by the engine after an unexpected disconnection is recovered.
 
@@ -3509,6 +3566,43 @@ class PluginExecutive:
         """
         return self._invoke_on_reconnect_all("feed_resubscription", reason)
 
+    def force_reconnect(self, reason: str) -> bool:
+        """Schedule ConnectionManager.force_reconnect() — a full API
+        disconnect/reconnect cycle, TWS process untouched — from whichever
+        thread the caller is on (the watchdog's escalation runs on its own
+        monitor thread, not the engine's asyncio loop).
+
+        Fire-and-forget: returns True once the reconnect has been scheduled,
+        not once it completes. on_reconnect() firing on every started
+        plugin (already wired to ConnectionManager's own reconnected
+        callback) is what actually re-creates live-bar subscriptions
+        afterward — same path a genuine network drop takes.
+        """
+        if not self.connection_manager:
+            logger.error("force_reconnect: no connection_manager wired to this executive")
+            return False
+
+        async def _do_reconnect():
+            try:
+                await self.connection_manager.force_reconnect(reason)
+            except Exception as e:
+                logger.error(f"force_reconnect failed: {e}")
+
+        try:
+            asyncio.get_running_loop().create_task(_do_reconnect())
+        except RuntimeError:
+            # Called from a thread (e.g. the watchdog's monitor thread).
+            # Use the stored loop reference; asyncio.get_event_loop() raises
+            # RuntimeError on non-main threads in Python 3.12+.
+            loop = self._loop
+            if not (loop and loop.is_running()):
+                logger.error("force_reconnect: no running event loop available")
+                return False
+            asyncio.run_coroutine_threadsafe(_do_reconnect(), loop)
+
+        logger.info(f"Force-reconnect scheduled: {reason}")
+        return True
+
     def _invoke_on_reconnect_all(self, alert_kind: str, message: str) -> List[str]:
         started = [
             config.plugin for config in list(self._plugins.values())
@@ -3525,6 +3619,49 @@ class PluginExecutive:
             except Exception as e:
                 logger.error(f"[{plugin.name}] on_reconnect error: {e}")
         return names
+
+    def aggregate_trading_windows(self) -> Optional[List[Tuple[dt_time, dt_time]]]:
+        """
+        Union every STARTED plugin's PluginBase.trading_hours() into one
+        merged, disjoint list of (start, end) windows (America/New_York
+        wall-clock). Used by infrastructure-level recovery (e.g. an
+        automatic TWS relaunch) to tell "some plugin is actively trading
+        right now" from "nothing is" without hardcoding a market calendar
+        in the watchdog itself.
+
+        Returns None if no loaded plugin expresses an opinion — callers
+        should fall back to their own configured default window in that
+        case, rather than treat "nobody answered" as "always off-hours".
+
+        Assumes no individual plugin window wraps midnight (true of every
+        current use: pre-market/regular/after-hours all sit within one
+        calendar day for US equities).
+        """
+        windows: List[Tuple[time, time]] = []
+        for config in list(self._plugins.values()):
+            if config.plugin.state != PluginState.STARTED:
+                continue
+            try:
+                declared = config.plugin.trading_hours()
+            except Exception as e:
+                logger.error(f"[{config.plugin.name}] trading_hours() error: {e}")
+                continue
+            if declared:
+                windows.extend(declared)
+
+        if not windows:
+            return None
+
+        windows.sort(key=lambda w: w[0])
+        merged: List[Tuple[time, time]] = [windows[0]]
+        for start, end in windows[1:]:
+            last_start, last_end = merged[-1]
+            if start <= last_end:   # overlaps or touches the open window
+                if end > last_end:
+                    merged[-1] = (last_start, end)
+            else:
+                merged.append((start, end))
+        return merged
 
     def _handle_order_status_for_plugins(self, order_record) -> None:
         """
@@ -3567,6 +3704,13 @@ class PluginExecutive:
           1. Order errors   — req_id is in _order_id_to_plugins
           2. Stream errors  — req_id maps to a symbol subscribed by plugins
         """
+        if error_code in _FARM_BROKEN_CODES:
+            # "Market data farm connection is broken:hfarm" -> "hfarm". IB's
+            # farm-status strings always end in ":<farm name>"; fall back to
+            # the whole string if that ever isn't true rather than raise.
+            farm = error_string.rsplit(":", 1)[-1].strip() or error_string
+            self._maybe_alert_farm_broken(farm, error_code, error_string)
+
         if req_id == -1 or error_code in _IB_INFO_CODES:
             return
 

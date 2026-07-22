@@ -72,10 +72,10 @@ import bisect
 import logging
 import time
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dt_time
 from zoneinfo import ZoneInfo
 from itertools import groupby
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ibapi.order import Order as IbOrder
 
@@ -97,6 +97,14 @@ _OPEN_HOUR,  _OPEN_MIN  = 9,  30
 _CLOSE_HOUR, _CLOSE_MIN = 15, 45   # bar completes 15:50 — inside NYSE ARCA MOC cutoff
 
 _NY_TZ = ZoneInfo("America/New_York")
+
+# Declared to PluginExecutive.aggregate_trading_windows() via trading_hours()
+# below: the wall-clock span this plugin actually needs its four feeds and
+# connection alive for. A little before the open (so the 09:30 decision bar
+# and its inputs are already warm) through a little after the MOC submission
+# cutoff (so the fill confirmation isn't missed).
+_TRADING_WINDOW_START = dt_time(9, 15)
+_TRADING_WINDOW_END   = dt_time(16, 0)
 
 # Wall-clock validity windows (ET). A session decision is only meaningful
 # while it can still act on THIS session: the open sell shortly after the
@@ -440,6 +448,9 @@ class GldUsdSwapPlugin(PluginBase):
         self._start_subscriptions()
         return True
 
+    def trading_hours(self) -> List[Tuple[dt_time, dt_time]]:
+        return [(_TRADING_WINDOW_START, _TRADING_WINDOW_END)]
+
     def on_reconnect(self) -> None:
         # keepUpToDate subscriptions are not restored by the connection
         # manager's stream recovery. Without this the plugin runs blind after
@@ -457,13 +468,24 @@ class GldUsdSwapPlugin(PluginBase):
         on_live_bar and may additionally trigger session decisions.  This
         positive backfill/live separation is what guarantees a replayed
         09:30/15:45 bar can never fire a real order on startup/resume.
+
+        UUP/TLT/RINF are signal-only (weight 0.0, never held) and thin enough
+        that a TRADES-basis feed — which only produces a bar when the exchange
+        prints an actual trade — goes stale for long stretches (observed live:
+        the watchdog's stale_feed alert firing on these three on nearly every
+        session, most persistently on RINF). MIDPOINT instead derives from the
+        live bid/ask, so it updates continuously regardless of print activity.
+        GLD stays on TRADES (the default) since it is the instrument actually
+        filled and its signal should track real transaction prices.
         """
         self._live_bar_req_ids: Dict[str, Optional[int]] = {}
         for symbol in ("GLD", "UUP", "TLT", "RINF"):
+            kwargs = {} if symbol == "GLD" else {"what_to_show": "MIDPOINT"}
             req_id = self.subscribe_live_bars(
                 contract=ContractBuilder.etf(symbol),
                 on_bar=lambda b, s=symbol: self._on_bar(s, b, is_live=False),
                 on_live_bar=lambda b, s=symbol: self._on_bar(s, b, is_live=True),
+                **kwargs,
             )
             self._live_bar_req_ids[symbol] = req_id
 

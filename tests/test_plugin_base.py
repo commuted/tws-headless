@@ -924,3 +924,23 @@ class TestPluginBaseFilePersistence:
         """plugin_dir property returns _base_path."""
         plugin = ConcreteTestPlugin("fp_plugin", base_path=tmp_path / "fp_plugin")
         assert plugin.plugin_dir == tmp_path / "fp_plugin"
+
+
+class TestTradingHoursDefault:
+    """PluginBase.trading_hours() defaults to 'no opinion' (None), so a
+    plugin that never overrides it doesn't force PluginExecutive
+    .aggregate_trading_windows() to treat the account as always in-session."""
+
+    def test_default_is_none(self):
+        plugin = ConcreteTestPlugin()
+        assert plugin.trading_hours() is None
+
+    def test_override_returns_declared_windows(self):
+        from datetime import time as dt_time
+
+        class WindowedPlugin(ConcreteTestPlugin):
+            def trading_hours(self):
+                return [(dt_time(9, 15), dt_time(16, 0))]
+
+        plugin = WindowedPlugin()
+        assert plugin.trading_hours() == [(dt_time(9, 15), dt_time(16, 0))]
