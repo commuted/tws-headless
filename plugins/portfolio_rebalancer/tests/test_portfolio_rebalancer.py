@@ -31,13 +31,13 @@ def _make_plugin(tmp_path, **kwargs):
 
 
 def _fund_plugin(plugin, cash=100_000.0, positions=None):
-    """Give the plugin a Holdings object with cash and optional positions."""
+    """Give the plugin a Holdings object with cash and optional positions.
+    market_value is derived (quantity * current_price) — no separate kwarg."""
     holdings = Holdings(plugin_name="portfolio_rebalancer", current_cash=cash)
     if positions:
         for sym, qty, price in positions:
             holdings.current_positions.append(
-                HoldingPosition(symbol=sym, quantity=qty,
-                                current_price=price, market_value=qty * price)
+                HoldingPosition(symbol=sym, quantity=qty, current_price=price)
             )
     plugin._holdings = holdings
     return holdings

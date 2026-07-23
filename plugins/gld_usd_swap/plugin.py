@@ -1275,13 +1275,13 @@ class GldUsdSwapPlugin(PluginBase):
     def _current_nav(self) -> float:
         """Mark-to-market NAV: cash + signed shares * current price.
 
-        Deliberately not holdings.total_value — that property sums
-        HoldingPosition.market_value, which add_position() never sets (it
-        stays at its dataclass default of 0.0 after every fill), so it
-        under-reports NAV by the entire position's worth. Computing it
-        directly here is sign-agnostic: a short's mark-to-market P&L falls
-        out correctly (price up -> position value more negative -> NAV
-        down) with no special-casing.
+        Equivalent to holdings.total_value now that HoldingPosition.market_value
+        is a derived property (plugins/base.py) rather than a field add_position()
+        could forget to set — computed explicitly here anyway to stay scoped to
+        this plugin's own GLD position specifically, rather than summing every
+        position in holdings. Sign-agnostic: a short's mark-to-market P&L falls
+        out correctly (price up -> position value more negative -> NAV down)
+        with no special-casing.
         """
         if not self.holdings:
             return 0.0

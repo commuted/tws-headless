@@ -438,17 +438,18 @@ class TestPluginExecutiveTransfers:
         assert positions == []
 
     def test_get_transferable_positions_zero_market_value_falls_back(self):
-        """Plugin ledgers rarely maintain market_value (fills/transfers store
-        quantity/cost/price only) — a stored 0.0 must not display as $0.00
-        when quantity x current_price is available."""
+        """market_value is derived (quantity * current_price on HoldingPosition,
+        plugins/base.py) rather than a stored field a fill can forget to set,
+        so it can no longer go stale — this now guards that regression, and
+        the qty x price fallback in get_transferable_positions below stays as
+        a harmless second line of defense (e.g. for a value read from an old
+        pre-fix persisted holdings.json with no current_price at all)."""
         from ib.plugin_executive import PluginExecutive
 
         plugin = MockPlugin("gld_swap", cash=20000.0, positions=[
             {"symbol": "GLD", "quantity": 10, "cost_basis": 420.79,
              "current_price": 367.13},
         ])
-        # Mirror the real ledger state: market_value present but never set
-        plugin.holdings.get_position("GLD").market_value = 0.0
 
         pe = object.__new__(PluginExecutive)
         pe._lock = MagicMock()

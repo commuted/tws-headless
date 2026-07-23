@@ -56,7 +56,18 @@ class HoldingPosition:
     quantity: float
     cost_basis: float = 0.0
     current_price: float = 0.0
-    market_value: float = 0.0
+
+    @property
+    def market_value(self) -> float:
+        """Computed, not stored: quantity * current_price.
+
+        Used to be a plain field that add_position() never set, so it stayed
+        at its default 0.0 forever after every fill — confirmed stale in a
+        live plugin's own holdings.json. A stored field can only go stale
+        again the same way; deriving it removes that failure mode entirely,
+        and it's sign-agnostic for a negative (short) quantity too.
+        """
+        return self.quantity * self.current_price
 
     def to_dict(self) -> Dict:
         return {
@@ -69,12 +80,14 @@ class HoldingPosition:
 
     @classmethod
     def from_dict(cls, data: Dict) -> "HoldingPosition":
+        # market_value is intentionally not read here — it's derived, and a
+        # stale value from an old persisted file (pre-fix) must not shadow
+        # the correct quantity * current_price computed fresh on load.
         return cls(
             symbol=data["symbol"],
             quantity=data.get("quantity", 0),
             cost_basis=data.get("cost_basis", 0.0),
             current_price=data.get("current_price", 0.0),
-            market_value=data.get("market_value", 0.0),
         )
 
 
