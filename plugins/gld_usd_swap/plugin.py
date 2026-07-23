@@ -66,6 +66,55 @@ Default parameters (tunable at runtime):
   vol_window             = 20    rolling window for derivative estimation
   derivative_percentile  = 50    p50 of recent |Δclose| sets slope limit
   allocation_dollars     = 10 000 USD
+
+─────────────────────────────────────────────────────────────────────────────
+RESET-CADENCE OVERLAY (opt-in, disabled by default)
+
+Backtested in volomom/backtest_reset_cadence_short.py: a walk-forward
+kill-switch on the strategy's OWN trailing performance. Each trading day at
+the close, if the strategy's realized daily-NAV return over the trailing
+`reset_lookback_days` compounds below `reset_threshold`, the strategy is
+judged in a real drawdown and pauses for `reset_cooldown_days` trading days.
+During the pause, the overnight leg is INVERTED — short GLD overnight
+instead of long — while the intraday leg stays flat regardless of regime
+(the "short overnight only" variant: best drawdown control of the four
+short/cash variants tested, and the most literal reading of "invert the
+hold", since the overnight leg is the only unconditional position the base
+strategy ever takes).
+
+This requires a fresh short-open at every paused close and a fresh cover at
+every paused open (not a single continuous short across the cooldown),
+since staying flat intraday is exactly the point. Real IBKR GLD borrow
+fees are immaterial at that cadence (backtest_reset_cadence_borrow_fee.py:
+~0.01 Sharpe impact), but per-order COMMISSION is not: cash-during-pause
+needs only ~2 orders total per triggered window, while this variant needs
+two orders every paused day (cover + re-short), and IBKR's GLD commission
+($0.0035/share, $1.00/order minimum) hits the $1 floor on every single one
+of them at this position size — 830 orders / $830 total over the 2012-2026
+backtest (backtest_reset_cadence_commission.py). Net of that cost,
+full-history Sharpe drops from 1.47 to 1.32 — barely ahead of just sitting
+in cash (1.30), where before commissions were modeled it looked like a
+clear win. Worse, the cost concentrates specifically in bear markets, not
+uniformly across time: 25.2% of days are paused within 2012-2016 alone
+vs. 11.6% over the full history, since the trigger is by construction
+responding to the drawdown that defines that window — and against that
+window's thin gross edge (+0.9%), the fixed per-order cost alone drags it
+to -4.8%. Worth reconfirming actual paper/live fill commissions before
+trusting this variant's edge over plain cash-during-pause.
+
+Locked-in default combo from an 80-combo sweep (sweep_reset_cadence_short.py):
+  reset_lookback_days = 42, reset_cooldown_days = 126, reset_threshold = -8%
+  -> full-history Sharpe 0.80->1.44 gross, 1.32 net of commission
+  -> 2012-2016 loss -33.5%->-0.3% gross, -5.9% net of commission
+
+Position sign convention: HoldingPosition.quantity is a plain signed float
+with no non-negative guard in add_position() (remove_position() is the only
+method that rejects going negative, and it's simply not used for the short
+leg) — so going short is just add_position("GLD", -shares, ...), and NAV
+(cash + quantity*price) nets out correctly for a short with zero special
+casing. A single sell order sized as (current long shares + target short
+shares) correctly crosses through zero in one fill when the pause triggers
+while still holding long.
 """
 
 import bisect
@@ -283,6 +332,12 @@ class GldUsdSwapPlugin(PluginBase):
         self.derivative_percentile: int   = 50
         self.allocation_dollars:    float = 10_000.0
 
+        # --- reset-cadence overlay (opt-in; see module docstring) ---
+        self.reset_cadence_enabled: bool  = False
+        self.reset_lookback_days:   int   = 42
+        self.reset_cooldown_days:   int   = 126
+        self.reset_threshold:       float = -0.08
+
         # --- per-instrument signal state ---
         self._uup  = _InstrumentState(_INIT_DERIV_UUP)
         self._tlt  = _InstrumentState(_INIT_DERIV_TLT)
@@ -301,6 +356,12 @@ class GldUsdSwapPlugin(PluginBase):
         # --- session / position state ---
         self._gld_price:    float = 0.0
         self._holding_gld:  bool  = False
+
+        # --- reset-cadence overlay state ---
+        self._short_gld:                 bool          = False
+        self._reset_cooldown_remaining:  int           = 0
+        self._daily_returns:             deque         = deque(maxlen=self.reset_lookback_days)
+        self._prior_nav:                 Optional[float] = None
 
         # --- live-bar gating (hazard: backfill replay must not fire orders) ---
         # Session events fire only for bars delivered through the live-update
@@ -361,6 +422,15 @@ class GldUsdSwapPlugin(PluginBase):
             self.vol_window              = saved.get("vol_window",              self.vol_window)
             self.derivative_percentile   = saved.get("derivative_percentile",   self.derivative_percentile)
             self.allocation_dollars      = saved.get("allocation_dollars",      self.allocation_dollars)
+            self.reset_cadence_enabled   = saved.get("reset_cadence_enabled",   self.reset_cadence_enabled)
+            self.reset_lookback_days     = saved.get("reset_lookback_days",     self.reset_lookback_days)
+            self.reset_cooldown_days     = saved.get("reset_cooldown_days",     self.reset_cooldown_days)
+            self.reset_threshold         = saved.get("reset_threshold",         self.reset_threshold)
+            self._short_gld              = saved.get("short_gld",               False)
+            self._reset_cooldown_remaining = saved.get("reset_cooldown_remaining", 0)
+            self._daily_returns          = deque(saved.get("daily_returns", []),
+                                                  maxlen=self.reset_lookback_days)
+            self._prior_nav              = saved.get("prior_nav")
             self._uup.restore(saved.get("uup",  {}), _INIT_DERIV_UUP)
             self._tlt.restore(saved.get("tlt",  {}), _INIT_DERIV_TLT)
             self._rinf.restore(saved.get("rinf", {}), _INIT_DERIV_RINF)
@@ -416,6 +486,17 @@ class GldUsdSwapPlugin(PluginBase):
                 # trigger a duplicate overnight buy at the next close.
                 logger.info("Reconcile: no GLD in portfolio → holding_gld=False")
                 self._holding_gld = False
+
+            # Signed reconciliation for the reset-cadence short leg — the plain
+            # _current_gld_shares() clamps negative to zero, which would hide
+            # an actual short position instead of detecting it.
+            actual_signed = self._current_gld_shares_signed()
+            if actual_signed < 0 and not self._short_gld:
+                logger.info(f"Reconcile: found {actual_signed:.0f} GLD shares (short) → short_gld=True")
+                self._short_gld = True
+            elif actual_signed == 0 and self._short_gld:
+                logger.info("Reconcile: no short GLD in portfolio → short_gld=False")
+                self._short_gld = False
 
         self._warm_up_from_history()
         self._start_subscriptions()
@@ -517,6 +598,14 @@ class GldUsdSwapPlugin(PluginBase):
             "vol_window":            self.vol_window,
             "derivative_percentile": self.derivative_percentile,
             "allocation_dollars":    self.allocation_dollars,
+            "reset_cadence_enabled": self.reset_cadence_enabled,
+            "reset_lookback_days":   self.reset_lookback_days,
+            "reset_cooldown_days":   self.reset_cooldown_days,
+            "reset_threshold":       self.reset_threshold,
+            "short_gld":             self._short_gld,
+            "reset_cooldown_remaining": self._reset_cooldown_remaining,
+            "daily_returns":         list(self._daily_returns),
+            "prior_nav":             self._prior_nav,
             "uup":                   self._uup.save(),
             "tlt":                   self._tlt.save(),
             "rinf":                  self._rinf.save(),
@@ -808,10 +897,41 @@ class GldUsdSwapPlugin(PluginBase):
     def _on_market_open(self, ts: datetime) -> None:
         """
         09:30 — overnight position matures.
-        Sell if prior-close regime was cash; hold through day if gold.
+        Normal: sell if prior-close regime was cash; hold through day if gold.
+        Reset-cadence pause: cover the overnight short regardless of regime;
+        stay flat intraday (see module docstring).
         """
         if self._open_fired_date == ts.date():
             return   # already decided this session (guard against repeated bars)
+
+        if self.reset_cadence_enabled and self._reset_cooldown_remaining > 0:
+            self._open_fired_date = ts.date()
+            if self._short_gld:
+                qty = -self._current_gld_shares_signed()   # positive shares to buy back
+                if qty > 0:
+                    self._place_cover_buy(
+                        int(qty),
+                        reason=(
+                            f"Open {ts.date()}: reset-cadence pause "
+                            f"({self._reset_cooldown_remaining}d remaining) — "
+                            f"MKT cover short, sit out intraday"
+                        ),
+                    )
+                else:
+                    logger.warning(
+                        f"Open {ts.date()}: reset-cadence pause active but plugin "
+                        f"holds no short GLD to cover (short_gld flag was "
+                        f"{self._short_gld})"
+                    )
+            self._reset_cooldown_remaining = max(0, self._reset_cooldown_remaining - 1)
+            if self._reset_cooldown_remaining == 0:
+                logger.info(
+                    f"Open {ts.date()}: reset-cadence pause ended — "
+                    f"resuming normal long/cash operation"
+                )
+            self._save_state()
+            return
+
         if not self._holding_gld:
             return
         self._open_fired_date = ts.date()
@@ -848,13 +968,45 @@ class GldUsdSwapPlugin(PluginBase):
         """
         15:45 bar (completes ~15:50) — inside NYSE ARCA MOC submission cutoff.
         Save current composite regime for tomorrow's open decision.
-        Place MOC order to buy GLD overnight if not already long.
+        Normal: place MOC order to buy GLD overnight if not already long.
+        Reset-cadence: evaluate the trigger on today's realized NAV return,
+        then either enter/continue the short-overnight pause or buy long as
+        usual (see module docstring).
         """
         if self._close_fired_date == ts.date():
             return   # already decided this session (guard against repeated bars)
         self._close_fired_date = ts.date()
 
         self._regime_at_prior_close = self._regime
+
+        if self.reset_cadence_enabled:
+            self._update_reset_cadence()
+
+        if self.reset_cadence_enabled and self._reset_cooldown_remaining > 0:
+            # Paused: short overnight instead of buying long. Sized as any
+            # existing long shares (first pause evening only — every other
+            # evening this is already flat from that morning's cover) plus
+            # the short target; one order correctly crosses through zero in
+            # a single fill (see _apply_signed_fill_to_holdings).
+            target_short = int(self.allocation_dollars / self._gld_price) if self._gld_price > 0 else 0
+            current_signed = self._current_gld_shares_signed()
+            sell_qty = max(0, int(current_signed)) + target_short
+            if sell_qty > 0:
+                self._place_moc_short(
+                    sell_qty,
+                    reason=(
+                        f"Close {ts.date()}: reset-cadence pause "
+                        f"({self._reset_cooldown_remaining}d remaining) — "
+                        f"MOC short overnight entry"
+                    ),
+                )
+            elif self.portfolio and self._gld_price > 0:
+                logger.error(
+                    f"Close {ts.date()}: reset-cadence short skipped — "
+                    f"computed 0 shares at ${self._gld_price:.2f}"
+                )
+            self._save_state()
+            return
 
         if not self._holding_gld:
             budget = self.allocation_dollars
@@ -970,6 +1122,90 @@ class GldUsdSwapPlugin(PluginBase):
         else:
             logger.error(f"Failed to place MKT SELL {qty} GLD — {reason}")
 
+    def _place_moc_short(self, shares: int, reason: str) -> None:
+        """Reset-cadence pause: sell to open (or extend into) a short
+        position at the closing auction. shares may include both closing an
+        existing long and continuing into the short target in one order —
+        _apply_signed_fill_to_holdings handles that crossing-through-zero
+        correctly on fill, so this is just a SELL like _emit_sell, tagged
+        differently so on_order_fill knows to set _short_gld."""
+        self._trade_count    += 1
+        self._last_trade_time = datetime.now(timezone.utc).isoformat()
+
+        self.publish(
+            "gld_usd_swap_signals",
+            {
+                "timestamp":  self._last_trade_time,
+                "action":     "SELL",
+                "order_type": "MOC",
+                "quantity":   shares,
+                "gld_price":  self._gld_price,
+                "factors":    self._last_factors,
+                "reason":     reason,
+            },
+            message_type="signal",
+        )
+
+        if not self.portfolio:
+            logger.info(f"[no portfolio] MOC SHORT SELL {shares} GLD — {reason}")
+            return
+
+        contract               = ContractBuilder.etf("GLD")
+        order                  = IbOrder()
+        order.action           = "SELL"
+        order.totalQuantity    = shares
+        order.orderType        = "MOC"
+        order.transmit         = True
+
+        oid = self.portfolio.place_order_custom(contract, order)
+        if oid is not None:
+            self._pending_order_actions[oid] = "SHORT_OPEN"
+            self._pending_order_placed_at[oid] = time.time()
+            self.register_order(oid)
+            logger.info(f"MOC SHORT SELL {shares} GLD (order_id={oid}) — {reason}")
+        else:
+            logger.error(f"Failed to place MOC SHORT SELL {shares} GLD — {reason}")
+
+    def _place_cover_buy(self, shares: int, reason: str) -> None:
+        """Reset-cadence pause: buy to cover the overnight short at the
+        market open, going flat for the intraday session."""
+        self._trade_count    += 1
+        self._last_trade_time = datetime.now(timezone.utc).isoformat()
+
+        self.publish(
+            "gld_usd_swap_signals",
+            {
+                "timestamp":  self._last_trade_time,
+                "action":     "BUY",
+                "order_type": "MKT",
+                "quantity":   shares,
+                "gld_price":  self._gld_price,
+                "factors":    self._last_factors,
+                "reason":     reason,
+            },
+            message_type="signal",
+        )
+
+        if not self.portfolio:
+            logger.info(f"[no portfolio] MKT COVER BUY {shares} GLD — {reason}")
+            return
+
+        contract            = ContractBuilder.etf("GLD")
+        order               = IbOrder()
+        order.action        = "BUY"
+        order.totalQuantity = shares
+        order.orderType     = "MKT"
+        order.transmit      = True
+
+        oid = self.portfolio.place_order_custom(contract, order)
+        if oid is not None:
+            self._pending_order_actions[oid] = "SHORT_COVER"
+            self._pending_order_placed_at[oid] = time.time()
+            self.register_order(oid)
+            logger.info(f"MKT COVER BUY {shares} GLD (order_id={oid}) — {reason}")
+        else:
+            logger.error(f"Failed to place MKT COVER BUY {shares} GLD — {reason}")
+
     def _alert(self, kind: str, message: str, **data) -> None:
         """Log at ERROR and publish to the 'alerts' channel.
 
@@ -1014,12 +1250,92 @@ class GldUsdSwapPlugin(PluginBase):
         """GLD shares in THIS plugin's holdings (its allocated slice) — not the
         account-wide GLD position. Reading portfolio.positions here would let the
         plugin sell GLD held by other plugins or unrelated account activity
-        (hazard #2); scope strictly to the plugin's own holdings instead."""
+        (hazard #2); scope strictly to the plugin's own holdings instead.
+
+        Clamped to >= 0: only ever used by the long-side flow, where a
+        negative reading would mean something is already wrong. Use
+        _current_gld_shares_signed() for anything that needs to see a short."""
         if self.holdings:
             pos = self.holdings.get_position("GLD")
             if pos:
                 return max(0, int(pos.quantity))
         return 0
+
+    def _current_gld_shares_signed(self) -> float:
+        """Signed GLD share count in this plugin's holdings — negative means
+        short. HoldingPosition.quantity has no non-negative guard (that guard
+        lives only in remove_position(), which the short leg doesn't use), so
+        this is a plain read, not a special short-aware accessor."""
+        if self.holdings:
+            pos = self.holdings.get_position("GLD")
+            if pos:
+                return pos.quantity
+        return 0.0
+
+    def _current_nav(self) -> float:
+        """Mark-to-market NAV: cash + signed shares * current price.
+
+        Deliberately not holdings.total_value — that property sums
+        HoldingPosition.market_value, which add_position() never sets (it
+        stays at its dataclass default of 0.0 after every fill), so it
+        under-reports NAV by the entire position's worth. Computing it
+        directly here is sign-agnostic: a short's mark-to-market P&L falls
+        out correctly (price up -> position value more negative -> NAV
+        down) with no special-casing.
+        """
+        if not self.holdings:
+            return 0.0
+        return self.holdings.current_cash + self._current_gld_shares_signed() * self._gld_price
+
+    def _update_reset_cadence(self) -> None:
+        """Track daily NAV return and evaluate the reset-cadence trigger.
+
+        Only accumulates/evaluates while NOT already paused (mirrors
+        apply_reset_cadence in volomom: paused days are `continue`d without
+        touching the trailing window at all, so the window doesn't fill with
+        paused-period returns and a fresh window builds once normal
+        operation resumes). _prior_nav still updates unconditionally so the
+        first post-pause day computes a real return instead of comparing
+        against a stale pre-pause NAV.
+        """
+        nav = self._current_nav()
+        if (self._prior_nav is not None and self._prior_nav > 0
+                and self._reset_cooldown_remaining == 0):
+            daily_ret = nav / self._prior_nav - 1.0
+            self._daily_returns.append(daily_ret)
+            if len(self._daily_returns) == self.reset_lookback_days:
+                trailing = 1.0
+                for r in self._daily_returns:
+                    trailing *= (1 + r)
+                trailing -= 1.0
+                if trailing < self.reset_threshold:
+                    self._reset_cooldown_remaining = self.reset_cooldown_days
+                    self._daily_returns.clear()
+                    self._alert(
+                        "reset_cadence_triggered",
+                        f"Trailing {self.reset_lookback_days}d return {trailing:+.1%} "
+                        f"below threshold {self.reset_threshold:+.1%} — entering "
+                        f"{self.reset_cooldown_days}-trading-day short-overnight pause",
+                        trailing_return=trailing, threshold=self.reset_threshold,
+                    )
+        self._prior_nav = nav
+
+    def _apply_signed_fill_to_holdings(self, signed_qty: float, price: float) -> None:
+        """Apply a fill's signed share delta to holdings — positive for a
+        buy, negative for a sell — regardless of whether the resulting
+        position ends up long, short, or flat.
+
+        add_position() has no non-negative guard (unlike remove_position(),
+        which isn't used here), so a single call handles every transition:
+        opening a short, covering one, or a combined sell that closes an
+        existing long and continues into a new short in one fill.
+        """
+        if not self.holdings or signed_qty == 0:
+            return
+        px = price if price > 0 else self._gld_price
+        self.holdings.add_position("GLD", signed_qty, cost_basis=px, current_price=px)
+        self.holdings.add_cash(-signed_qty * price)
+        self.save_holdings()
 
     # =========================================================================
     # SIGNALS
@@ -1049,6 +1365,22 @@ class GldUsdSwapPlugin(PluginBase):
             self._holding_gld = False
             self._apply_fill_to_holdings("SELL", qty, price)
             logger.info(f"MKT SELL filled: {qty:.0f} GLD @ ${price:.2f}")
+        elif action in ("SHORT_OPEN", "SHORT_COVER"):
+            # Signed delta, not a fixed direction: a SHORT_OPEN sell may
+            # cross through zero in one fill if it was also closing an
+            # existing long (see _place_moc_short), so the resulting flags
+            # are read back from the position after the fill lands rather
+            # than assumed from the action tag.
+            signed_qty = -qty if action == "SHORT_OPEN" else qty
+            self._apply_signed_fill_to_holdings(signed_qty, price)
+            resulting = self._current_gld_shares_signed()
+            self._holding_gld = resulting > 0
+            self._short_gld   = resulting < 0
+            verb = "SHORT SELL" if action == "SHORT_OPEN" else "COVER BUY"
+            logger.info(
+                f"{verb} filled: {qty:.0f} GLD @ ${price:.2f} "
+                f"(resulting position: {resulting:+.0f})"
+            )
         if action:
             self._save_state()
 
@@ -1141,6 +1473,11 @@ class GldUsdSwapPlugin(PluginBase):
                     "overnight_holds":       self._overnight_holds,
                     "intraday_holds":        self._intraday_holds,
                     "last_trade_time":       self._last_trade_time,
+                    "reset_cadence_enabled": self.reset_cadence_enabled,
+                    "short_gld":             self._short_gld,
+                    "reset_cooldown_remaining": self._reset_cooldown_remaining,
+                    "daily_returns_tracked": len(self._daily_returns),
+                    "current_nav":           round(self._current_nav(), 2),
                 },
             }
 
@@ -1155,6 +1492,10 @@ class GldUsdSwapPlugin(PluginBase):
                     "vol_window":            self.vol_window,
                     "derivative_percentile": self.derivative_percentile,
                     "allocation_dollars":    self.allocation_dollars,
+                    "reset_cadence_enabled": self.reset_cadence_enabled,
+                    "reset_lookback_days":   self.reset_lookback_days,
+                    "reset_cooldown_days":   self.reset_cooldown_days,
+                    "reset_threshold":       self.reset_threshold,
                 },
             }
 
@@ -1201,6 +1542,19 @@ class GldUsdSwapPlugin(PluginBase):
                 self.derivative_percentile = max(1, min(99, int(value)))
             elif key == "allocation_dollars":
                 self.allocation_dollars = max(0.0, float(value))
+            elif key == "reset_cadence_enabled":
+                self.reset_cadence_enabled = bool(value)
+            elif key == "reset_lookback_days":
+                v = max(1, int(value))
+                self.reset_lookback_days = v
+                self._daily_returns = deque(list(self._daily_returns), maxlen=v)
+            elif key == "reset_cooldown_days":
+                self.reset_cooldown_days = max(1, int(value))
+            elif key == "reset_threshold":
+                v = float(value)
+                if v >= 0:
+                    return {"success": False, "message": "reset_threshold must be negative (a drawdown)"}
+                self.reset_threshold = v
             else:
                 return {"success": False, "message": f"Unknown parameter: {key}"}
         except (TypeError, ValueError) as exc:
@@ -1220,6 +1574,10 @@ class GldUsdSwapPlugin(PluginBase):
             "  plugin request gld_usd_swap set_parameter '{\"key\": \"vol_window\",            \"value\": 20}'\n"
             "  plugin request gld_usd_swap set_parameter '{\"key\": \"derivative_percentile\", \"value\": 50}'\n"
             "  plugin request gld_usd_swap set_parameter '{\"key\": \"allocation_dollars\",    \"value\": 10000}'\n"
+            "  plugin request gld_usd_swap set_parameter '{\"key\": \"reset_cadence_enabled\", \"value\": true}'\n"
+            "  plugin request gld_usd_swap set_parameter '{\"key\": \"reset_lookback_days\",   \"value\": 42}'\n"
+            "  plugin request gld_usd_swap set_parameter '{\"key\": \"reset_cooldown_days\",   \"value\": 126}'\n"
+            "  plugin request gld_usd_swap set_parameter '{\"key\": \"reset_threshold\",       \"value\": -0.08}'\n"
             "  plugin request gld_usd_swap force_regime '{\"regime\": \"gold\"}'\n"
             "  plugin request gld_usd_swap force_regime '{\"regime\": \"cash\"}'\n"
         )

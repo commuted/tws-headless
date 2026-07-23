@@ -780,3 +780,343 @@ class TestAlerting:
 
         kinds = [m.payload["kind"] for m in received]
         assert kinds == ["order_terminal"]
+
+
+# ---------------------------------------------------------------------------
+# Reset-cadence overlay — trigger detection
+# ---------------------------------------------------------------------------
+
+class TestResetCadenceTrigger:
+    def _loaded(self, tmp_path, **kw):
+        plugin = _make_plugin(tmp_path, **kw)
+        plugin.load()
+        plugin.reset_cadence_enabled = True
+        plugin.reset_lookback_days = 5
+        plugin.reset_cooldown_days = 3
+        plugin.reset_threshold = -0.08
+        return plugin
+
+    def test_no_trigger_before_window_full(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.holdings.add_cash(1000.0)
+        plugin._gld_price = 100.0
+        for _ in range(4):   # first call only seeds _prior_nav (no return yet);
+            plugin._update_reset_cadence()   # 3 more append, still < lookback_days=5
+        assert plugin._reset_cooldown_remaining == 0
+        assert len(plugin._daily_returns) == 3
+
+    def test_trigger_fires_on_sustained_drawdown(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.holdings.add_cash(1000.0)
+        plugin._gld_price = 100.0
+        plugin._update_reset_cadence()   # seeds _prior_nav, no return yet
+        for _ in range(5):
+            plugin.holdings.add_cash(-30.0)   # steady erosion each "day"
+            plugin._update_reset_cadence()
+        assert plugin._reset_cooldown_remaining == plugin.reset_cooldown_days
+        assert len(plugin._daily_returns) == 0   # cleared on trigger
+
+    def test_no_trigger_on_small_loss(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.holdings.add_cash(1000.0)
+        plugin._gld_price = 100.0
+        plugin._update_reset_cadence()
+        for _ in range(5):
+            plugin.holdings.add_cash(-1.0)   # trivial daily loss
+            plugin._update_reset_cadence()
+        assert plugin._reset_cooldown_remaining == 0
+
+    def test_window_frozen_while_paused(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.holdings.add_cash(1000.0)
+        plugin._gld_price = 100.0
+        plugin._reset_cooldown_remaining = 2   # already paused
+        for _ in range(4):
+            plugin.holdings.add_cash(-30.0)
+            plugin._update_reset_cadence()
+        assert len(plugin._daily_returns) == 0   # never accumulates while paused
+
+    def test_trigger_publishes_alert(self, tmp_path):
+        from ib.message_bus import MessageBus
+
+        bus = MessageBus()
+        received = []
+        bus.subscribe("alerts", received.append, subscriber="test")
+        plugin = _make_plugin(tmp_path, message_bus=bus)
+        plugin.load()
+        plugin.reset_cadence_enabled = True
+        plugin.reset_lookback_days = 3
+        plugin.reset_cooldown_days = 10
+        plugin.reset_threshold = -0.08
+        plugin.holdings.add_cash(1000.0)
+        plugin._gld_price = 100.0
+        plugin._update_reset_cadence()
+        for _ in range(3):
+            plugin.holdings.add_cash(-30.0)
+            plugin._update_reset_cadence()
+
+        kinds = [m.payload["kind"] for m in received]
+        assert kinds == ["reset_cadence_triggered"]
+
+
+# ---------------------------------------------------------------------------
+# Reset-cadence overlay — session-decision branching
+# ---------------------------------------------------------------------------
+
+class TestResetCadenceSessionFlow:
+    def _loaded(self, tmp_path, **kw):
+        plugin = _make_plugin(tmp_path, **kw)
+        plugin.load()
+        plugin.reset_cadence_enabled = True
+        plugin._gld_price = 100.0
+        plugin.allocation_dollars = 1000.0   # -> 10 target shares at $100
+        return plugin
+
+    def test_close_shorts_instead_of_buying_when_paused(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin._reset_cooldown_remaining = 5
+        shorts = []
+        plugin._place_moc_short = lambda shares, reason: shorts.append(shares)
+        buys = []
+        plugin._place_moc_buy = lambda shares, reason: buys.append(shares)
+
+        plugin._on_market_close(datetime(2026, 5, 15, 15, 45))
+
+        assert shorts == [10]
+        assert buys == []
+
+    def test_close_short_qty_includes_existing_long(self, tmp_path):
+        """First pause evening: still holding long from before the trigger —
+        one order must close the long AND continue into the short target."""
+        plugin = self._loaded(tmp_path)
+        plugin.holdings.add_position("GLD", 7, 100.0)   # existing long
+        plugin._reset_cooldown_remaining = 5
+        shorts = []
+        plugin._place_moc_short = lambda shares, reason: shorts.append(shares)
+
+        plugin._on_market_close(datetime(2026, 5, 15, 15, 45))
+
+        assert shorts == [7 + 10]
+
+    def test_close_evaluates_trigger_before_deciding(self, tmp_path):
+        """A trigger firing on THIS close must be actionable the same evening
+        — no one-day lag."""
+        plugin = self._loaded(tmp_path)
+        plugin.reset_lookback_days = 2
+        plugin.reset_cooldown_days = 10
+        plugin.reset_threshold = -0.08
+        plugin.holdings.add_cash(1000.0)
+        plugin._prior_nav = 1000.0
+        plugin._daily_returns.extend([-0.20])   # one more bad day tips it over
+
+        shorts = []
+        plugin._place_moc_short = lambda shares, reason: shorts.append(shares)
+        plugin.holdings.add_cash(-200.0)   # this evening's own drawdown
+        plugin._on_market_close(datetime(2026, 5, 15, 15, 45))
+
+        assert plugin._reset_cooldown_remaining == 10
+        assert shorts == [10]
+
+    def test_open_covers_short_and_decrements_cooldown(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.holdings.add_position("GLD", -10, 100.0)   # currently short
+        plugin._short_gld = True
+        plugin._reset_cooldown_remaining = 5
+        covers = []
+        plugin._place_cover_buy = lambda shares, reason: covers.append(shares)
+
+        plugin._on_market_open(datetime(2026, 5, 15, 9, 30))
+
+        assert covers == [10]
+        assert plugin._reset_cooldown_remaining == 4
+
+    def test_open_skips_cover_when_not_short(self, tmp_path):
+        """Cooldown ticking down with nothing to cover (e.g. a prior cover
+        already landed) must not error or place a spurious order."""
+        plugin = self._loaded(tmp_path)
+        plugin._short_gld = False
+        plugin._reset_cooldown_remaining = 2
+        covers = []
+        plugin._place_cover_buy = lambda shares, reason: covers.append(shares)
+
+        plugin._on_market_open(datetime(2026, 5, 15, 9, 30))
+
+        assert covers == []
+        assert plugin._reset_cooldown_remaining == 1
+
+    def test_pause_ends_when_cooldown_reaches_zero(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.holdings.add_position("GLD", -10, 100.0)
+        plugin._short_gld = True
+        plugin._reset_cooldown_remaining = 1
+        plugin._place_cover_buy = lambda shares, reason: None
+
+        plugin._on_market_open(datetime(2026, 5, 15, 9, 30))
+        assert plugin._reset_cooldown_remaining == 0
+
+        # Next close should now take the NORMAL path, not the short path.
+        buys = []
+        plugin._place_moc_buy = lambda shares, reason: buys.append(shares)
+        plugin._holding_gld = False
+        plugin._on_market_close(datetime(2026, 5, 15, 15, 45))
+        assert buys == [10]
+
+    def test_disabled_by_default_uses_normal_flow(self, tmp_path):
+        """reset_cadence_enabled defaults False — behavior must be identical
+        to the pre-existing long-only flow with no code path changes. No
+        portfolio here, so budget isn't cash-clamped (matches pre-existing
+        behavior — see test_close_buy_bounded_by_plugin_cash for the
+        with-portfolio case): allocation_dollars=10,000 / $100 = 100 shares."""
+        plugin = _make_plugin(tmp_path)
+        plugin.load()
+        assert plugin.reset_cadence_enabled is False
+        plugin._gld_price = 100.0
+        plugin.holdings.add_cash(1000.0)
+        plugin._holding_gld = False
+        buys = []
+        plugin._place_moc_buy = lambda shares, reason: buys.append(shares)
+
+        plugin._on_market_close(datetime(2026, 5, 15, 15, 45))
+
+        assert buys == [100]
+        assert plugin._reset_cooldown_remaining == 0
+
+
+# ---------------------------------------------------------------------------
+# Reset-cadence overlay — fills apply signed deltas correctly
+# ---------------------------------------------------------------------------
+
+class TestResetCadenceFills:
+    def _loaded(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin.load()
+        return plugin
+
+    def _fill(self, order_id, qty, price):
+        return Mock(order_id=order_id, filled_quantity=qty, avg_fill_price=price)
+
+    def test_short_open_from_flat(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin._pending_order_actions[1] = "SHORT_OPEN"
+
+        plugin.on_order_fill(self._fill(1, 10, 100.0))
+
+        pos = plugin.holdings.get_position("GLD")
+        assert pos is not None and pos.quantity == -10
+        assert plugin.holdings.current_cash == pytest.approx(1000.0)   # sale proceeds
+        assert plugin._short_gld is True
+        assert plugin._holding_gld is False
+
+    def test_short_cover_back_to_flat(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.holdings.add_position("GLD", -10, 100.0)
+        plugin.holdings.add_cash(1000.0)   # proceeds from the original short
+        plugin._short_gld = True
+        plugin._pending_order_actions[2] = "SHORT_COVER"
+
+        plugin.on_order_fill(self._fill(2, 10, 95.0))   # covered cheaper -> profit
+
+        pos = plugin.holdings.get_position("GLD")
+        assert pos is None or pos.quantity == 0
+        assert plugin.holdings.current_cash == pytest.approx(1000.0 - 10 * 95.0)
+        assert plugin._short_gld is False
+        assert plugin._holding_gld is False
+
+    def test_short_open_crosses_through_existing_long(self, tmp_path):
+        """The combined sell (close long + open short) must land on exactly
+        the right signed quantity from a single fill."""
+        plugin = self._loaded(tmp_path)
+        plugin.holdings.add_position("GLD", 7, 90.0)   # existing long
+        plugin._holding_gld = True
+        plugin._pending_order_actions[3] = "SHORT_OPEN"
+
+        plugin.on_order_fill(self._fill(3, 17, 100.0))   # 7 (close) + 10 (open short)
+
+        pos = plugin.holdings.get_position("GLD")
+        assert pos is not None and pos.quantity == -10
+        assert plugin._short_gld is True
+        assert plugin._holding_gld is False
+
+
+# ---------------------------------------------------------------------------
+# Reset-cadence overlay — reconciliation and state persistence
+# ---------------------------------------------------------------------------
+
+class TestResetCadenceReconciliation:
+    def test_reconcile_detects_existing_short(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin.load()
+        plugin.holdings.add_position("GLD", -10, 100.0)
+        plugin.portfolio = Mock(positions=[])
+        plugin.get_bars_cached = Mock(return_value=[])   # skip real history fetch
+
+        plugin.start()
+
+        assert plugin._short_gld is True
+
+    def test_reconcile_clears_short_flag_when_flat(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin.load()
+        plugin._short_gld = True   # stale flag, no actual position
+        plugin.portfolio = Mock(positions=[])
+        plugin.get_bars_cached = Mock(return_value=[])   # skip real history fetch
+
+        plugin.start()
+
+        assert plugin._short_gld is False
+
+
+class TestResetCadenceStatePersistence:
+    def test_state_round_trips_through_stop_start(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin.start()
+        plugin.reset_cadence_enabled = True
+        plugin.reset_lookback_days = 30
+        plugin.reset_cooldown_days = 90
+        plugin.reset_threshold = -0.10
+        plugin._short_gld = True
+        plugin._reset_cooldown_remaining = 42
+        plugin._daily_returns.extend([0.01, -0.02, 0.005])
+        plugin._prior_nav = 12345.6
+        plugin.stop()
+
+        plugin2 = _make_plugin(tmp_path)
+        plugin2.start()
+        assert plugin2.reset_cadence_enabled is True
+        assert plugin2.reset_lookback_days == 30
+        assert plugin2.reset_cooldown_days == 90
+        assert plugin2.reset_threshold == -0.10
+        assert plugin2._short_gld is True
+        assert plugin2._reset_cooldown_remaining == 42
+        assert list(plugin2._daily_returns) == [0.01, -0.02, 0.005]
+        assert plugin2._prior_nav == 12345.6
+
+
+class TestResetCadenceParameters:
+    def test_get_parameters_includes_reset_cadence(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        result = plugin.handle_request("get_parameters", {})
+        data = result["data"]
+        assert data["reset_cadence_enabled"] is False
+        assert data["reset_lookback_days"] == 42
+        assert data["reset_cooldown_days"] == 126
+        assert data["reset_threshold"] == -0.08
+
+    def test_set_reset_cadence_enabled(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        result = plugin._set_parameter("reset_cadence_enabled", True)
+        assert result["success"] is True
+        assert plugin.reset_cadence_enabled is True
+
+    def test_set_reset_threshold_rejects_positive(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        result = plugin._set_parameter("reset_threshold", 0.05)
+        assert result["success"] is False
+
+    def test_set_reset_lookback_days_resizes_window(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin._daily_returns.extend([0.01] * 42)
+        result = plugin._set_parameter("reset_lookback_days", 5)
+        assert result["success"] is True
+        assert plugin._daily_returns.maxlen == 5
+        assert len(plugin._daily_returns) == 5
