@@ -8,6 +8,7 @@ from Interactive Brokers. Supports both snapshot and streaming market data.
 import asyncio
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
@@ -38,6 +39,15 @@ from .execution_db import (
     get_execution_db,
 )
 logger = logging.getLogger(__name__)
+
+
+# IB error codes that are purely advisory notices about an order preset/
+# parameter, not a rejection — a whatIf order can still receive a clean
+# openOrder response afterward. Confirmed live: 10349 ("Order TIF was set
+# to DAY based on order preset") fired on a whatIf SELL for an account
+# later confirmed permitted via openOrder in the same request — treating
+# it as terminal would have reported a false rejection.
+_WHATIF_ADVISORY_CODES = frozenset({10349})
 
 
 # Tick types we care about for price updates
@@ -186,6 +196,14 @@ class Portfolio(IBClient):
         self._orders: Dict[int, OrderRecord] = {}  # orderId -> OrderRecord
         self._pending_orders: Dict[int, asyncio.Event] = {}  # orderId -> completion event
         self._on_order_status: Optional[Callable[[OrderRecord], None]] = None
+
+        # whatIf order responses, keyed by orderId — separate from the single-
+        # slot self._callbacks["openOrder"]/error dispatch (unclaimed elsewhere
+        # in this codebase) so a whatIf probe never collides with it, and so
+        # concurrent whatIf calls from different callers never collide with
+        # each other. See check_short_selling_permitted().
+        self._whatif_open_order: Dict[int, Callable] = {}
+        self._whatif_error: Dict[int, Callable] = {}
 
         # When True, every order placement method (place_order, place_order_raw,
         # and therefore place_order_custom) logs and suppresses the order instead
@@ -1347,6 +1365,96 @@ class Portfolio(IBClient):
         order.orderId = order_id
         return order_id if self.place_order_raw(order_id, contract, order) else None
 
+    def check_short_selling_permitted(
+        self, contract: Contract, quantity: int, timeout: float = 15.0
+    ) -> Dict[str, Any]:
+        """
+        Test whether this account can sell short, via an IB whatIf order —
+        never places a real order (whatIf orders are pre-trade impact checks
+        only; IB never fills them). Cash accounts and IRAs cannot sell short
+        at all, and this is the reliable way to find out: account-summary
+        tags like AccountType describe legal structure (Individual, IRA,
+        etc.), not margin/shorting permissions directly.
+
+        Blocks the calling thread (same style as get_contract_details in
+        plugins/base.py) until IB responds or timeout elapses.
+
+        Returns a dict:
+            {"permitted": bool, "reject_reason": str, "raw": dict or None}
+
+        Conservative by design: anything other than a clean pre-trade impact
+        report (a populated rejectReason, an error() callback for this order,
+        a timeout, or dry_run mode where no order can be tested at all) comes
+        back permitted=False. The cost of wrongly assuming shorting works is
+        a rejected real order at the worst possible moment — see
+        gld_usd_swap's reset-cadence overlay, which calls this before ever
+        attempting to short live.
+        """
+        if self.dry_run:
+            return {
+                "permitted": False,
+                "reject_reason": "dry_run mode — cannot test against IB",
+                "raw": None,
+            }
+        if not self.connected:
+            return {"permitted": False, "reject_reason": "not connected", "raw": None}
+
+        ids = self.allocate_order_ids(1)
+        if not ids:
+            return {"permitted": False, "reject_reason": "no order id available", "raw": None}
+        order_id = ids[0]
+
+        done = threading.Event()
+        result: Dict[str, Any] = {"permitted": False, "reject_reason": "", "raw": None}
+
+        def on_open_order(oid, c, o, order_state) -> None:
+            reject = getattr(order_state, "rejectReason", "") or ""
+            result["raw"] = {
+                "status": order_state.status,
+                "initMarginBefore": order_state.initMarginBefore,
+                "initMarginChange": order_state.initMarginChange,
+                "initMarginAfter": order_state.initMarginAfter,
+                "warningText": order_state.warningText,
+                "rejectReason": reject,
+            }
+            result["permitted"] = (
+                not reject and order_state.status not in ("Cancelled", "Inactive")
+            )
+            result["reject_reason"] = reject
+            done.set()
+
+        def on_error(oid, error_code, error_string) -> None:
+            result["permitted"] = False
+            result["reject_reason"] = f"IB error {error_code}: {error_string}"
+            done.set()
+
+        self._whatif_open_order[order_id] = on_open_order
+        self._whatif_error[order_id] = on_error
+
+        order = Order()
+        order.action = "SELL"
+        order.totalQuantity = quantity
+        order.orderType = "MOC"
+        order.whatIf = True
+        order.transmit = True
+        order.orderId = order_id
+
+        if not self.place_order_raw(order_id, contract, order):
+            self._whatif_open_order.pop(order_id, None)
+            self._whatif_error.pop(order_id, None)
+            return {"permitted": False, "reject_reason": "order submission failed", "raw": None}
+
+        if not done.wait(timeout=timeout):
+            self._whatif_open_order.pop(order_id, None)
+            self._whatif_error.pop(order_id, None)
+            return {
+                "permitted": False,
+                "reject_reason": f"timeout after {timeout}s waiting for IB response",
+                "raw": None,
+            }
+
+        return result
+
     async def wait_for_order(self, order_id: int, timeout: float = 30.0) -> Optional[OrderRecord]:
         """
         Wait for an order to complete (fill, cancel, or error).
@@ -1847,6 +1955,16 @@ class Portfolio(IBClient):
         # must release the waiting thread ourselves to avoid a 60-second hang.
         if errorCode in (162, 321, 354) and reqId in self._historical_requests:
             self.historicalDataEnd(reqId, "", "")
+        # A whatIf order rejected outright (e.g. short selling not permitted)
+        # arrives here instead of via openOrder — release the waiting caller
+        # with the rejection instead of letting it time out. Advisory codes
+        # (e.g. 10349, an order-preset notice) are not a rejection and can
+        # still be followed by a clean openOrder response, so they must not
+        # resolve or clear the pending whatIf callbacks.
+        if reqId in self._whatif_error and errorCode not in _WHATIF_ADVISORY_CODES:
+            whatif_cb = self._whatif_error.pop(reqId)
+            self._whatif_open_order.pop(reqId, None)
+            whatif_cb(reqId, errorCode, errorString)
 
     def historicalData(self, reqId: int, bar) -> None:
         """IB callback: one bar of historical data has arrived (backfill).
@@ -2224,6 +2342,12 @@ class Portfolio(IBClient):
     ):
         """Handle open order information"""
         logger.debug(f"Open order {orderId}: {order.action} {order.totalQuantity} {contract.symbol}")
+
+        whatif_cb = self._whatif_open_order.pop(orderId, None)
+        if whatif_cb:
+            self._whatif_error.pop(orderId, None)
+            whatif_cb(orderId, contract, order, orderState)
+            return
 
         if "openOrder" in self._callbacks:
             self._callbacks["openOrder"](orderId, contract, order, orderState)
