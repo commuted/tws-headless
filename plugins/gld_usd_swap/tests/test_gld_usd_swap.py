@@ -870,6 +870,7 @@ class TestResetCadenceSessionFlow:
         plugin.reset_cadence_enabled = True
         plugin._gld_price = 100.0
         plugin.allocation_dollars = 1000.0   # -> 10 target shares at $100
+        plugin._short_selling_permitted = True   # these tests exercise the short-GLD path
         return plugin
 
     def test_close_shorts_instead_of_buying_when_paused(self, tmp_path):
@@ -1120,3 +1121,374 @@ class TestResetCadenceParameters:
         assert result["success"] is True
         assert plugin._daily_returns.maxlen == 5
         assert len(plugin._daily_returns) == 5
+
+
+# ---------------------------------------------------------------------------
+# Reset-cadence overlay — shadow backfill from historical bars
+# ---------------------------------------------------------------------------
+
+def _make_day_bars(symbol, date_str, open_price, close_price, n_bars=76):
+    """76 5-min bars (09:30-15:45 RTH) for one trading day. Only the first
+    and last bar's prices are meaningful for the caller's purposes (day open
+    and day close); everything in between is linearly interpolated so the
+    signal state still receives plausible intermediate values."""
+    bars = []
+    hour, minute = 9, 30
+    for i in range(n_bars):
+        frac = i / (n_bars - 1)
+        price = open_price + (close_price - open_price) * frac
+        bars.append(Mock(date=f"{date_str} {hour:02d}:{minute:02d}:00",
+                         open=price, close=price))
+        minute += 5
+        if minute >= 60:
+            minute -= 60
+            hour += 1
+    return bars
+
+
+def _make_flat_days(symbol, dates, price):
+    """Multiple days, price never moves — keeps UUP/TLT/RINF SMAs exactly
+    flat so fast_sma == slow_sma, forcing a deterministic CASH regime
+    (uup_gold requires fast < slow, strictly)."""
+    bars = []
+    for d in dates:
+        bars.extend(_make_day_bars(symbol, d, price, price))
+    return bars
+
+
+class TestResetCadenceShadowBackfill:
+    DATES = ["20260501", "20260504", "20260505"]   # 3 trading days (Fri, Mon, Tue)
+
+    def _loaded(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin.load()
+        plugin.portfolio = Mock()   # truthy, so backfill doesn't early-return
+        plugin.reset_cadence_enabled = True
+        plugin.reset_lookback_days = 2
+        return plugin
+
+    def _stub_bars(self, plugin, gld_day_prices):
+        """gld_day_prices: list of (open, close) per day, same length as DATES.
+        UUP/TLT/RINF stay perfectly flat throughout -> deterministic CASH regime."""
+        gld_bars = []
+        for d, (o, c) in zip(self.DATES, gld_day_prices):
+            gld_bars.extend(_make_day_bars("GLD", d, o, c))
+        flat = _make_flat_days("UUP", self.DATES, 28.0)
+
+        def fake_get_bars_cached(contract, **kwargs):
+            symbol = contract.symbol
+            if symbol == "GLD":
+                return gld_bars
+            return flat   # same flat series reused for UUP/TLT/RINF
+
+        plugin.get_bars_cached = fake_get_bars_cached
+
+    def test_isolated_from_live_state(self, tmp_path):
+        """The shadow computation must not touch the live instance's own
+        signal/regime state at all — only _daily_returns and _prior_nav
+        (set by the caller, _maybe_backfill_reset_cadence) may change."""
+        plugin = self._loaded(tmp_path)
+        self._stub_bars(plugin, [(100.0, 100.0), (101.0, 102.0), (103.0, 104.0)])
+
+        uup_before  = plugin._uup
+        tlt_before  = plugin._tlt
+        rinf_before = plugin._rinf
+        meta_before = plugin._gld_meta_closes
+        regime_before = plugin._regime
+        prior_close_before = plugin._regime_at_prior_close
+
+        plugin._maybe_backfill_reset_cadence()
+
+        assert plugin._uup is uup_before and len(plugin._uup.closes) == 0
+        assert plugin._tlt is tlt_before and len(plugin._tlt.closes) == 0
+        assert plugin._rinf is rinf_before and len(plugin._rinf.closes) == 0
+        assert plugin._gld_meta_closes is meta_before and len(meta_before) == 0
+        assert plugin._regime == regime_before == REGIME_UNKNOWN
+        assert plugin._regime_at_prior_close == prior_close_before == REGIME_UNKNOWN
+
+    def test_reconstructs_expected_overnight_returns(self, tmp_path):
+        """UUP/TLT/RINF flat -> regime stays CASH throughout -> intraday leg
+        is never held, so each day's return is exactly the overnight leg
+        (today's open vs yesterday's close), independent of that day's own
+        intraday move."""
+        plugin = self._loaded(tmp_path)
+        # day1: 100 -> 100 (warm-up only, produces no return)
+        # day2: open 101 (overnight +1% from day1 close 100), close 102 (ignored, CASH)
+        # day3: open 103 (overnight from day2 close 102), close 104 (ignored, CASH)
+        self._stub_bars(plugin, [(100.0, 100.0), (101.0, 102.0), (103.0, 104.0)])
+
+        returns, ok = plugin._compute_reset_cadence_backfill(2)
+
+        assert ok is True
+        assert len(returns) == 2
+        assert returns[0] == pytest.approx(101.0 / 100.0 - 1.0)
+        assert returns[1] == pytest.approx(103.0 / 102.0 - 1.0)
+
+    def test_maybe_backfill_seeds_daily_returns_and_prior_nav(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        self._stub_bars(plugin, [(100.0, 100.0), (101.0, 102.0), (103.0, 104.0)])
+        plugin.holdings.add_cash(5000.0)
+
+        plugin._maybe_backfill_reset_cadence()
+
+        assert len(plugin._daily_returns) == 2
+        # Seeded from the REAL current NAV (cash + signed shares * price),
+        # not anything derived from the shadow computation.
+        assert plugin._prior_nav == pytest.approx(plugin._current_nav())
+        assert plugin._prior_nav == pytest.approx(5000.0)
+
+    def test_skips_when_disabled(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.reset_cadence_enabled = False
+        called = []
+        plugin.get_bars_cached = lambda *a, **k: called.append(1) or []
+
+        plugin._maybe_backfill_reset_cadence()
+
+        assert called == []
+        assert len(plugin._daily_returns) == 0
+
+    def test_skips_when_daily_returns_already_present(self, tmp_path):
+        """A restart with real (or previously backfilled) history already in
+        _daily_returns must not be clobbered by a fresh shadow reconstruction."""
+        plugin = self._loaded(tmp_path)
+        plugin._daily_returns.append(0.0123)
+        called = []
+        plugin.get_bars_cached = lambda *a, **k: called.append(1) or []
+
+        plugin._maybe_backfill_reset_cadence()
+
+        assert called == []
+        assert list(plugin._daily_returns) == [0.0123]
+
+    def test_no_historical_data_returns_not_ok(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.get_bars_cached = lambda *a, **k: []
+
+        returns, ok = plugin._compute_reset_cadence_backfill(2)
+
+        assert ok is False
+        assert returns == []
+
+    def test_fewer_days_available_still_ok(self, tmp_path):
+        """Only 1 reconstructable day when 2 were requested (e.g. near a
+        data-availability boundary) — partial result, not a failure; the
+        live tracker fills in the rest from real trading days."""
+        plugin = self._loaded(tmp_path)
+        self.DATES = ["20260501", "20260504"]   # only 2 days -> 1 return
+        self._stub_bars(plugin, [(100.0, 100.0), (101.0, 102.0)])
+
+        returns, ok = plugin._compute_reset_cadence_backfill(2)
+
+        assert ok is True
+        assert len(returns) == 1
+
+    def test_no_portfolio_returns_not_ok(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin.load()
+        plugin.portfolio = None
+
+        returns, ok = plugin._compute_reset_cadence_backfill(2)
+
+        assert ok is False
+        assert returns == []
+
+
+# ---------------------------------------------------------------------------
+# Reset-cadence overlay — whatIf short-selling capability check
+# ---------------------------------------------------------------------------
+
+class TestShortSellingCapabilityCheck:
+    def _loaded(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin.load()
+        plugin.reset_cadence_enabled = True
+        plugin._gld_price = 100.0
+        return plugin
+
+    def test_permitted_result_cached(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.portfolio = Mock()
+        plugin.portfolio.check_short_selling_permitted.return_value = {
+            "permitted": True, "reject_reason": "", "raw": {},
+        }
+
+        plugin._maybe_check_short_selling_capability()
+
+        assert plugin._short_selling_permitted is True
+
+    def test_not_permitted_result_cached_and_alerts(self, tmp_path):
+        from ib.message_bus import MessageBus
+
+        bus = MessageBus()
+        received = []
+        bus.subscribe("alerts", received.append, subscriber="test")
+        plugin = _make_plugin(tmp_path, message_bus=bus)
+        plugin.load()
+        plugin.reset_cadence_enabled = True
+        plugin._gld_price = 100.0
+        plugin.portfolio = Mock()
+        plugin.portfolio.check_short_selling_permitted.return_value = {
+            "permitted": False,
+            "reject_reason": "Short sale not allowed for this account type",
+            "raw": {},
+        }
+
+        plugin._maybe_check_short_selling_capability()
+
+        assert plugin._short_selling_permitted is False
+        kinds = [m.payload["kind"] for m in received]
+        assert kinds == ["short_selling_not_permitted"]
+
+    def test_only_checked_once(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin._short_selling_permitted = True   # already checked
+        plugin.portfolio = Mock()
+
+        plugin._maybe_check_short_selling_capability()
+
+        plugin.portfolio.check_short_selling_permitted.assert_not_called()
+
+    def test_skips_when_disabled(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.reset_cadence_enabled = False
+        plugin.portfolio = Mock()
+
+        plugin._maybe_check_short_selling_capability()
+
+        plugin.portfolio.check_short_selling_permitted.assert_not_called()
+        assert plugin._short_selling_permitted is None
+
+    def test_sizes_check_off_real_allocation(self, tmp_path):
+        """The probe order size should reflect the actual target short size,
+        not an arbitrary token quantity — margin availability can depend on
+        size."""
+        plugin = self._loaded(tmp_path)
+        plugin.allocation_dollars = 10_000.0
+        plugin._gld_price = 250.0   # -> 40 target shares
+        plugin.portfolio = Mock()
+        plugin.portfolio.check_short_selling_permitted.return_value = {
+            "permitted": True, "reject_reason": "", "raw": {},
+        }
+
+        plugin._maybe_check_short_selling_capability()
+
+        _, kwargs_or_args = plugin.portfolio.check_short_selling_permitted.call_args, None
+        args = plugin.portfolio.check_short_selling_permitted.call_args.args
+        assert args[1] == 40
+
+
+# ---------------------------------------------------------------------------
+# Reset-cadence overlay — GLL fallback (when shorting isn't permitted)
+# ---------------------------------------------------------------------------
+
+class TestResetCadenceGllFallback:
+    def _loaded(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin.load()
+        plugin.reset_cadence_enabled = True
+        plugin._gld_price = 100.0
+        plugin._gll_price = 20.0
+        plugin.allocation_dollars = 1000.0   # -> 5 GLL shares at half notional
+        plugin._short_selling_permitted = False   # confirmed: cannot short
+        return plugin
+
+    def test_close_buys_gll_instead_of_shorting(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin._reset_cooldown_remaining = 5
+        gll_buys = []
+        plugin._place_gll_buy = lambda shares, reason: gll_buys.append(shares)
+        shorts = []
+        plugin._place_moc_short = lambda shares, reason: shorts.append(shares)
+
+        plugin._on_market_close(datetime(2026, 5, 15, 15, 45))
+
+        assert shorts == []
+        assert gll_buys == [25]   # 0.5 * 1000 / 20
+
+    def test_close_sells_existing_long_before_hedging(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.holdings.add_position("GLD", 7, 100.0)
+        plugin._reset_cooldown_remaining = 5
+        sells = []
+        plugin._emit_sell = lambda qty, reason: sells.append(qty)
+        gll_buys = []
+        plugin._place_gll_buy = lambda shares, reason: gll_buys.append(shares)
+
+        plugin._on_market_close(datetime(2026, 5, 15, 15, 45))
+
+        assert sells == [7]
+        assert gll_buys == [25]
+
+    def test_open_sells_gll_hedge_and_decrements_cooldown(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin.holdings.add_position("GLL", 5, 20.0)
+        plugin._holding_gll = True
+        plugin._reset_cooldown_remaining = 5
+        gll_sells = []
+        plugin._place_gll_sell = lambda shares, reason: gll_sells.append(shares)
+
+        plugin._on_market_open(datetime(2026, 5, 15, 9, 30))
+
+        assert gll_sells == [5]
+        assert plugin._reset_cooldown_remaining == 4
+
+    def test_open_skips_gll_sell_when_not_holding(self, tmp_path):
+        plugin = self._loaded(tmp_path)
+        plugin._holding_gll = False
+        plugin._short_gld = False
+        plugin._reset_cooldown_remaining = 3
+        gll_sells = []
+        plugin._place_gll_sell = lambda shares, reason: gll_sells.append(shares)
+
+        plugin._on_market_open(datetime(2026, 5, 15, 9, 30))
+
+        assert gll_sells == []
+        assert plugin._reset_cooldown_remaining == 2
+
+    def test_gll_open_fill_sets_holding_flag(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin.load()
+        plugin.holdings.add_cash(10_000.0)
+        plugin._pending_order_actions[10] = "GLL_OPEN"
+
+        plugin.on_order_fill(Mock(order_id=10, filled_quantity=5, avg_fill_price=20.0))
+
+        pos = plugin.holdings.get_position("GLL")
+        assert pos is not None and pos.quantity == 5
+        assert plugin.holdings.current_cash == pytest.approx(10_000 - 5 * 20.0)
+        assert plugin._holding_gll is True
+
+    def test_gll_close_fill_clears_holding_flag(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin.load()
+        plugin.holdings.add_position("GLL", 5, 20.0)
+        plugin.holdings.add_cash(100.0)
+        plugin._holding_gll = True
+        plugin._pending_order_actions[11] = "GLL_CLOSE"
+
+        plugin.on_order_fill(Mock(order_id=11, filled_quantity=5, avg_fill_price=21.0))
+
+        pos = plugin.holdings.get_position("GLL")
+        assert pos is None or pos.quantity == 0
+        assert plugin._holding_gll is False
+
+    def test_gll_subscribed_only_when_reset_cadence_enabled(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin.load()
+        plugin.portfolio = Mock()
+        subscribed_symbols = []
+
+        def fake_subscribe(contract, on_bar, on_live_bar, **kwargs):
+            subscribed_symbols.append(contract.symbol)
+            return 1
+        plugin.subscribe_live_bars = fake_subscribe
+
+        plugin.reset_cadence_enabled = False
+        plugin._start_subscriptions()
+        assert "GLL" not in subscribed_symbols
+
+        subscribed_symbols.clear()
+        plugin.reset_cadence_enabled = True
+        plugin._start_subscriptions()
+        assert "GLL" in subscribed_symbols

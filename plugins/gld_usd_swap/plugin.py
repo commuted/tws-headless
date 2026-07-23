@@ -107,6 +107,32 @@ Locked-in default combo from an 80-combo sweep (sweep_reset_cadence_short.py):
   -> full-history Sharpe 0.80->1.44 gross, 1.32 net of commission
   -> 2012-2016 loss -33.5%->-0.3% gross, -5.9% net of commission
 
+SHADOW BACKFILL ON ENABLE
+
+On a fresh enable, waiting reset_lookback_days (42) real trading days for
+the trigger to have an opinion means it's blind through the exact kind of
+early-onset drawdown it exists to catch. _maybe_backfill_reset_cadence()
+reconstructs that history from market data instead, via
+_compute_reset_cadence_backfill() — synthetic NAV from historical bars is
+predictive of a real bear regime; this plugin's own actual operational
+history isn't reliably available for that (crashes, feed staleness, TWS
+relogin cycles, or simply not having run continuously for 42 days).
+
+Runs synchronously inside start(), immediately after _warm_up_from_history()
+and before _start_subscriptions() — so it always finishes before any live
+bar can reach a session decision, eliminating any window where a real
+open/close could fire against a still-cold trigger.
+
+Computed with throwaway shadow state (fresh _InstrumentState objects, local
+variables) that never touches self._uup/_tlt/_rinf/_gld_meta_closes/_regime
+— the live signal state used by real trading decisions is untouched by the
+computation, so there's no live state to save and restore around it. Only
+two lines of the live instance change, both after the shadow computation
+has fully finished: _daily_returns (the reconstructed history) and
+_prior_nav (seeded from the REAL current NAV via _current_nav(), not from
+anything in the shadow computation, since today's first live daily return
+must be measured from where the real portfolio actually stands).
+
 Position sign convention: HoldingPosition.quantity is a plain signed float
 with no non-negative guard in add_position() (remove_position() is the only
 method that rejects going negative, and it's simply not used for the short
@@ -115,6 +141,36 @@ leg) — so going short is just add_position("GLD", -shares, ...), and NAV
 casing. A single sell order sized as (current long shares + target short
 shares) correctly crosses through zero in one fill when the pause triggers
 while still holding long.
+
+GLL FALLBACK — CASH ACCOUNTS AND IRAS CANNOT SELL SHORT
+
+Confirmed via a real IB whatIf order (never a real trade — a pre-trade
+margin/rejection check only): _maybe_check_short_selling_capability() calls
+Portfolio.check_short_selling_permitted() once, cached in
+self._short_selling_permitted (persisted; not re-checked every restart,
+since account permissions don't change session to session). Runs
+synchronously in start() alongside the backfill, and defensively again the
+instant a pause first triggers (_update_reset_cadence) in case
+reset_cadence_enabled was turned on mid-session after start() already ran
+— the capability is always known before a real order is ever attempted,
+never discovered via a rejected order at the worst possible moment.
+AccountSummaryTags.AccountType (Individual, IRA, ...) describes legal
+structure, not margin/shorting permissions, so it isn't a substitute for
+actually asking IB.
+
+When not permitted, GLD's overnight leg during the pause is inverted via
+GLL (ProShares UltraShort Gold, -2x GLD daily) instead of a short: bought
+long at half notional (_GLL_WEIGHT = 0.5) at the close, sold at the open,
+flat intraday — same cadence as the direct short, an ordinary long
+purchase requiring no shorting privileges at all. Validated in
+volomom/backtest_reset_cadence_gll.py (apply_reset_cadence_gll_overnight_only,
+NOT the continuous-hold variant in that same file, which was found to
+replicate full-day exposure instead — a mismatch caught before this was
+wired in): Sharpe 1.42 vs the direct short's 1.44, essentially the same
+trade. GLL is a different symbol from GLD, so unlike the short leg's
+single crossing-through-zero order, entering the hedge for the first time
+while still holding a GLD long takes two separate orders (sell the GLD
+long, buy the GLL hedge) rather than one combined order.
 """
 
 import bisect
@@ -141,6 +197,13 @@ REGIME_UNKNOWN = "unknown"
 _INIT_DERIV_UUP  = 0.074   # p50 UUP daily moves 2023-2025
 _INIT_DERIV_TLT  = 0.500   # conservative TLT initial (~$100 ETF, 0.5% daily)
 _INIT_DERIV_RINF = 0.200   # conservative RINF initial
+
+# GLL (ProShares UltraShort Gold, -2x GLD daily) fallback weight when this
+# account can't sell short. Half notional of GLL long replicates roughly
+# -1x GLD exposure — validated in volomom/backtest_reset_cadence_gll.py
+# (apply_reset_cadence_gll_overnight_only): Sharpe 1.42 vs the direct
+# short's 1.44, essentially the same trade with an ordinary long purchase.
+_GLL_WEIGHT = 0.5
 
 _OPEN_HOUR,  _OPEN_MIN  = 9,  30
 _CLOSE_HOUR, _CLOSE_MIN = 15, 45   # bar completes 15:50 — inside NYSE ARCA MOC cutoff
@@ -363,6 +426,15 @@ class GldUsdSwapPlugin(PluginBase):
         self._daily_returns:             deque         = deque(maxlen=self.reset_lookback_days)
         self._prior_nav:                 Optional[float] = None
 
+        # --- GLL fallback (cash accounts/IRAs cannot sell short at all) ---
+        # None = not yet checked; True/False = confirmed via a real whatIf
+        # order test (see _maybe_check_short_selling_capability). Checked
+        # once and persisted — not re-checked every restart, since account
+        # permissions don't change session to session.
+        self._short_selling_permitted: Optional[bool] = None
+        self._gll_price: float = 0.0
+        self._holding_gll: bool = False   # overnight-only GLL hedge, half notional
+
         # --- live-bar gating (hazard: backfill replay must not fire orders) ---
         # Session events fire only for bars delivered through the live-update
         # callback AND strictly newer than any bar seen (the high-water-mark
@@ -431,6 +503,8 @@ class GldUsdSwapPlugin(PluginBase):
             self._daily_returns          = deque(saved.get("daily_returns", []),
                                                   maxlen=self.reset_lookback_days)
             self._prior_nav              = saved.get("prior_nav")
+            self._short_selling_permitted = saved.get("short_selling_permitted")
+            self._holding_gll            = saved.get("holding_gll", False)
             self._uup.restore(saved.get("uup",  {}), _INIT_DERIV_UUP)
             self._tlt.restore(saved.get("tlt",  {}), _INIT_DERIV_TLT)
             self._rinf.restore(saved.get("rinf", {}), _INIT_DERIV_RINF)
@@ -499,6 +573,8 @@ class GldUsdSwapPlugin(PluginBase):
                 self._short_gld = False
 
         self._warm_up_from_history()
+        self._maybe_backfill_reset_cadence()
+        self._maybe_check_short_selling_capability()
         self._start_subscriptions()
 
         logger.info(
@@ -542,7 +618,8 @@ class GldUsdSwapPlugin(PluginBase):
         self._start_subscriptions()
 
     def _start_subscriptions(self) -> None:
-        """Subscribe to live 5-min bars for all four symbols.
+        """Subscribe to live 5-min bars for all four symbols (five when the
+        reset-cadence overlay is enabled — see below).
 
         Backfill bars (historicalData replay) arrive via on_bar and only feed
         the signal state; live updates (historicalDataUpdate) arrive via
@@ -558,10 +635,19 @@ class GldUsdSwapPlugin(PluginBase):
         live bid/ask, so it updates continuously regardless of print activity.
         GLD stays on TRADES (the default) since it is the instrument actually
         filled and its signal should track real transaction prices.
+
+        GLL (the fallback hedge when this account can't sell short) is
+        subscribed only when reset_cadence_enabled — no reason to carry a
+        fifth live feed for every plugin instance that never uses it. It's a
+        potential trade, not signal-only, so it stays on TRADES too.
         """
+        symbols = ["GLD", "UUP", "TLT", "RINF"]
+        if self.reset_cadence_enabled:
+            symbols.append("GLL")
+
         self._live_bar_req_ids: Dict[str, Optional[int]] = {}
-        for symbol in ("GLD", "UUP", "TLT", "RINF"):
-            kwargs = {} if symbol == "GLD" else {"what_to_show": "MIDPOINT"}
+        for symbol in symbols:
+            kwargs = {} if symbol in ("GLD", "GLL") else {"what_to_show": "MIDPOINT"}
             req_id = self.subscribe_live_bars(
                 contract=ContractBuilder.etf(symbol),
                 on_bar=lambda b, s=symbol: self._on_bar(s, b, is_live=False),
@@ -606,6 +692,8 @@ class GldUsdSwapPlugin(PluginBase):
             "reset_cooldown_remaining": self._reset_cooldown_remaining,
             "daily_returns":         list(self._daily_returns),
             "prior_nav":             self._prior_nav,
+            "short_selling_permitted": self._short_selling_permitted,
+            "holding_gll":           self._holding_gll,
             "uup":                   self._uup.save(),
             "tlt":                   self._tlt.save(),
             "rinf":                  self._rinf.save(),
@@ -716,6 +804,297 @@ class GldUsdSwapPlugin(PluginBase):
         )
 
     # =========================================================================
+    # RESET-CADENCE SHADOW BACKFILL
+    # =========================================================================
+
+    def _maybe_backfill_reset_cadence(self) -> None:
+        """
+        On a fresh enable (self._daily_returns empty), reconstruct
+        reset_lookback_days of the composite strategy's own daily returns
+        from historical market data instead of waiting reset_lookback_days
+        real trading days to accumulate them live.
+
+        Runs synchronously in the same start() phase as _warm_up_from_history
+        — before _start_subscriptions() — so no live bar can reach a session
+        decision (open/close, real orders) until this returns. That ordering
+        is what makes the backfill safe: there's no window where a real
+        decision could fire on a still-cold trigger.
+
+        Deliberately reconstructs from market data rather than any real
+        operational history this plugin might have (persisted daily NAV from
+        a previous run, if any): actual uptime has gaps — crashes, feed
+        staleness, TWS relogin cycles, the plugin being frozen — that would
+        make 42 CONSECUTIVE real trading days unreliable to assemble. Market
+        data doesn't care whether this engine was running.
+
+        Never touches self._uup/_tlt/_rinf/_gld_meta_closes/_regime — see
+        _compute_reset_cadence_backfill, which builds entirely separate
+        shadow state. Only two lines of the live instance are set here, both
+        after the shadow computation has fully finished: _daily_returns and
+        _prior_nav.
+        """
+        if not self.reset_cadence_enabled or self._daily_returns:
+            return   # disabled, or already has real or previously-backfilled history
+
+        returns, ok = self._compute_reset_cadence_backfill(self.reset_lookback_days)
+        if not ok:
+            logger.warning(
+                "Reset-cadence backfill: could not reconstruct history — "
+                "starting cold, trigger will warm up from live trading instead"
+            )
+            return
+
+        self._daily_returns = deque(returns, maxlen=self.reset_lookback_days)
+        # Seed from the REAL current NAV, not anything from the shadow
+        # computation (which is a hypothetical parallel strategy, not this
+        # plugin's actual position) — today's first live daily return must
+        # be measured from where the real portfolio actually stands right now.
+        self._prior_nav = self._current_nav()
+        logger.info(
+            f"Reset-cadence backfill: reconstructed {len(returns)}/"
+            f"{self.reset_lookback_days} days from history, "
+            f"seeded prior_nav=${self._prior_nav:,.2f}"
+        )
+
+    def _compute_reset_cadence_backfill(self, lookback_days: int) -> Tuple[List[float], bool]:
+        """
+        Reconstruct lookback_days of the composite strategy's own daily
+        returns from historical 5-min bars, using throwaway shadow signal
+        state — fresh _InstrumentState objects and local variables, never
+        self._uup/_tlt/_rinf/_gld_meta_closes/_regime. Mirrors
+        volomom's plugin_proxy_daily_returns exactly (overnight leg always
+        held, intraday leg conditional on the regime decided at the PRIOR
+        day's close) but computed from this plugin's own live signal logic
+        (5-min bars, adaptive smoothing, the meta gate) rather than
+        volomom's daily-bar approximation.
+
+        Returns (daily_returns, ok). ok is False only when historical data
+        could not be fetched at all; a shorter-than-requested but non-empty
+        reconstruction (e.g. near a data-availability boundary) is still ok
+        — the live tracker fills the remainder from real trading days.
+        """
+        if not self.portfolio:
+            return [], False
+
+        _UTC = timezone.utc
+        _now = datetime.now(_UTC)
+        # Comfortably more calendar days than lookback_days trading days:
+        # the shadow signal needs under a day to warm up (meta_slow_bars=60
+        # 5-min bars ≈ 5h), so this is mostly slack for weekends/holidays.
+        _start = _now - timedelta(days=int(lookback_days * 1.6) + 10)
+
+        fetch_started = time.time()
+        logger.info(
+            f"Reset-cadence backfill: requesting 5-min bars "
+            f"{_start.date()} → {_now.date()} for GLD/UUP/TLT/RINF "
+            f"(lookback_days={lookback_days})"
+        )
+
+        bars_by_symbol: Dict[str, list] = {}
+        for symbol in ("GLD", "UUP", "TLT", "RINF"):
+            what_to_show = "TRADES" if symbol == "GLD" else "MIDPOINT"
+            symbol_started = time.time()
+            bars = self.get_bars_cached(
+                contract=ContractBuilder.etf(symbol),
+                start_dt=_start,
+                end_dt=_now,
+                bar_size_setting="5 mins",
+                what_to_show=what_to_show,
+                use_rth=True,
+            )
+            if not bars:
+                logger.warning(f"Reset-cadence backfill: no historical data for {symbol}")
+                return [], False
+            logger.info(
+                f"Reset-cadence backfill: {symbol} {len(bars)} bars "
+                f"({bars[0].date} → {bars[-1].date}) in "
+                f"{time.time() - symbol_started:.1f}s"
+            )
+            bars_by_symbol[symbol] = bars
+
+        merged: List[tuple] = []
+        for symbol, bars in bars_by_symbol.items():
+            for b in bars:
+                merged.append((b.date, symbol, float(b.open), float(b.close)))
+        merged.sort(key=lambda x: x[0])
+
+        # --- shadow state: isolated from self.*, discarded after this call ---
+        shadow_uup  = _InstrumentState(_INIT_DERIV_UUP)
+        shadow_tlt  = _InstrumentState(_INIT_DERIV_TLT)
+        shadow_rinf = _InstrumentState(_INIT_DERIV_RINF)
+        shadow_meta_closes: deque = deque(maxlen=80)
+        shadow = {
+            "meta_fast": 0.0, "meta_slow": 0.0, "gld_uptrend": False,
+            "regime": REGIME_UNKNOWN, "regime_at_prior_close": REGIME_UNKNOWN,
+        }
+        day_open: Dict[object, float] = {}
+        day_close: Dict[object, float] = {}
+        daily_returns: List[float] = []
+        prev_close_price: Optional[float] = None
+
+        def _shadow_recompute_regime() -> None:
+            if not shadow_uup.warmed_up(self.slow_bars):
+                return
+            uup_gold = shadow_uup.fast_sma < shadow_uup.slow_sma
+            if shadow_tlt.warmed_up(self.slow_bars):
+                tlt_gold = shadow_tlt.fast_sma > shadow_tlt.slow_sma
+                if shadow["gld_uptrend"] and shadow_rinf.warmed_up(self.slow_bars):
+                    rinf_gold = shadow_rinf.fast_sma > shadow_rinf.slow_sma
+                    gold = uup_gold and (tlt_gold or rinf_gold)
+                else:
+                    gold = uup_gold and tlt_gold
+            else:
+                gold = uup_gold
+            shadow["regime"] = REGIME_GOLD if gold else REGIME_CASH
+
+        for ts_str, group in groupby(merged, key=lambda x: x[0]):
+            try:
+                ts = datetime.strptime(ts_str[:8] + " " + ts_str[9:17], "%Y%m%d %H:%M:%S")
+            except (ValueError, TypeError):
+                continue
+            date = ts.date()
+
+            for _, symbol, o, c in group:
+                if symbol == "GLD":
+                    day_open.setdefault(date, o)
+                    day_close[date] = c
+                    shadow_meta_closes.append(c)
+                    if len(shadow_meta_closes) >= self.meta_slow_bars:
+                        cl = list(shadow_meta_closes)
+                        shadow["meta_fast"] = sum(cl[-self.meta_fast_bars:]) / self.meta_fast_bars
+                        shadow["meta_slow"] = sum(cl[-self.meta_slow_bars:]) / self.meta_slow_bars
+                        shadow["gld_uptrend"] = shadow["meta_fast"] > shadow["meta_slow"]
+                    _shadow_recompute_regime()
+                elif symbol == "UUP":
+                    shadow_uup.push(c, self.vol_window, self.derivative_percentile,
+                                     self.fast_bars, self.slow_bars)
+                    _shadow_recompute_regime()
+                elif symbol == "TLT":
+                    shadow_tlt.push(c, self.vol_window, self.derivative_percentile,
+                                     self.fast_bars, self.slow_bars)
+                    _shadow_recompute_regime()
+                elif symbol == "RINF":
+                    shadow_rinf.push(c, self.vol_window, self.derivative_percentile,
+                                      self.fast_bars, self.slow_bars)
+                    _shadow_recompute_regime()
+
+            if ts.hour == _CLOSE_HOUR and ts.minute == _CLOSE_MIN:
+                # Session close for `date`: settle the day's realized return
+                # (overnight from the previous close into today's open, plus
+                # intraday conditional on the PRIOR day's close regime —
+                # never today's, which isn't known until this same instant),
+                # then roll the regime forward for tomorrow's decision.
+                o_today = day_open.get(date)
+                c_today = day_close.get(date)
+                if (prev_close_price and o_today and c_today
+                        and shadow["regime_at_prior_close"] != REGIME_UNKNOWN):
+                    cash = 1.0 + (o_today / prev_close_price - 1.0)
+                    if shadow["regime_at_prior_close"] == REGIME_GOLD:
+                        cash *= 1.0 + (c_today / o_today - 1.0)
+                    daily_returns.append(cash - 1.0)
+                if shadow["regime"] != REGIME_UNKNOWN:
+                    shadow["regime_at_prior_close"] = shadow["regime"]
+                prev_close_price = c_today
+
+        elapsed = time.time() - fetch_started
+        if not daily_returns:
+            logger.warning(
+                f"Reset-cadence backfill: fetched bars but reconstructed 0 "
+                f"days (in {elapsed:.1f}s) — shadow regime never warmed up "
+                f"or no valid close-to-close pairs in range"
+            )
+            return [], False
+        if len(daily_returns) < lookback_days:
+            logger.warning(
+                f"Reset-cadence backfill: only reconstructed {len(daily_returns)} "
+                f"of {lookback_days} requested days (in {elapsed:.1f}s)"
+            )
+            return daily_returns, True
+
+        logger.info(
+            f"Reset-cadence backfill: reconstructed {len(daily_returns)} days "
+            f"(kept last {lookback_days}) in {elapsed:.1f}s total"
+        )
+        return daily_returns[-lookback_days:], True
+
+    # =========================================================================
+    # RESET-CADENCE GLL FALLBACK
+    # =========================================================================
+
+    def _maybe_check_short_selling_capability(self) -> None:
+        """
+        Confirm via a real IB whatIf order — not an assumption, not an
+        account-type tag — whether this account can sell short at all.
+        Cash accounts and IRAs cannot; AccountSummaryTags.AccountType
+        describes legal structure (Individual, IRA, ...), not margin/
+        shorting permissions, so it isn't a substitute for actually asking.
+
+        Checked once and persisted (self._short_selling_permitted stays
+        None only until the first successful check) — account permissions
+        don't change session to session, so there's no reason to repeat a
+        blocking IB round-trip on every restart.
+
+        Runs synchronously in start(), alongside _maybe_backfill_reset_cadence
+        and before _start_subscriptions() — the capability is known before
+        any real trading decision can occur, not discovered reactively via a
+        rejected order at the worst possible moment.
+        """
+        if not self.reset_cadence_enabled or self._short_selling_permitted is not None:
+            return
+        if not self.portfolio:
+            return
+
+        target_shares = (
+            max(1, int(self.allocation_dollars / self._gld_price))
+            if self._gld_price > 0 else 1
+        )
+        logger.info(
+            f"Reset-cadence: submitting whatIf SELL {target_shares} GLD "
+            f"to test short-selling capability (gld_price=${self._gld_price:.2f})"
+        )
+        checked_at = time.time()
+        result = self.portfolio.check_short_selling_permitted(
+            ContractBuilder.etf("GLD"), target_shares,
+        )
+        self._short_selling_permitted = result["permitted"]
+        elapsed = time.time() - checked_at
+
+        if result["permitted"]:
+            raw = result.get("raw") or {}
+            logger.info(
+                f"Reset-cadence: short selling confirmed permitted on this "
+                f"account (whatIf order test, {elapsed:.1f}s) — "
+                f"status={raw.get('status')} "
+                f"initMargin {raw.get('initMarginBefore')}->{raw.get('initMarginAfter')}"
+            )
+        else:
+            logger.warning(
+                f"Reset-cadence: whatIf check ({elapsed:.1f}s) found short "
+                f"selling NOT permitted — reject_reason={result['reject_reason']!r} "
+                f"raw={result.get('raw')}"
+            )
+            self._alert(
+                "short_selling_not_permitted",
+                f"Reset-cadence: short selling NOT permitted on this account "
+                f"({result['reject_reason']}) — falling back to 1/2 GLL "
+                f"(ProShares UltraShort Gold) during pauses instead",
+                reject_reason=result["reject_reason"],
+            )
+        self._save_state()
+
+    def _current_gll_shares_signed(self) -> float:
+        """Signed GLL share count in this plugin's holdings. GLL is always
+        held long (never short) when it's held at all, so this is really
+        just a same-shaped accessor alongside _current_gld_shares_signed —
+        but add_position()/get_position() are shared machinery regardless
+        of symbol, so there's nothing GLL-specific about it."""
+        if self.holdings:
+            pos = self.holdings.get_position("GLL")
+            if pos:
+                return pos.quantity
+        return 0.0
+
+    # =========================================================================
     # MARKET DATA
     # =========================================================================
 
@@ -779,6 +1158,10 @@ class GldUsdSwapPlugin(PluginBase):
             self._rinf.push(close, self.vol_window, self.derivative_percentile,
                             self.fast_bars, self.slow_bars)
             self._recompute_regime()
+        elif symbol == "GLL":
+            # Fallback hedge instrument — just needs a current price to size
+            # orders against; no signal role, nothing feeds the regime.
+            self._gll_price = close
 
     def _is_live_bar(self, ts: datetime, is_live: bool) -> bool:
         """Gate session decisions to genuinely-new bars from the live callback.
@@ -906,6 +1289,10 @@ class GldUsdSwapPlugin(PluginBase):
 
         if self.reset_cadence_enabled and self._reset_cooldown_remaining > 0:
             self._open_fired_date = ts.date()
+            # Checked against actual position flags (set from the resulting
+            # fill, not assumed) rather than re-deriving from
+            # _short_selling_permitted — self-correcting the same way
+            # on_order_fill already is.
             if self._short_gld:
                 qty = -self._current_gld_shares_signed()   # positive shares to buy back
                 if qty > 0:
@@ -922,6 +1309,23 @@ class GldUsdSwapPlugin(PluginBase):
                         f"Open {ts.date()}: reset-cadence pause active but plugin "
                         f"holds no short GLD to cover (short_gld flag was "
                         f"{self._short_gld})"
+                    )
+            elif self._holding_gll:
+                qty = self._current_gll_shares_signed()
+                if qty > 0:
+                    self._place_gll_sell(
+                        int(qty),
+                        reason=(
+                            f"Open {ts.date()}: reset-cadence pause "
+                            f"({self._reset_cooldown_remaining}d remaining) — "
+                            f"MKT sell GLL hedge, sit out intraday"
+                        ),
+                    )
+                else:
+                    logger.warning(
+                        f"Open {ts.date()}: reset-cadence pause active but plugin "
+                        f"holds no GLL to sell (holding_gll flag was "
+                        f"{self._holding_gll})"
                     )
             self._reset_cooldown_remaining = max(0, self._reset_cooldown_remaining - 1)
             if self._reset_cooldown_remaining == 0:
@@ -983,28 +1387,70 @@ class GldUsdSwapPlugin(PluginBase):
             self._update_reset_cadence()
 
         if self.reset_cadence_enabled and self._reset_cooldown_remaining > 0:
-            # Paused: short overnight instead of buying long. Sized as any
-            # existing long shares (first pause evening only — every other
-            # evening this is already flat from that morning's cover) plus
-            # the short target; one order correctly crosses through zero in
-            # a single fill (see _apply_signed_fill_to_holdings).
-            target_short = int(self.allocation_dollars / self._gld_price) if self._gld_price > 0 else 0
-            current_signed = self._current_gld_shares_signed()
-            sell_qty = max(0, int(current_signed)) + target_short
-            if sell_qty > 0:
-                self._place_moc_short(
-                    sell_qty,
-                    reason=(
-                        f"Close {ts.date()}: reset-cadence pause "
-                        f"({self._reset_cooldown_remaining}d remaining) — "
-                        f"MOC short overnight entry"
-                    ),
+            if self._short_selling_permitted:
+                # Paused: short overnight instead of buying long. Sized as
+                # any existing long shares (first pause evening only — every
+                # other evening this is already flat from that morning's
+                # cover) plus the short target; one order correctly crosses
+                # through zero in a single fill (see
+                # _apply_signed_fill_to_holdings).
+                target_short = (
+                    int(self.allocation_dollars / self._gld_price)
+                    if self._gld_price > 0 else 0
                 )
-            elif self.portfolio and self._gld_price > 0:
-                logger.error(
-                    f"Close {ts.date()}: reset-cadence short skipped — "
-                    f"computed 0 shares at ${self._gld_price:.2f}"
+                current_signed = self._current_gld_shares_signed()
+                sell_qty = max(0, int(current_signed)) + target_short
+                if sell_qty > 0:
+                    self._place_moc_short(
+                        sell_qty,
+                        reason=(
+                            f"Close {ts.date()}: reset-cadence pause "
+                            f"({self._reset_cooldown_remaining}d remaining) — "
+                            f"MOC short overnight entry"
+                        ),
+                    )
+                elif self.portfolio and self._gld_price > 0:
+                    logger.error(
+                        f"Close {ts.date()}: reset-cadence short skipped — "
+                        f"computed 0 shares at ${self._gld_price:.2f}"
+                    )
+            else:
+                # GLL fallback: this account can't sell short (or capability
+                # is unconfirmed — treated the same as "can't", conservatively).
+                # Two separate orders, since GLL is a different symbol from
+                # GLD and the single-order crossing-through-zero trick only
+                # works within one symbol: sell any existing GLD long first
+                # (first pause evening only), then buy GLL at half notional
+                # for the overnight hedge (every paused evening — flat again
+                # each morning, same cadence as the direct short).
+                gld_qty = self._current_gld_shares()
+                if gld_qty > 0:
+                    self._emit_sell(
+                        qty=gld_qty,
+                        reason=(
+                            f"Close {ts.date()}: reset-cadence pause, GLL fallback "
+                            f"— MKT sell existing GLD long before hedging with GLL"
+                        ),
+                    )
+                gll_shares = (
+                    int(_GLL_WEIGHT * self.allocation_dollars / self._gll_price)
+                    if self._gll_price > 0 else 0
                 )
+                if gll_shares > 0:
+                    self._place_gll_buy(
+                        gll_shares,
+                        reason=(
+                            f"Close {ts.date()}: reset-cadence pause "
+                            f"({self._reset_cooldown_remaining}d remaining) — "
+                            f"MOC BUY GLL (1/2 notional) overnight hedge, "
+                            f"short selling not permitted on this account"
+                        ),
+                    )
+                elif self.portfolio and self._gll_price > 0:
+                    logger.error(
+                        f"Close {ts.date()}: reset-cadence GLL hedge skipped — "
+                        f"computed 0 shares at ${self._gll_price:.2f}"
+                    )
             self._save_state()
             return
 
@@ -1206,6 +1652,90 @@ class GldUsdSwapPlugin(PluginBase):
         else:
             logger.error(f"Failed to place MKT COVER BUY {shares} GLD — {reason}")
 
+    def _place_gll_buy(self, shares: int, reason: str) -> None:
+        """Reset-cadence pause, GLL fallback: buy GLL at the closing auction
+        for the overnight hedge — used instead of a GLD short when this
+        account can't sell short. Mirrors _place_moc_short's cadence exactly
+        (fresh position every paused evening, closed every paused morning),
+        just on a different symbol via an ordinary long purchase."""
+        self._trade_count    += 1
+        self._last_trade_time = datetime.now(timezone.utc).isoformat()
+
+        self.publish(
+            "gld_usd_swap_signals",
+            {
+                "timestamp":  self._last_trade_time,
+                "action":     "BUY",
+                "order_type": "MOC",
+                "quantity":   shares,
+                "gll_price":  self._gll_price,
+                "factors":    self._last_factors,
+                "reason":     reason,
+            },
+            message_type="signal",
+        )
+
+        if not self.portfolio:
+            logger.info(f"[no portfolio] MOC BUY {shares} GLL — {reason}")
+            return
+
+        contract               = ContractBuilder.etf("GLL")
+        order                  = IbOrder()
+        order.action           = "BUY"
+        order.totalQuantity    = shares
+        order.orderType        = "MOC"
+        order.transmit         = True
+
+        oid = self.portfolio.place_order_custom(contract, order)
+        if oid is not None:
+            self._pending_order_actions[oid] = "GLL_OPEN"
+            self._pending_order_placed_at[oid] = time.time()
+            self.register_order(oid)
+            logger.info(f"MOC BUY {shares} GLL (order_id={oid}) — {reason}")
+        else:
+            logger.error(f"Failed to place MOC BUY {shares} GLL — {reason}")
+
+    def _place_gll_sell(self, shares: int, reason: str) -> None:
+        """Reset-cadence pause, GLL fallback: sell the overnight GLL hedge
+        at the market open, going flat for the intraday session — mirrors
+        _place_cover_buy's cadence, an ordinary sell instead of a cover."""
+        self._trade_count    += 1
+        self._last_trade_time = datetime.now(timezone.utc).isoformat()
+
+        self.publish(
+            "gld_usd_swap_signals",
+            {
+                "timestamp":  self._last_trade_time,
+                "action":     "SELL",
+                "order_type": "MKT",
+                "quantity":   shares,
+                "gll_price":  self._gll_price,
+                "factors":    self._last_factors,
+                "reason":     reason,
+            },
+            message_type="signal",
+        )
+
+        if not self.portfolio:
+            logger.info(f"[no portfolio] MKT SELL {shares} GLL — {reason}")
+            return
+
+        contract            = ContractBuilder.etf("GLL")
+        order               = IbOrder()
+        order.action        = "SELL"
+        order.totalQuantity = shares
+        order.orderType     = "MKT"
+        order.transmit      = True
+
+        oid = self.portfolio.place_order_custom(contract, order)
+        if oid is not None:
+            self._pending_order_actions[oid] = "GLL_CLOSE"
+            self._pending_order_placed_at[oid] = time.time()
+            self.register_order(oid)
+            logger.info(f"MKT SELL {shares} GLL (order_id={oid}) — {reason}")
+        else:
+            logger.error(f"Failed to place MKT SELL {shares} GLL — {reason}")
+
     def _alert(self, kind: str, message: str, **data) -> None:
         """Log at ERROR and publish to the 'alerts' channel.
 
@@ -1311,16 +1841,24 @@ class GldUsdSwapPlugin(PluginBase):
                 if trailing < self.reset_threshold:
                     self._reset_cooldown_remaining = self.reset_cooldown_days
                     self._daily_returns.clear()
+                    # Safety net: normally checked once at startup, but if
+                    # reset_cadence_enabled was turned on mid-session (after
+                    # start() already ran), this is the first point a pause
+                    # is about to act — capability must be known before that,
+                    # not discovered via a rejected order this same evening.
+                    self._maybe_check_short_selling_capability()
                     self._alert(
                         "reset_cadence_triggered",
                         f"Trailing {self.reset_lookback_days}d return {trailing:+.1%} "
                         f"below threshold {self.reset_threshold:+.1%} — entering "
-                        f"{self.reset_cooldown_days}-trading-day short-overnight pause",
+                        f"{self.reset_cooldown_days}-trading-day short-overnight pause "
+                        f"({'short GLD' if self._short_selling_permitted else '1/2 GLL fallback'})",
                         trailing_return=trailing, threshold=self.reset_threshold,
                     )
         self._prior_nav = nav
 
-    def _apply_signed_fill_to_holdings(self, signed_qty: float, price: float) -> None:
+    def _apply_signed_fill_to_holdings(self, signed_qty: float, price: float,
+                                        symbol: str = "GLD") -> None:
         """Apply a fill's signed share delta to holdings — positive for a
         buy, negative for a sell — regardless of whether the resulting
         position ends up long, short, or flat.
@@ -1328,12 +1866,15 @@ class GldUsdSwapPlugin(PluginBase):
         add_position() has no non-negative guard (unlike remove_position(),
         which isn't used here), so a single call handles every transition:
         opening a short, covering one, or a combined sell that closes an
-        existing long and continues into a new short in one fill.
+        existing long and continues into a new short in one fill. Also used
+        for the GLL fallback hedge (always a plain long, never negative),
+        which is why symbol is a parameter rather than hardcoded.
         """
         if not self.holdings or signed_qty == 0:
             return
-        px = price if price > 0 else self._gld_price
-        self.holdings.add_position("GLD", signed_qty, cost_basis=px, current_price=px)
+        default_price = self._gld_price if symbol == "GLD" else self._gll_price
+        px = price if price > 0 else default_price
+        self.holdings.add_position(symbol, signed_qty, cost_basis=px, current_price=px)
         self.holdings.add_cash(-signed_qty * price)
         self.save_holdings()
 
@@ -1380,6 +1921,18 @@ class GldUsdSwapPlugin(PluginBase):
             logger.info(
                 f"{verb} filled: {qty:.0f} GLD @ ${price:.2f} "
                 f"(resulting position: {resulting:+.0f})"
+            )
+        elif action in ("GLL_OPEN", "GLL_CLOSE"):
+            # GLL is only ever held long (it's the no-shorting-required
+            # fallback), so the sign is fixed by the action, unlike the
+            # GLD short leg above.
+            signed_qty = qty if action == "GLL_OPEN" else -qty
+            self._apply_signed_fill_to_holdings(signed_qty, price, symbol="GLL")
+            self._holding_gll = self._current_gll_shares_signed() > 0
+            verb = "BUY" if action == "GLL_OPEN" else "SELL"
+            logger.info(
+                f"GLL {verb} filled: {qty:.0f} GLL @ ${price:.2f} "
+                f"(holding_gll={self._holding_gll})"
             )
         if action:
             self._save_state()

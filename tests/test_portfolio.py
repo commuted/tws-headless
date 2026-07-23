@@ -111,6 +111,8 @@ def portfolio_instance(mock_ibapi):
         portfolio._orders_lock = Lock()
         portfolio._pending_orders = {}
         portfolio._on_order_status = None
+        portfolio._whatif_open_order = {}
+        portfolio._whatif_error = {}
         portfolio.dry_run = False
         portfolio._kutd_symbols = {}
         portfolio._kutd_last_bar = {}
@@ -1713,6 +1715,125 @@ class TestOpenOrderAndExecDetails:
             portfolio_instance.execDetails(1, contract, execution)
 
         handler.assert_called_once()
+
+
+class TestCheckShortSellingPermitted:
+    """Tests for check_short_selling_permitted (whatIf order probe)"""
+
+    def _ready(self, portfolio_instance, next_order_id=500):
+        portfolio_instance._connected.set()
+        portfolio_instance._next_order_id = next_order_id
+        return portfolio_instance
+
+    def test_permitted_on_clean_response(self, portfolio_instance):
+        portfolio = self._ready(portfolio_instance)
+
+        def fake_place_order_raw(order_id, contract, order):
+            order_state = MagicMock(status="PreSubmitted", rejectReason="",
+                                    warningText="", initMarginBefore="100.0",
+                                    initMarginChange="-10.0", initMarginAfter="90.0")
+            portfolio.openOrder(order_id, contract, order, order_state)
+            return True
+        portfolio.place_order_raw = fake_place_order_raw
+
+        result = portfolio.check_short_selling_permitted(MagicMock(symbol="GLD"), 100)
+
+        assert result["permitted"] is True
+        assert result["reject_reason"] == ""
+        assert result["raw"]["status"] == "PreSubmitted"
+
+    def test_not_permitted_via_reject_reason(self, portfolio_instance):
+        portfolio = self._ready(portfolio_instance)
+
+        def fake_place_order_raw(order_id, contract, order):
+            order_state = MagicMock(status="Cancelled",
+                                    rejectReason="Short sale not allowed for this account type",
+                                    warningText="", initMarginBefore="0.0",
+                                    initMarginChange="0.0", initMarginAfter="0.0")
+            portfolio.openOrder(order_id, contract, order, order_state)
+            return True
+        portfolio.place_order_raw = fake_place_order_raw
+
+        result = portfolio.check_short_selling_permitted(MagicMock(symbol="GLD"), 100)
+
+        assert result["permitted"] is False
+        assert "not allowed" in result["reject_reason"]
+
+    def test_not_permitted_via_error_callback(self, portfolio_instance):
+        """Some rejections arrive via error() before any openOrder at all."""
+        portfolio = self._ready(portfolio_instance)
+
+        def fake_place_order_raw(order_id, contract, order):
+            portfolio.error(order_id, 0, 201, "Order rejected - reason:Account not eligible")
+            return True
+        portfolio.place_order_raw = fake_place_order_raw
+
+        result = portfolio.check_short_selling_permitted(MagicMock(symbol="GLD"), 100)
+
+        assert result["permitted"] is False
+        assert "201" in result["reject_reason"]
+
+    def test_advisory_error_does_not_preempt_openOrder(self, portfolio_instance):
+        """Regression test for a live bug: error code 10349 ("Order TIF was
+        set to DAY based on order preset") is advisory, not a rejection —
+        confirmed live, it fires on a whatIf SELL for an account later
+        confirmed permitted via a clean openOrder response in the same
+        request. Treating it as terminal reported a false rejection."""
+        portfolio = self._ready(portfolio_instance)
+
+        def fake_place_order_raw(order_id, contract, order):
+            portfolio.error(order_id, 0, 10349, "Order TIF was set to DAY based on order preset.")
+            order_state = MagicMock(status="PreSubmitted", rejectReason="",
+                                    warningText="", initMarginBefore="100.0",
+                                    initMarginChange="-10.0", initMarginAfter="90.0")
+            portfolio.openOrder(order_id, contract, order, order_state)
+            return True
+        portfolio.place_order_raw = fake_place_order_raw
+
+        result = portfolio.check_short_selling_permitted(MagicMock(symbol="GLD"), 100)
+
+        assert result["permitted"] is True
+        assert result["reject_reason"] == ""
+
+    def test_dry_run_never_calls_ib(self, portfolio_instance):
+        portfolio = self._ready(portfolio_instance)
+        portfolio.dry_run = True
+        portfolio.place_order_raw = MagicMock(
+            side_effect=AssertionError("must not place an order in dry_run"))
+
+        result = portfolio.check_short_selling_permitted(MagicMock(symbol="GLD"), 100)
+
+        assert result["permitted"] is False
+        assert "dry_run" in result["reject_reason"]
+        portfolio.place_order_raw.assert_not_called()
+
+    def test_not_connected_returns_not_permitted(self, portfolio_instance):
+        portfolio = portfolio_instance   # _connected never set
+        portfolio.dry_run = False
+
+        result = portfolio.check_short_selling_permitted(MagicMock(symbol="GLD"), 100)
+
+        assert result["permitted"] is False
+        assert "not connected" in result["reject_reason"]
+
+    def test_timeout_returns_not_permitted(self, portfolio_instance):
+        portfolio = self._ready(portfolio_instance)
+        portfolio.place_order_raw = MagicMock(return_value=True)   # never responds
+
+        result = portfolio.check_short_selling_permitted(
+            MagicMock(symbol="GLD"), 100, timeout=0.05)
+
+        assert result["permitted"] is False
+        assert "timeout" in result["reject_reason"]
+
+    def test_no_order_id_available(self, portfolio_instance):
+        portfolio = self._ready(portfolio_instance)
+        portfolio._next_order_id = None   # allocate_order_ids returns []
+
+        result = portfolio.check_short_selling_permitted(MagicMock(symbol="GLD"), 100)
+
+        assert result["permitted"] is False
+        assert "no order id" in result["reject_reason"]
 
 
 # =============================================================================
