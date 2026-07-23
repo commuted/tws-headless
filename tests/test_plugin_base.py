@@ -41,13 +41,13 @@ class TestHoldingPosition:
     """Tests for HoldingPosition dataclass"""
 
     def test_create_position(self):
-        """Test creating a holding position"""
+        """Test creating a holding position. market_value is derived
+        (quantity * current_price), not a settable field — no kwarg for it."""
         pos = HoldingPosition(
             symbol="SPY",
             quantity=100,
             cost_basis=45000.0,
             current_price=455.0,
-            market_value=45500.0,
         )
 
         assert pos.symbol == "SPY"
@@ -65,7 +65,7 @@ class TestHoldingPosition:
 
     def test_to_dict(self):
         """Test conversion to dict"""
-        pos = HoldingPosition("SPY", 100, cost_basis=45000.0, market_value=45500.0)
+        pos = HoldingPosition("SPY", 100, cost_basis=45000.0, current_price=455.0)
         d = pos.to_dict()
 
         assert d["symbol"] == "SPY"
@@ -74,13 +74,14 @@ class TestHoldingPosition:
         assert d["market_value"] == 45500.0
 
     def test_from_dict(self):
-        """Test creation from dict"""
+        """Test creation from dict. A stale/mismatched persisted market_value
+        must not be trusted — it's recomputed fresh from quantity * current_price."""
         data = {
             "symbol": "SPY",
             "quantity": 100,
             "cost_basis": 45000.0,
             "current_price": 455.0,
-            "market_value": 45500.0,
+            "market_value": 0.0,   # stale, as a pre-fix persisted file would have
         }
         pos = HoldingPosition.from_dict(data)
 
@@ -100,11 +101,12 @@ class TestHoldings:
         assert holdings.current_positions == []
 
     def test_total_value(self):
-        """Test total value calculation"""
+        """Test total value calculation. market_value is derived from
+        quantity * current_price, so current_price is set to match."""
         holdings = Holdings(plugin_name="test", current_cash=5000.0)
         holdings.current_positions = [
-            HoldingPosition("SPY", 100, market_value=45500.0),
-            HoldingPosition("QQQ", 50, market_value=19250.0),
+            HoldingPosition("SPY", 100, current_price=455.0),   # 100 * 455 = 45500
+            HoldingPosition("QQQ", 50, current_price=385.0),    # 50 * 385 = 19250
         ]
 
         # 5000 + 45500 + 19250 = 69750
@@ -114,8 +116,8 @@ class TestHoldings:
         """Test getting a position by symbol"""
         holdings = Holdings(plugin_name="test")
         holdings.current_positions = [
-            HoldingPosition("SPY", 100, market_value=45500.0),
-            HoldingPosition("QQQ", 50, market_value=19250.0),
+            HoldingPosition("SPY", 100, current_price=455.0),
+            HoldingPosition("QQQ", 50, current_price=385.0),
         ]
 
         pos = holdings.get_position("SPY")
@@ -529,10 +531,10 @@ class TestPluginWithHoldings:
         plugin.add_instrument(PluginInstrument("SPY", "Test"))
         plugin.load()
 
-        # Set some holdings
+        # Set some holdings. market_value is derived from quantity * current_price.
         plugin._holdings.current_cash = 10000.0
         plugin._holdings.current_positions = [
-            HoldingPosition("SPY", 100, market_value=45500.0)
+            HoldingPosition("SPY", 100, current_price=455.0)   # 100 * 455 = 45500
         ]
 
         value = plugin.get_effective_total_value()
@@ -545,7 +547,7 @@ class TestPluginWithHoldings:
         plugin.load()
 
         plugin._holdings.current_positions = [
-            HoldingPosition("SPY", 100, market_value=45500.0)
+            HoldingPosition("SPY", 100, current_price=455.0)   # 100 * 455 = 45500
         ]
 
         pos = plugin.holdings.get_position("SPY")

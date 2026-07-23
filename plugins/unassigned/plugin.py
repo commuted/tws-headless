@@ -241,13 +241,15 @@ class UnassignedPlugin(PluginBase):
                     remainder = pos.quantity - claimed_quantities.get(pos.symbol, 0.0)
                     if remainder <= 1e-9:
                         continue
-                    fraction = remainder / pos.quantity if pos.quantity else 0.0
                     unassigned_positions.append(HoldingPosition(
                         symbol=pos.symbol,
                         quantity=remainder,
                         cost_basis=pos.avg_cost,
                         current_price=pos.current_price,
-                        market_value=pos.market_value * fraction,
+                        # market_value is derived (quantity * current_price on
+                        # HoldingPosition) — remainder * pos.current_price is
+                        # exactly pos.market_value * fraction, so no separate
+                        # kwarg is needed or accepted.
                     ))
                 elif pos.symbol not in self._claimed_symbols:
                     unassigned_positions.append(HoldingPosition(
@@ -255,7 +257,6 @@ class UnassignedPlugin(PluginBase):
                         quantity=pos.quantity,
                         cost_basis=pos.avg_cost,
                         current_price=pos.current_price,
-                        market_value=pos.market_value,
                     ))
 
             # Update holdings
