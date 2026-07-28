@@ -102,15 +102,21 @@ def resolve_socket_path(explicit_socket, env, port, exists=os.path.exists):
     Priority: explicit --socket > --env > --port-derived env > auto-discovery
     of a running engine's socket > legacy fallback.
 
-    Auto-discovery (nothing specified): if the legacy socket exists, use it
-    (a pre-separation engine is running); else if exactly the *paper* socket
-    exists, use it — the common single-engine case should just work. A live
-    engine is never targeted implicitly: if the live socket exists (alone or
-    alongside paper), require --env so commands cannot land on a live account
-    by default.
+    An unrecognized --port (not in _PAPER_PORTS/_LIVE_PORTS) is a hard error,
+    not silently ignored: falling through to auto-discovery on a typo'd port
+    would let a command land on whichever engine happens to be running,
+    without so much as a warning that the port was never used.
+
+    Auto-discovery (nothing specified, or --port not recognized): if the
+    legacy socket exists, use it (a pre-separation engine is running); else
+    if exactly the *paper* socket exists, use it — the common single-engine
+    case should just work. A live engine is never targeted implicitly: if
+    the live socket exists (alone or alongside paper), require --env so
+    commands cannot land on a live account by default.
 
     Returns (socket_path, error_message); error_message is set when the
-    target is ambiguous or live-only and must be chosen explicitly.
+    port is unrecognized, or the target is ambiguous or live-only and must
+    be chosen explicitly.
     """
     if explicit_socket:
         return explicit_socket, None
@@ -120,6 +126,11 @@ def resolve_socket_path(explicit_socket, env, port, exists=os.path.exists):
         derived = _env_from_port(port)
         if derived:
             return _socket_for_env(derived), None
+        return None, (
+            f"Port {port} is not a recognized paper port ({sorted(_PAPER_PORTS)}) "
+            f"or live port ({sorted(_LIVE_PORTS)}). Pass --env paper or --env live, "
+            f"or --socket to target a specific socket path directly."
+        )
 
     if exists(DEFAULT_SOCKET_PATH):
         return DEFAULT_SOCKET_PATH, None
@@ -707,19 +718,25 @@ Examples:
     parser.add_argument(
         "--socket", "-s",
         default=None,
-        help="Socket path (default: ~/.tws_headless_{env}.sock, chosen via --env/--port)",
+        help="Socket path — overrides --env/--port. Default: auto-detect the "
+             "one running engine (legacy pre-separation socket, else a lone "
+             "paper socket); refuses to guess and requires --env if a live "
+             "engine is running, alone or alongside paper",
     )
     parser.add_argument(
         "--env",
         choices=["paper", "live"],
         default=None,
-        help="Target the paper or live engine (selects ~/.tws_headless_{env}.sock)",
+        help="Target the paper or live engine explicitly (selects "
+             "~/.tws_headless_{env}.sock) — required whenever a live engine "
+             "might be running, since auto-detection never targets live",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=None,
-        help="Derive the target engine (paper/live) from a TWS/Gateway port",
+        help="Derive --env from a TWS/Gateway port (paper: 7497/4002, "
+             "live: 7496/4001); an unrecognized port is a hard error, not ignored",
     )
     parser.add_argument(
         "--timeout", "-t",
