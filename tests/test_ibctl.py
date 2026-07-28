@@ -662,6 +662,13 @@ class TestResolveSocketPath:
         path, err = self._resolve(set(), port=7497)
         assert path == self._sock("paper") and err is None
 
+    def test_unrecognized_port_is_an_error_not_ignored(self):
+        # A typo'd/unknown port must not silently fall through to
+        # auto-discovery and land on whatever engine happens to be running.
+        path, err = self._resolve({self._sock("paper")}, port=9999)
+        assert path is None
+        assert "9999" in err and "--env" in err
+
     def test_legacy_socket_preferred_when_present(self):
         from ibctl import DEFAULT_SOCKET_PATH
         path, err = self._resolve({DEFAULT_SOCKET_PATH, self._sock("paper")})
