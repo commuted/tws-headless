@@ -784,6 +784,21 @@ Examples:
             sys.exit(1)
         return
 
+    # A few server-side handlers (ib/run_engine.py's handle_summary and
+    # handle_reconcile) look for a literal "--json" in their own args to
+    # switch their `message` field from human-readable text to a clean JSON
+    # dump — exactly what a `--json` caller wants. But ibctl's --json/-j is
+    # its own *global* argparse flag, consumed by parse_known_args() before
+    # args.command is ever built, so a user-typed "summary --json" can never
+    # reach the server as such — it always arrives as bare "summary", and
+    # --json falls back to wrapping the human-readable message in a JSON
+    # string instead. Re-forward --json on the wire for the commands whose
+    # handlers are confirmed to look for it, so the documented behavior
+    # ("summary --json", "reconcile --json") actually reaches them.
+    _SERVER_JSON_AWARE_COMMANDS = {"summary", "reconcile"}
+    if args.json and args.command[0].lower() in _SERVER_JSON_AWARE_COMMANDS:
+        args.command = args.command + ["--json"]
+
     # Build command string
     command_str = " ".join(args.command)
 
