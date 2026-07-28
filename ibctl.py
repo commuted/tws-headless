@@ -4,11 +4,21 @@ ibctl.py - Command-line client for TWS Headless
 
 Send commands to a running main.py or run_engine.py instance via Unix socket.
 
+This is a quick-start reference, not the full command list — it drifts
+(see git blame) precisely because it's the *second* place commands get
+documented and nobody remembers to update it when the first place, the
+argparse epilog in main() below, gains a new one. Run `./ibctl.py --help`
+for the authoritative, complete list — in particular the full `plugin`
+lifecycle set (freeze, resume, enable, disable, trigger, request, all six
+`instruments` subcommands, export, import) and `reconcile` aren't shown
+below at all.
+
 Usage:
     ./ibctl.py status                          # Get portfolio status
     ./ibctl.py positions                       # List all positions
     ./ibctl.py summary                         # Account summary with plugin breakdown
     ./ibctl.py summary --json                  # Account summary as JSON
+    ./ibctl.py reconcile                       # Sync plugin holdings with IB account
 
     # Simple orders (market only)
     ./ibctl.py sell SPY 10                     # Preview selling 10 shares of SPY
@@ -58,6 +68,8 @@ Usage:
     ./ibctl.py plugin dump NAME_OR_ID          # Dump positions & open orders
     ./ibctl.py plugin help NAME_OR_ID          # Show plugin CLI help
     ./ibctl.py plugin message NAME_OR_ID JSON  # Send arbitrary message to plugin
+    #  ...also: freeze/resume/enable/disable/trigger/request/instruments/
+    #  export/import — see --help, not shown here
     ./ibctl.py pause                           # Pause execution
     ./ibctl.py resume                          # Resume execution
     ./ibctl.py ping                            # Test server connectivity
