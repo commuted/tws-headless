@@ -119,7 +119,7 @@ def resolve_socket_path(explicit_socket, env, port, exists=os.path.exists):
     would let a command land on whichever engine happens to be running,
     without so much as a warning that the port was never used.
 
-    Auto-discovery (nothing specified, or --port not recognized): if the
+    Auto-discovery (nothing specified): if the
     legacy socket exists, use it (a pre-separation engine is running); else
     if exactly the *paper* socket exists, use it — the common single-engine
     case should just work. A live engine is never targeted implicitly: if
