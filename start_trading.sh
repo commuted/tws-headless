@@ -22,6 +22,16 @@
 #
 #   NO_RESTART=1 ./start_trading.sh ...   # old behavior: single run, no loop
 #
+# Lid-switch inhibit:
+#   While the engine process is alive, a systemd handle-lid-switch inhibitor
+#   keeps closing the clamshell from suspending the machine (2026-07-29: a
+#   closed lid put the box to sleep through five market hours).  logind
+#   honors handle-lid-switch locks unconditionally — unlike plain "sleep"
+#   inhibitors, which lid actions ignore by default.  The lock lives exactly
+#   as long as the engine: during backoff waits and after exit the lid
+#   behaves normally.  Idle/automatic suspend and a manual suspend are NOT
+#   blocked, only the lid switch.
+#
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -32,8 +42,18 @@ export IB_PLUGIN_DIR="${3:-$SCRIPT_DIR/plugins}"
 # Run from project root (where ib/ and plugins/ both live)
 cd "$SCRIPT_DIR"
 
+# See "Lid-switch inhibit" in the header.  Degrades to a bare run where
+# systemd-inhibit is unavailable (containers, non-systemd boxes).
+INHIBIT=()
+if command -v systemd-inhibit >/dev/null 2>&1; then
+    INHIBIT=(systemd-inhibit --what=handle-lid-switch
+             --who="tws-engine"
+             --why="IB trading engine running (port $PORT, mode $MODE)"
+             --mode=block)
+fi
+
 if [[ "${NO_RESTART:-0}" == "1" ]]; then
-    exec python3 -m ib.run_engine --port "$PORT" --mode "$MODE"
+    exec "${INHIBIT[@]}" python3 -m ib.run_engine --port "$PORT" --mode "$MODE"
 fi
 
 BACKOFF=5
@@ -50,7 +70,7 @@ trap 'INTERRUPTED=1' INT TERM
 
 while true; do
     START_TS=$(date +%s)
-    python3 -m ib.run_engine --port "$PORT" --mode "$MODE"
+    "${INHIBIT[@]}" python3 -m ib.run_engine --port "$PORT" --mode "$MODE"
     CODE=$?
     ELAPSED=$(( $(date +%s) - START_TS ))
 
