@@ -2067,20 +2067,31 @@ class Portfolio(IBClient):
         Routes to on_bar_update when the requester provided one (so callers can
         tell live bars from the backfill replay); falls back to on_bar otherwise.
 
-        Logged unconditionally, before the entry lookup — see historicalData's
-        docstring for why: our override replaces the base ibapi wrapper method
-        (which would have logged this itself) without replicating that
-        logging, so a genuinely-delivered bar and a silently-dropped one
-        (entry is None, next line) were indistinguishable from the log alone.
+        This used to log every bar at INFO, unconditionally and before the
+        entry lookup — see historicalData's docstring for why: our override
+        replaces the base ibapi wrapper method (which would have logged this
+        itself), so a genuinely-delivered bar and a silently-dropped one were
+        otherwise indistinguishable from the log alone.
+
+        That fires per bar, per subscription, every few seconds, and by
+        2026-08-05 it was 205k lines — 59% of a 42MB engine.log — which is a
+        large part of why a real outage sat unnoticed in that file for eight
+        hours. The distinction it was protecting is kept, and sharpened: a
+        dropped bar is the anomaly, so it stays visible at WARNING, while the
+        routine delivered bar drops to DEBUG.
         """
-        logger.info(
-            f"historicalDataUpdate reqId={reqId} date={getattr(bar, 'date', '?')} "
-            f"close={getattr(bar, 'close', '?')} "
-            f"entry_found={reqId in self._historical_requests}"
-        )
         entry = self._historical_requests.get(reqId)
         if entry is None:
+            logger.warning(
+                f"historicalDataUpdate reqId={reqId} "
+                f"date={getattr(bar, 'date', '?')} "
+                f"close={getattr(bar, 'close', '?')} dropped: no such request"
+            )
             return
+        logger.debug(
+            f"historicalDataUpdate reqId={reqId} date={getattr(bar, 'date', '?')} "
+            f"close={getattr(bar, 'close', '?')} entry_found=True"
+        )
         on_bar, on_bar_update, _on_end, _keep_up_to_date, bars = entry
         bars.append(bar)
         if reqId in self._kutd_last_bar:
