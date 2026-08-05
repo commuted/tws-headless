@@ -57,7 +57,8 @@ async def startup_plugin_sequence(pe) -> None:
     flags against portfolio positions and then subscribes to live bars, after
     which a bar can reach its handler and place an MOC order. Both read a
     ledger that should already be squared against the account; otherwise the
-    plugin acts on the holdings it persisted at shutdown.
+    plugin acts on the holdings it persisted at shutdown, which after a STATE
+    restore may have come from another machine entirely.
 
     Every step runs in a thread so the asyncio event loop stays free for IB
     socket I/O — ``plugin.start()`` may call ``get_historical_data()``, which
@@ -151,6 +152,20 @@ Examples:
         "--plugin-dir",
         default=None,
         help="Plugin directory path (default: from IB_PLUGIN_DIR env or ./plugins)",
+    )
+
+    # STATE snapshot (relocating a stopped platform)
+    parser.add_argument(
+        "--restore-state", nargs="?", const="", default=None, metavar="PATH",
+        help="Restore plugin registry and per-plugin state from a STATE file "
+             "before startup reconciliation (default path: ./STATE.json). Off "
+             "unless given: without it the engine starts from whatever state is "
+             "already on this machine.",
+    )
+    parser.add_argument(
+        "--no-state-on-stop", action="store_true",
+        help="Do not write a STATE snapshot when the engine stops (default: write "
+             "./STATE.json, which together with a repo image relocates the platform)",
     )
 
     # Market data type
@@ -423,6 +438,29 @@ def main():
         if engine.plugin_executive:
             engine.plugin_executive.set_account(account_id)
 
+        # Restore a STATE snapshot before reconciliation and auto-reload, so the
+        # engine reloads the plugin set the snapshot describes and reconciliation
+        # then settles it against live IB positions. Opt-in via --restore-state.
+        if args.restore_state is not None:
+            from . import state_file as state_mod
+            state_path = Path(args.restore_state) if args.restore_state else state_mod.default_state_path()
+            try:
+                snapshot = state_mod.load_state(state_path)
+                report = state_mod.restore_state(
+                    snapshot,
+                    plugin_dir=Path(os.environ["IB_PLUGIN_DIR"]),
+                    expected_account=account_id,
+                )
+                for line in state_mod.format_restore_report(report).split("\n"):
+                    logger.info(line)
+            except Exception as e:
+                # A restore that half-applied is worse than one that did not run:
+                # the operator asked to start from a specific state and must not
+                # be left guessing which one the engine actually has.
+                abort["reason"] = f"STATE restore from {state_path} failed: {e}"
+                logger.error(abort["reason"])
+                return
+
         if command_server:
             if command_server.start():
                 logger.info(f"Command server listening on {socket_path}")
@@ -444,6 +482,27 @@ def main():
 
     def on_stopped():
         logger.info("Engine stopped")
+
+        # Write the STATE snapshot before tearing down the command server. This
+        # runs after PluginExecutive.stop() has flushed every plugin's state.json,
+        # so the snapshot reads the freshly-saved files rather than stale ones.
+        if not args.no_state_on_stop:
+            accounts = getattr(engine.portfolio, "managed_accounts", None) if engine.portfolio else None
+            if accounts:
+                try:
+                    from . import state_file as state_mod
+                    snapshot = state_mod.collect_state(
+                        accounts[0],
+                        plugin_dir=Path(os.environ["IB_PLUGIN_DIR"]),
+                    )
+                    path = state_mod.write_state(snapshot)
+                    logger.info(f"STATE snapshot written to {path}")
+                except Exception as e:
+                    # Never let snapshot failure block shutdown.
+                    logger.error(f"Failed to write STATE snapshot: {e}")
+            else:
+                logger.warning("No managed account known; skipping STATE snapshot")
+
         if command_server:
             command_server.stop()
 

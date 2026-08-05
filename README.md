@@ -106,6 +106,53 @@ Start the engine once against that account first so it creates the schema, or le
 confirmed the new per-account DBs look right, the legacy `~/.ib_executions.db` and
 `~/.tws_headless.sock` can be deleted.
 
+### Relocating the platform — STATE snapshots
+
+Runtime state is split across four stores, and three of them live in `$HOME`, not the
+repo: the per-plugin `state.json` / `holdings.json` / `instruments.json` files (in the
+repo but **gitignored**), `~/.ib_plugin_store_{account}.db` (which plugins reload and in
+what status), `~/.ib_executions_{account}.db`, and `~/.ib_forex_cost_basis.json`. A repo
+image alone therefore cannot relocate a running platform — a `git clone` carries none of
+it.
+
+A **STATE file** closes that gap. The engine writes `./STATE.json` on every clean stop
+(disable with `--no-state-on-stop`), after plugin state has been flushed to disk. STATE
+file + repo image is sufficient to restart elsewhere.
+
+```bash
+# The engine writes STATE.json itself on a clean stop. To collect the same
+# snapshot from a system that is already stopped (or whose engine died):
+./ibctl.py state collect --account DUP278735          # → ./STATE.json
+./ibctl.py state show                                 # summarize, don't apply
+
+# On the target machine, restore before starting:
+RESTORE_STATE=1 ./start_trading.sh 4002 immediate     # first run only
+python3 -m ib.run_engine --port 4002 --restore-state  # or directly
+
+# Or apply it offline (dry run unless --confirm):
+./ibctl.py state restore --account DUP278735 --confirm
+```
+
+`state collect`, `show`, and `restore` read the on-disk stores directly and never touch
+the command socket — that is what lets them work with no engine running.
+
+Restore is **not** a merge. It writes back what the snapshot says is true, then the
+engine's normal startup reconciliation settles the remainder against live IB positions.
+Two safety properties are worth knowing:
+
+- **Restore is opt-in.** Without `--restore-state` the engine starts from whatever state
+  is already on the machine. Under `start_trading.sh` the flag applies to the *first* run
+  only — a supervised restart must not wind the engine back to the snapshot.
+- **It refuses to cross accounts.** A snapshot collected from one account will not be
+  restored over another's stores, for the same reason paper and live never share a
+  socket, an execution DB, or a log.
+
+The executions DB and `historical/bars.db` are deliberately *not* carried — one is an
+audit log of past fills, the other a refetchable market-data cache. Both are listed in
+the snapshot's `not_carried` manifest so a restore tells you what was left behind.
+`STATE.json` holds live positions and is gitignored: copy it alongside a repo image,
+never commit it.
+
 ## CLI — `ibctl.py`
 
 Sends commands to a running engine over the Unix socket.
