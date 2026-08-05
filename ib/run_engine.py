@@ -37,6 +37,61 @@ logging.basicConfig(
 logger = logging.getLogger("trading")
 
 
+async def startup_plugin_sequence(pe) -> None:
+    """Restore last session's plugins: load them, reconcile, then start them.
+
+    The order is the point, and the engine got both boundaries wrong until
+    2026-08-04 by doing reconcile-then-reload in a single pass.
+
+    Reconcile must come AFTER the load. ``reconcile_with_account()`` derives
+    what plugins claim from the plugins loaded in memory
+    (``PluginExecutive._plugins``), so reconciling first always saw an empty
+    claim set — and since reconciliation *sets* ``_unassigned`` to
+    (account − claimed) rather than adding to it, that handed ``_unassigned``
+    the entire account. The plugins then loaded and claimed the same positions
+    on top, leaving every position double-counted until the watchdog's next
+    hourly pass corrected it.
+
+    Reconcile must come BEFORE the start, because starting a plugin opens the
+    door to trading. ``gld_usd_swap.start()`` self-reconciles its own holding
+    flags against portfolio positions and then subscribes to live bars, after
+    which a bar can reach its handler and place an MOC order. Both read a
+    ledger that should already be squared against the account; otherwise the
+    plugin acts on the holdings it persisted at shutdown.
+
+    Every step runs in a thread so the asyncio event loop stays free for IB
+    socket I/O — ``plugin.start()`` may call ``get_historical_data()``, which
+    blocks on ``threading.Event.wait()``, and AsyncIBTransport needs the loop
+    to deliver those responses.
+    """
+    pending = []
+    try:
+        result = await asyncio.to_thread(pe.load_registered_plugins)
+        pending = result["pending_start"]
+        if result["loaded"]:
+            logger.info(f"Loaded plugins from last session: {result['loaded']}")
+        if result["failed"]:
+            logger.warning(f"Failed to load plugins: {result['failed']}")
+    finally:
+        # Reconcile even when the load failed or loaded nothing: an empty or
+        # partial plugin set still has to be squared against the account, and
+        # skipping it would leave _unassigned stale.
+        logger.info("Reconciling plugin holdings with account...")
+        report = await asyncio.to_thread(pe.reconcile_with_account)
+        if report.get("discrepancies"):
+            for line in pe.format_reconciliation_report(report).split("\n"):
+                logger.info(line)
+        else:
+            logger.info("Reconciliation complete: holdings match account")
+
+    if pending:
+        started = await asyncio.to_thread(pe.start_loaded_plugins, pending)
+        if started["started"]:
+            logger.info(f"Auto-started plugins: {started['started']}")
+        if started["failed"]:
+            logger.warning(f"Failed to start plugins: {started['failed']}")
+
+
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
@@ -374,37 +429,14 @@ def main():
             else:
                 logger.warning("Failed to start command server")
 
-        # Reconcile plugin holdings with account on startup
         if engine.plugin_executive:
-            logger.info("Reconciling plugin holdings with account...")
-            report = engine.plugin_executive.reconcile_with_account()
-            if report.get("discrepancies"):
-                formatted = engine.plugin_executive.format_reconciliation_report(report)
-                for line in formatted.split("\n"):
-                    logger.info(line)
-            else:
-                logger.info("Reconciliation complete: holdings match account")
-
-        # Auto-reload plugins from last session.
-        # Run in a thread so the asyncio event loop stays free for IB socket
-        # I/O — plugin.start() may call get_historical_data() which blocks on
-        # threading.Event.wait(), and AsyncIBTransport needs the loop to deliver
-        # those responses.
-        if engine.plugin_executive:
-            pe = engine.plugin_executive
-
-            async def _reload_plugins():
-                result = await asyncio.to_thread(pe.reload_registered_plugins)
-                if result["reloaded"]:
-                    logger.info(f"Auto-reloaded plugins: {result['reloaded']}")
-                if result["failed"]:
-                    logger.warning(f"Failed to reload plugins: {result['failed']}")
-
-            _reload_task = asyncio.get_event_loop().create_task(_reload_plugins())
+            _reload_task = asyncio.get_event_loop().create_task(
+                startup_plugin_sequence(engine.plugin_executive)
+            )
 
             def _on_reload_done(t):
                 if not t.cancelled() and t.exception():
-                    logger.error(f"Plugin reload failed: {t.exception()}")
+                    logger.error(f"Plugin startup sequence failed: {t.exception()}")
 
             _reload_task.add_done_callback(_on_reload_done)
 

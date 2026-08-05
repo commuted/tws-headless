@@ -1567,3 +1567,122 @@ class TestForceReconnect:
 
         executive.force_reconnect("test reason")
         await asyncio.sleep(0)   # let the task run and raise internally
+
+
+class TestTwoPhaseReload:
+    """load_registered_plugins / start_loaded_plugins split.
+
+    The engine reconciles between the two phases, so loading must not start
+    anything and starting must be driven entirely by the caller.
+    """
+
+    def _store(self, tmp_path, *entries):
+        from ib.plugin_store import PluginStore
+        store = PluginStore(db_path=tmp_path / "t.db")
+        for slot, status in entries:
+            f = tmp_path / f"{slot}.py"
+            f.write_text("# placeholder")
+            store.upsert_registry(slot, str(f), "1.0", status)
+        return store
+
+    def _executive(self, store):
+        from unittest.mock import patch
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+        executive._store_patch = patch("ib.plugin_executive.get_plugin_store",
+                                       return_value=store)
+        return executive
+
+    def test_load_phase_starts_nothing(self, tmp_path):
+        from unittest.mock import patch
+        store = self._store(tmp_path, ("a_slot", "started"), ("b_slot", "frozen"))
+
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            executive.load_plugin_from_file = Mock(side_effect=lambda p, slot=None, descriptor=None: {
+                "plugin_name": slot, "slot": slot, "instance_id": slot, "descriptor": None,
+            })
+            executive.start_plugin = Mock(return_value=True)
+
+            result = executive.load_registered_plugins()
+
+        executive.start_plugin.assert_not_called()
+        assert sorted(result["loaded"]) == ["a_slot", "b_slot"]
+        # Only the slot that was 'started' at shutdown is queued to start.
+        assert result["pending_start"] == ["a_slot"]
+
+    def test_start_phase_starts_only_what_it_is_given(self, tmp_path):
+        from unittest.mock import patch
+        store = self._store(tmp_path, ("a_slot", "started"))
+
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            executive.start_plugin = Mock(return_value=True)
+
+            result = executive.start_loaded_plugins(["a_slot"])
+
+        executive.start_plugin.assert_called_once_with("a_slot")
+        assert result["started"] == ["a_slot"]
+        assert result["failed"] == []
+
+    def test_start_phase_reports_failures(self, tmp_path):
+        from unittest.mock import patch
+        store = self._store(tmp_path, ("a_slot", "started"))
+
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            executive.start_plugin = Mock(return_value=False)
+
+            result = executive.start_loaded_plugins(["a_slot"])
+
+        assert result["started"] == []
+        assert result["failed"] == ["a_slot"]
+
+    def test_load_phase_reports_missing_file_as_skipped(self, tmp_path):
+        from unittest.mock import patch
+        from ib.plugin_store import PluginStore
+        store = PluginStore(db_path=tmp_path / "t.db")
+        store.upsert_registry("dead_slot", "/nonexistent/plugin.py", "1.0", "started")
+
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            result = executive.load_registered_plugins()
+
+        assert result["skipped"] == ["dead_slot"]
+        assert result["loaded"] == []
+        assert result["pending_start"] == []
+
+    def test_wrapper_still_loads_and_starts_in_one_pass(self, tmp_path):
+        """reload_registered_plugins keeps its old contract for other callers."""
+        from unittest.mock import patch
+        store = self._store(tmp_path, ("a_slot", "started"), ("b_slot", "frozen"))
+
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            executive.load_plugin_from_file = Mock(side_effect=lambda p, slot=None, descriptor=None: {
+                "plugin_name": slot, "slot": slot, "instance_id": slot, "descriptor": None,
+            })
+            executive.start_plugin = Mock(return_value=True)
+
+            result = executive.reload_registered_plugins()
+
+        executive.start_plugin.assert_called_once_with("a_slot")
+        assert sorted(result["reloaded"]) == ["a_slot", "b_slot"]
+        assert result["failed"] == []
+
+    def test_wrapper_excludes_start_failures_from_reloaded(self, tmp_path):
+        from unittest.mock import patch
+        store = self._store(tmp_path, ("a_slot", "started"), ("b_slot", "frozen"))
+
+        with patch("ib.plugin_executive.get_plugin_store", return_value=store):
+            executive = PluginExecutive(None, None)
+            executive.load_plugin_from_file = Mock(side_effect=lambda p, slot=None, descriptor=None: {
+                "plugin_name": slot, "slot": slot, "instance_id": slot, "descriptor": None,
+            })
+            executive.start_plugin = Mock(return_value=False)
+
+            result = executive.reload_registered_plugins()
+
+        # b_slot was frozen — loaded only, so it still counts as reloaded.
+        assert result["reloaded"] == ["b_slot"]
+        assert result["failed"] == ["a_slot"]

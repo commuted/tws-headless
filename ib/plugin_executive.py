@@ -3255,19 +3255,30 @@ class PluginExecutive:
         })
         return str(local)
 
-    def reload_registered_plugins(self) -> Dict[str, Any]:
+    def load_registered_plugins(self) -> Dict[str, Any]:
         """
-        Reload plugins that were active at last shutdown.
+        Phase 1 of the reload: load plugins that were active at last shutdown,
+        without starting any of them.
 
-        - status='started' → load_plugin_from_file + start_plugin
-        - status='frozen'  → load_plugin_from_file only (operator resumes manually)
+        Loading and starting are separable so the caller can reconcile in
+        between. Reconciliation derives what plugins claim from the plugins
+        loaded in memory, so it has to run after the load; but a plugin that
+        trades on start would otherwise act on its own persisted holdings
+        before those holdings had been squared against the real account. Load
+        everything, reconcile, then start.
 
-        Skips slots already loaded in memory and slots whose class_path file
-        is missing (logs a warning for those).
+        - status='started' → loaded, and its slot returned in ``pending_start``
+        - status='frozen'  → loaded only (operator resumes manually)
 
-        Returns a dict with lists: ``reloaded``, ``skipped``, ``failed``.
+        Skips slots already loaded in memory and slots whose class_path file is
+        missing (logs a warning for those).
+
+        Returns a dict with lists: ``loaded``, ``pending_start``, ``skipped``,
+        ``failed``.
         """
-        result: Dict[str, Any] = {"reloaded": [], "skipped": [], "failed": []}
+        result: Dict[str, Any] = {
+            "loaded": [], "pending_start": [], "skipped": [], "failed": [],
+        }
 
         # Collect already-loaded slots to avoid duplicates
         loaded_slots = {
@@ -3293,7 +3304,7 @@ class PluginExecutive:
 
             if not Path(class_path).exists():
                 logger.warning(
-                    f"reload_registered_plugins: class_path not found for slot "
+                    f"load_registered_plugins: class_path not found for slot "
                     f"'{slot}': {class_path}"
                 )
                 result["skipped"].append(slot)
@@ -3303,21 +3314,55 @@ class PluginExecutive:
                 class_path, slot=slot, descriptor=entry.get("config")
             )
             if load_result is None:
-                logger.warning(f"reload_registered_plugins: failed to load slot '{slot}'")
+                logger.warning(f"load_registered_plugins: failed to load slot '{slot}'")
                 result["failed"].append(slot)
                 continue
 
+            result["loaded"].append(slot)
             if status == "started":
-                if not self.start_plugin(slot):
-                    logger.warning(
-                        f"reload_registered_plugins: loaded but failed to start slot '{slot}'"
-                    )
-                    result["failed"].append(slot)
-                    continue
-
-            result["reloaded"].append(slot)
+                result["pending_start"].append(slot)
 
         return result
+
+    def start_loaded_plugins(self, slots: List[str]) -> Dict[str, Any]:
+        """
+        Phase 2 of the reload: start slots already loaded by
+        ``load_registered_plugins``.
+
+        Returns a dict with lists: ``started``, ``failed``.
+        """
+        result: Dict[str, Any] = {"started": [], "failed": []}
+        for slot in slots:
+            if self.start_plugin(slot):
+                result["started"].append(slot)
+            else:
+                logger.warning(
+                    f"start_loaded_plugins: loaded but failed to start slot '{slot}'"
+                )
+                result["failed"].append(slot)
+        return result
+
+    def reload_registered_plugins(self) -> Dict[str, Any]:
+        """
+        Reload plugins that were active at last shutdown, loading and starting
+        in one pass.
+
+        Convenience wrapper over ``load_registered_plugins`` +
+        ``start_loaded_plugins`` for callers with nothing to do between the two
+        phases. The engine's own startup does NOT use this — it reconciles
+        between the phases (see ib/run_engine.py).
+
+        Returns a dict with lists: ``reloaded``, ``skipped``, ``failed``.
+        """
+        load = self.load_registered_plugins()
+        start = self.start_loaded_plugins(load["pending_start"])
+
+        failed = load["failed"] + start["failed"]
+        return {
+            "reloaded": [s for s in load["loaded"] if s not in set(start["failed"])],
+            "skipped": load["skipped"],
+            "failed": failed,
+        }
 
     def get_execution_history(
         self,

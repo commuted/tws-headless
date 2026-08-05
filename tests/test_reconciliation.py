@@ -808,3 +808,160 @@ class TestReconcileOnStartup:
 
         # format_reconciliation_report should be called when there are discrepancies
         pe.format_reconciliation_report.assert_called_once()
+
+
+class TestStartupOrdering:
+    """Reconciliation must run AFTER the plugin auto-reload, not before.
+
+    reconcile_with_account() derives the claim set from the plugins loaded in
+    memory, and SETs _unassigned to (account - claimed). Reconciling before the
+    auto-reload therefore hands _unassigned the entire account; the real plugins
+    then load and claim the same positions on top, and the ledger double-counts
+    until the next reconcile. These tests pin the ordering that avoids it.
+    """
+
+    def _executive(self, portfolio, plugins, unassigned):
+        from ib.plugin_executive import PluginExecutive
+        pe = object.__new__(PluginExecutive)
+        pe._lock = MagicMock()
+        pe._plugins = {name: MockPluginConfig(p) for name, p in plugins.items()}
+        pe.portfolio = portfolio
+        pe._unassigned_plugin = unassigned
+        return pe
+
+    @staticmethod
+    def _ledger(symbol, *plugins):
+        """Total quantity the platform believes it holds, across every bucket."""
+        total = 0.0
+        for plugin in plugins:
+            pos = plugin.holdings.get_position(symbol)
+            if pos:
+                total += pos.quantity
+        return total
+
+    def test_reconciling_before_reload_double_counts(self):
+        """The old ordering: reconcile with nothing loaded, then plugins arrive."""
+        account = MockPortfolio(positions=[MockPosition("SPY", 100, 450.0, 455.0)], cash=0.0)
+        unassigned = MockPlugin("_unassigned", cash=0.0, is_system=True)
+
+        # Startup reconcile, before the auto-reload: no strategy plugins exist yet.
+        pe = self._executive(account, {"_unassigned": unassigned}, unassigned)
+        pe.reconcile_with_account()
+
+        # _unassigned was handed the whole account.
+        assert unassigned.holdings.get_position("SPY").quantity == 100
+
+        # Now the auto-reload brings back the plugin that actually holds it.
+        momentum = MockPlugin("momentum", cash=0.0, positions=[
+            {"symbol": "SPY", "quantity": 100, "cost_basis": 450.0, "current_price": 455.0}
+        ])
+        pe._plugins["momentum"] = MockPluginConfig(momentum)
+
+        # The ledger now claims twice what the account holds — this is the window
+        # the old ordering left open until the watchdog's next hourly reconcile.
+        assert self._ledger("SPY", momentum, unassigned) == 200
+        assert account.get_position("SPY").quantity == 100
+
+    def test_reconciling_after_reload_matches_the_account(self):
+        """The fixed ordering: plugins are loaded first, so the claim set is real."""
+        account = MockPortfolio(positions=[MockPosition("SPY", 100, 450.0, 455.0)], cash=0.0)
+        unassigned = MockPlugin("_unassigned", cash=0.0, is_system=True)
+        momentum = MockPlugin("momentum", cash=0.0, positions=[
+            {"symbol": "SPY", "quantity": 100, "cost_basis": 450.0, "current_price": 455.0}
+        ])
+
+        pe = self._executive(account, {"momentum": momentum, "_unassigned": unassigned}, unassigned)
+        report = pe.reconcile_with_account()
+
+        assert report["discrepancies"] == []
+        pos = unassigned.holdings.get_position("SPY")
+        assert pos is None or pos.quantity == 0
+        assert self._ledger("SPY", momentum, unassigned) == 100
+
+    def test_a_second_reconcile_heals_the_double_count(self):
+        """The old ordering self-corrected, but only on the next reconcile pass."""
+        account = MockPortfolio(positions=[MockPosition("SPY", 100, 450.0, 455.0)], cash=0.0)
+        unassigned = MockPlugin("_unassigned", cash=0.0, is_system=True)
+
+        pe = self._executive(account, {"_unassigned": unassigned}, unassigned)
+        pe.reconcile_with_account()
+
+        momentum = MockPlugin("momentum", cash=0.0, positions=[
+            {"symbol": "SPY", "quantity": 100, "cost_basis": 450.0, "current_price": 455.0}
+        ])
+        pe._plugins["momentum"] = MockPluginConfig(momentum)
+        pe.reconcile_with_account()
+
+        assert self._ledger("SPY", momentum, unassigned) == 100
+
+
+class TestStartupPluginSequence:
+    """run_engine.startup_plugin_sequence must load, reconcile, then start.
+
+    The ordering is the entire fix, so it is pinned here rather than left to
+    inspection of the startup closure.
+    """
+
+    def _pe(self, pending=("gld_usd_swap",), calls=None):
+        calls = calls if calls is not None else []
+        pe = Mock()
+        pe.load_registered_plugins.side_effect = lambda: (
+            calls.append("load"),
+            {"loaded": list(pending), "pending_start": list(pending),
+             "skipped": [], "failed": []},
+        )[1]
+        pe.reconcile_with_account.side_effect = lambda: (
+            calls.append("reconcile"), {"discrepancies": [], "adjustments": []},
+        )[1]
+        pe.start_loaded_plugins.side_effect = lambda slots: (
+            calls.append("start"), {"started": list(slots), "failed": []},
+        )[1]
+        return pe, calls
+
+    def _run(self, pe):
+        import asyncio
+        from ib.run_engine import startup_plugin_sequence
+        asyncio.run(startup_plugin_sequence(pe))
+
+    def test_order_is_load_reconcile_start(self):
+        pe, calls = self._pe()
+        self._run(pe)
+        assert calls == ["load", "reconcile", "start"]
+
+    def test_start_receives_exactly_the_pending_slots(self):
+        pe, _ = self._pe(pending=("gld_usd_swap", "momentum_5day"))
+        self._run(pe)
+        pe.start_loaded_plugins.assert_called_once_with(["gld_usd_swap", "momentum_5day"])
+
+    def test_nothing_is_started_when_nothing_was_pending(self):
+        pe, calls = self._pe(pending=())
+        self._run(pe)
+        assert calls == ["load", "reconcile"]
+        pe.start_loaded_plugins.assert_not_called()
+
+    def test_reconcile_still_runs_when_the_load_raises(self):
+        """A failed load must not leave _unassigned unreconciled."""
+        import asyncio
+        from ib.run_engine import startup_plugin_sequence
+
+        calls = []
+        pe = Mock()
+        pe.load_registered_plugins.side_effect = RuntimeError("registry unreadable")
+        pe.reconcile_with_account.side_effect = lambda: (
+            calls.append("reconcile"), {"discrepancies": []},
+        )[1]
+
+        with pytest.raises(RuntimeError, match="registry unreadable"):
+            asyncio.run(startup_plugin_sequence(pe))
+
+        assert calls == ["reconcile"]
+        pe.start_loaded_plugins.assert_not_called()
+
+    def test_discrepancies_are_logged(self):
+        pe, _ = self._pe()
+        pe.reconcile_with_account.side_effect = lambda: {
+            "discrepancies": [{"type": "unclaimed_position"}], "adjustments": [],
+        }
+        pe.format_reconciliation_report.return_value = "Found issues:\n- Unclaimed position"
+        self._run(pe)
+        pe.format_reconciliation_report.assert_called_once()

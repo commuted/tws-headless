@@ -171,6 +171,24 @@ Plugins are Python classes that subclass `PluginBase`. They receive market data,
 
 Plugins that were running when the engine last stopped are **automatically reloaded on the next start** — no manual `plugin load` / `plugin start` needed. The engine records each instance in `~/.ib_plugin_store.db` and replays their last lifecycle status (`running` → auto-start; `frozen` → load only).
 
+The auto-reload happens in **two phases with reconciliation between them** — plugins are
+loaded, holdings are reconciled against the account, and only then are plugins started
+(`PluginExecutive.load_registered_plugins` → `reconcile_with_account` →
+`start_loaded_plugins`, sequenced by `run_engine.startup_plugin_sequence`). Both
+boundaries matter:
+
+- **Reconcile after the load**, because `reconcile_with_account()` derives what plugins
+  claim from the plugins loaded in memory and *sets* `_unassigned` to (account − claimed).
+  Reconciling with nothing loaded hands `_unassigned` the whole account, and every
+  position is double-counted once the real plugins load on top.
+- **Reconcile before the start**, because starting a plugin opens the door to trading — a
+  plugin's `start()` typically self-reconciles its own holding flags and subscribes to
+  live bars, after which a bar can place an order. It should act on a ledger already
+  squared against the account.
+
+`reload_registered_plugins()` still does both phases in one pass for callers with nothing
+to do in between; the engine's own startup does not use it.
+
 ### File layout
 
 ```
