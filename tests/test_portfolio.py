@@ -2031,3 +2031,57 @@ class TestPnLCallbacks:
         assert exec_id == "exec_001"
         assert commission == 1.25
         assert currency == "USD"
+
+
+class TestWaitForPositions:
+    """Portfolio.wait_for_positions gates anything that compares ledgers to IB.
+
+    An empty `positions` list means "download hasn't happened yet" as often as
+    it means "account holds nothing", and the two are indistinguishable to a
+    caller. Reconciling on the former deletes real holdings as phantoms.
+    """
+
+    def _portfolio(self):
+        from portfolio import Portfolio
+        with patch.object(Portfolio, '__init__', lambda self, **kw: None):
+            p = Portfolio()
+        p._positions_done = asyncio.Event()
+        return p
+
+    def test_returns_true_once_the_snapshot_is_complete(self):
+        p = self._portfolio()
+
+        async def scenario():
+            p._positions_done.set()
+            return await p.wait_for_positions(timeout=1.0)
+
+        assert asyncio.run(scenario()) is True
+
+    def test_returns_false_when_positions_never_arrive(self):
+        p = self._portfolio()
+
+        async def scenario():
+            return await p.wait_for_positions(timeout=0.05)
+
+        assert asyncio.run(scenario()) is False
+
+    def test_blocks_until_position_end_fires(self):
+        """positionEnd is what flips the event, mirroring the IB callback."""
+        p = self._portfolio()
+        p._positions = {}
+        p._callbacks = {}
+        order = []
+
+        async def scenario():
+            async def late_end():
+                await asyncio.sleep(0.05)
+                order.append("positionEnd")
+                p.positionEnd()
+
+            asyncio.create_task(late_end())
+            ok = await p.wait_for_positions(timeout=2.0)
+            order.append("waiter_resumed")
+            return ok
+
+        assert asyncio.run(scenario()) is True
+        assert order == ["positionEnd", "waiter_resumed"]
