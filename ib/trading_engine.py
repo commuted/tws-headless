@@ -128,6 +128,11 @@ class TradingEngine:
         self.config = config or EngineConfig()
         self._state = EngineState.STOPPED
         self._shutdown_event = asyncio.Event()
+        # Set only once stop() has fully finished. _shutdown_event fires at the
+        # START of stop(), so it says "shutdown was requested", not "shutdown is
+        # done" — anything that must not outlive a complete shutdown has to wait
+        # on this one instead. See wait_until_stopped().
+        self._stopped_event = asyncio.Event()
 
         # Create components
         self._portfolio = Portfolio(
@@ -681,6 +686,7 @@ class TradingEngine:
 
         self._state = EngineState.STARTING
         self._shutdown_event.clear()
+        self._stopped_event.clear()
 
         logger.info("Starting trading engine...")
 
@@ -762,6 +768,30 @@ class TradingEngine:
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
             self._state = EngineState.ERROR
+        finally:
+            # Announce completion even on the error path: a caller waiting for
+            # a clean shutdown must not block forever because one failed.
+            self._stopped_event.set()
+
+    async def wait_until_stopped(self, timeout: float = 30.0) -> bool:
+        """Wait for an in-flight stop() to finish. Returns False on timeout.
+
+        stop() is normally scheduled as a task (by the SIGINT handler and by the
+        command server's `stop`), and it sets _shutdown_event immediately — so
+        run_forever() returns and the process can exit while stop() is still
+        working. Awaiting this instead keeps the process alive through
+        PluginExecutive.stop(), which flushes plugin state, and through the
+        on_stopped callback.
+        """
+        try:
+            await asyncio.wait_for(self._stopped_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Shutdown did not complete within {timeout:.0f}s; exiting with "
+                "a stop still in flight (plugin state may not be fully saved)"
+            )
+            return False
 
     def pause(self):
         """Pause plugin execution (data still flows)"""
