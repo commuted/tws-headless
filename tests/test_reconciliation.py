@@ -904,7 +904,13 @@ class TestStartupPluginSequence:
 
     def _pe(self, pending=("gld_usd_swap",), calls=None):
         calls = calls if calls is not None else []
+
+        async def wait_for_positions(timeout=30.0):
+            return True
+
         pe = Mock()
+        pe.portfolio = Mock()
+        pe.portfolio.wait_for_positions = wait_for_positions
         pe.load_registered_plugins.side_effect = lambda: (
             calls.append("load"),
             {"loaded": list(pending), "pending_start": list(pending),
@@ -944,8 +950,13 @@ class TestStartupPluginSequence:
         import asyncio
         from ib.run_engine import startup_plugin_sequence
 
+        async def wait_for_positions(timeout=30.0):
+            return True
+
         calls = []
         pe = Mock()
+        pe.portfolio = Mock()
+        pe.portfolio.wait_for_positions = wait_for_positions
         pe.load_registered_plugins.side_effect = RuntimeError("registry unreadable")
         pe.reconcile_with_account.side_effect = lambda: (
             calls.append("reconcile"), {"discrepancies": []},
@@ -965,3 +976,73 @@ class TestStartupPluginSequence:
         pe.format_reconciliation_report.return_value = "Found issues:\n- Unclaimed position"
         self._run(pe)
         pe.format_reconciliation_report.assert_called_once()
+
+
+class TestReconcileWaitsForPositions:
+    """Startup must never reconcile against a position list that hasn't arrived.
+
+    on_started fires before Portfolio.load() calls reqPositions, so an
+    unguarded reconcile sees zero account positions and deletes every plugin
+    holding as a phantom. Observed live on 2026-08-04: 26 GLD stripped out of
+    gld_usd_swap against an account that actually held 487.
+    """
+
+    def _pe(self, positions_ready=True, calls=None):
+        calls = calls if calls is not None else []
+
+        async def wait_for_positions(timeout=30.0):
+            calls.append("wait_positions")
+            return positions_ready
+
+        pe = Mock()
+        pe.portfolio = Mock()
+        pe.portfolio.wait_for_positions = wait_for_positions
+        pe.load_registered_plugins.side_effect = lambda: (
+            calls.append("load"),
+            {"loaded": ["gld_usd_swap"], "pending_start": ["gld_usd_swap"],
+             "skipped": [], "failed": []},
+        )[1]
+        pe.reconcile_with_account.side_effect = lambda: (
+            calls.append("reconcile"), {"discrepancies": []},
+        )[1]
+        pe.start_loaded_plugins.side_effect = lambda slots: (
+            calls.append("start"), {"started": list(slots), "failed": []},
+        )[1]
+        return pe, calls
+
+    def _run(self, pe):
+        import asyncio
+        from ib.run_engine import startup_plugin_sequence
+        asyncio.run(startup_plugin_sequence(pe))
+
+    def test_waits_for_positions_before_reconciling(self):
+        pe, calls = self._pe(positions_ready=True)
+        self._run(pe)
+        assert calls == ["load", "wait_positions", "reconcile", "start"]
+
+    def test_skips_reconcile_when_positions_never_arrive(self):
+        """Stale ledgers are recoverable; deleted holdings are not."""
+        pe, calls = self._pe(positions_ready=False)
+        self._run(pe)
+        assert "reconcile" not in calls
+        pe.reconcile_with_account.assert_not_called()
+
+    def test_plugins_still_start_when_positions_never_arrive(self):
+        pe, calls = self._pe(positions_ready=False)
+        self._run(pe)
+        assert calls == ["load", "wait_positions", "start"]
+
+    def test_tolerates_a_portfolio_without_the_barrier(self):
+        """Older/mocked portfolios lacking wait_for_positions must not crash."""
+        calls = []
+        pe = Mock()
+        pe.portfolio = object()  # no wait_for_positions attribute
+        pe.load_registered_plugins.side_effect = lambda: (
+            calls.append("load"),
+            {"loaded": [], "pending_start": [], "skipped": [], "failed": []},
+        )[1]
+        pe.reconcile_with_account.side_effect = lambda: (
+            calls.append("reconcile"), {"discrepancies": []},
+        )[1]
+        self._run(pe)
+        assert calls == ["load", "reconcile"]

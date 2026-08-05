@@ -243,6 +243,28 @@ class Portfolio(IBClient):
         all_positions.extend(self._forex_positions.values())
         return all_positions
 
+    async def wait_for_positions(self, timeout: float = 30.0) -> bool:
+        """Wait until reqPositions has delivered a complete position snapshot.
+
+        Anything that compares plugin ledgers against the account must await
+        this first. ``positions`` is an empty list both when the account really
+        holds nothing and when the download simply has not happened yet, and the
+        two are indistinguishable to a caller — reconciling on the second reads
+        every plugin holding as a phantom and deletes it.
+
+        Returns True once the snapshot is complete, False on timeout. A False
+        return means the caller must NOT treat ``positions`` as authoritative.
+        """
+        try:
+            await asyncio.wait_for(self._positions_done.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Timed out after {timeout:.0f}s waiting for the position "
+                "snapshot; positions are not yet authoritative"
+            )
+            return False
+
     @property
     def total_value(self) -> float:
         """Get total portfolio market value"""

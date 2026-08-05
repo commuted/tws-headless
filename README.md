@@ -232,6 +232,12 @@ boundaries matter:
   plugin's `start()` typically self-reconciles its own holding flags and subscribes to
   live bars, after which a bar can place an order. It should act on a ledger already
   squared against the account.
+- **Reconcile only after IB's position snapshot has arrived** (`Portfolio.wait_for_positions`).
+  `on_started` fires before `Portfolio.load()` has even called `reqPositions`, and an
+  empty `positions` list means "not downloaded yet" just as often as "account holds
+  nothing". Reconciling against the former reads every plugin holding as a phantom and
+  deletes it. If the snapshot never arrives, startup reconciliation is **skipped** rather
+  than run on incomplete data — a stale ledger is recoverable, deleted holdings are not.
 
 `reload_registered_plugins()` still does both phases in one pass for callers with nothing
 to do in between; the engine's own startup does not use it.

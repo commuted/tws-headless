@@ -60,6 +60,14 @@ async def startup_plugin_sequence(pe) -> None:
     plugin acts on the holdings it persisted at shutdown, which after a STATE
     restore may have come from another machine entirely.
 
+    Reconciliation additionally waits for IB's position snapshot. on_started
+    fires before Portfolio.load() has even called reqPositions, so an
+    unguarded reconcile compares plugin ledgers against an empty position list
+    and deletes every holding as a phantom — observed live on 2026-08-04
+    stripping 26 GLD out of gld_usd_swap. An empty ``positions`` means "not
+    downloaded yet" just as often as "account holds nothing", so the snapshot
+    must be confirmed complete before it can be treated as the truth.
+
     Every step runs in a thread so the asyncio event loop stays free for IB
     socket I/O — ``plugin.start()`` may call ``get_historical_data()``, which
     blocks on ``threading.Event.wait()``, and AsyncIBTransport needs the loop
@@ -77,13 +85,31 @@ async def startup_plugin_sequence(pe) -> None:
         # Reconcile even when the load failed or loaded nothing: an empty or
         # partial plugin set still has to be squared against the account, and
         # skipping it would leave _unassigned stale.
-        logger.info("Reconciling plugin holdings with account...")
-        report = await asyncio.to_thread(pe.reconcile_with_account)
-        if report.get("discrepancies"):
-            for line in pe.format_reconciliation_report(report).split("\n"):
-                logger.info(line)
+        #
+        # But never reconcile against a position list that has not arrived.
+        # Skipping reconciliation leaves the ledger stale until the watchdog's
+        # next hourly pass; reconciling against a phantom-empty account deletes
+        # real holdings. Only one of those is recoverable.
+        portfolio = getattr(pe, "portfolio", None)
+        positions_ready = True
+        if portfolio is not None and hasattr(portfolio, "wait_for_positions"):
+            positions_ready = await portfolio.wait_for_positions()
+
+        if not positions_ready:
+            logger.error(
+                "Skipping startup reconciliation: IB never delivered a complete "
+                "position snapshot, and reconciling against an incomplete one "
+                "would delete live plugin holdings as phantoms. Plugin ledgers "
+                "stay as they were; run 'ibctl reconcile' once positions are up."
+            )
         else:
-            logger.info("Reconciliation complete: holdings match account")
+            logger.info("Reconciling plugin holdings with account...")
+            report = await asyncio.to_thread(pe.reconcile_with_account)
+            if report.get("discrepancies"):
+                for line in pe.format_reconciliation_report(report).split("\n"):
+                    logger.info(line)
+            else:
+                logger.info("Reconciliation complete: holdings match account")
 
     if pending:
         started = await asyncio.to_thread(pe.start_loaded_plugins, pending)
@@ -532,6 +558,15 @@ def main():
                 await engine.stop()
                 return 1
             await engine.run_forever()
+            # run_forever() returns as soon as _shutdown_event is set, and
+            # stop() sets that at its start — so a stop triggered by Ctrl+C or
+            # `ibctl stop` is still running right now. Returning here would end
+            # asyncio.run() and tear the process down mid-shutdown, losing the
+            # plugin-state flush in PluginExecutive.stop() and the STATE
+            # snapshot written from on_stopped. Both were observed missing on
+            # 2026-08-04 before this wait existed.
+            await engine.stop()              # no-op if one is already in flight
+            await engine.wait_until_stopped()  # ...so wait for that one too
             logger.info("Engine stopped.")
             return 0
         else:
