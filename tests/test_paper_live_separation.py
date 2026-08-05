@@ -235,11 +235,30 @@ class TestIbctlSocketResolution:
         path, _ = m.resolve_socket_path(None, None, 4001, exists=self._NONE_EXIST)
         assert path.endswith("_live.sock")
 
-    def test_unknown_port_falls_back_to_legacy(self):
+    def test_unknown_port_is_rejected(self):
+        """An unrecognized --port is a hard error, not a fallback.
+
+        This asserted the opposite until 2026-08-04, having gone stale when
+        fdc5eeb deliberately changed the behavior.
+        """
         m = self._ibctl()
         path, err = m.resolve_socket_path(None, None, 9999,
                                           exists=self._NONE_EXIST)
-        assert path == m.DEFAULT_SOCKET_PATH and err is None
+        assert path is None
+        assert "9999" in err
+
+    def test_unknown_port_is_rejected_even_when_a_socket_exists(self):
+        """The case the guard exists for: a typo must not land on a live engine.
+
+        The old fallback ran auto-discovery, so `--port 9999` quietly used
+        whichever engine happened to be up — with no warning that the port
+        had been ignored.
+        """
+        m = self._ibctl()
+        path, err = m.resolve_socket_path(None, None, 9999,
+                                          exists=lambda p: True)
+        assert path is None
+        assert "9999" in err
 
     def test_nothing_falls_back_to_legacy(self):
         m = self._ibctl()
