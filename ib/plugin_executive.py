@@ -1164,6 +1164,25 @@ class PluginExecutive:
         if not self.portfolio:
             return {"error": "No portfolio connected", "discrepancies": [], "adjustments": []}
 
+        # The guard lives HERE, not at the call sites, because every caller
+        # needs it and only one of them had it. The startup sequence awaits
+        # wait_for_positions before calling; but the watchdog's periodic pass
+        # and `ibctl reconcile` also land here, and the empty-positions window
+        # is not a startup-only condition — Portfolio.load() re-runs on EVERY
+        # reconnect and clears the position dict before re-requesting it. A
+        # reconcile in that window reads every plugin holding as a phantom and
+        # deletes it (observed live 2026-08-04, at startup; the reconnect
+        # window is the same failure with a different clock).
+        if not getattr(self.portfolio, "positions_ready", True):
+            return {
+                "error": "Position snapshot not ready (disconnected, or "
+                         "reqPositions has not completed since the last "
+                         "[re]connect); refusing to reconcile against a "
+                         "position list that would read as falsely empty",
+                "discrepancies": [],
+                "adjustments": [],
+            }
+
         report = {
             "timestamp": datetime.now().isoformat(),
             "discrepancies": [],

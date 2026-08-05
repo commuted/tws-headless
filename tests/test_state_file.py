@@ -206,3 +206,100 @@ class TestSafety:
             state_file.restore_state(
                 snapshot, plugin_dir=tmp_path / "dst", plugin_store=tmp_path / "dst.db",
             )
+
+
+class TestReanchor:
+    """Relocation must survive a path change — the registry stores ABSOLUTE
+    class_paths, so restoring them verbatim onto a machine whose repo lives
+    anywhere else produced a registry full of source-machine paths that
+    load_registered_plugins then skipped one by one, each with nothing but a
+    log warning: a platform that starts cleanly and silently trades nothing.
+    """
+
+    def _snapshot_with_real_class_path(self, source):
+        """Registry entry whose class_path genuinely lives under the source
+        plugin dir (the fixture's default entries use paths that exist
+        nowhere, which exercises the missing-report instead)."""
+        src_cp = source["plugin_dir"] / "gld_usd_swap" / "plugin.py"
+        src_cp.write_text("# plugin source")
+        PluginStore(source["store_path"]).upsert_registry(
+            "gld_usd_swap", str(src_cp), "1.0", "started", None
+        )
+        return state_file.collect_state(
+            ACCOUNT,
+            plugin_dir=source["plugin_dir"],
+            plugin_store=source["store_path"],
+            root=source["root"],
+        )
+
+    def test_class_path_reanchors_to_the_target_plugin_dir(
+            self, source, tmp_path, monkeypatch):
+        monkeypatch.setattr(state_file, "FOREX_COST_BASIS_PATH", tmp_path / "forex.json")
+        snap = self._snapshot_with_real_class_path(source)
+
+        dst_plugins = tmp_path / "dst" / "plugins"
+        (dst_plugins / "gld_usd_swap").mkdir(parents=True)
+        (dst_plugins / "gld_usd_swap" / "plugin.py").write_text("# relocated")
+        dst_store = tmp_path / "dst" / "store.db"
+
+        report = state_file.restore_state(
+            snap, plugin_dir=dst_plugins, plugin_store=dst_store,
+            expected_account=ACCOUNT,
+        )
+
+        entry = next(e for e in PluginStore(dst_store).list_registry()
+                     if e["slot"] == "gld_usd_swap")
+        assert entry["class_path"] == str(dst_plugins / "gld_usd_swap" / "plugin.py")
+        assert any(r["slot"] == "gld_usd_swap"
+                   for r in report["class_path_rewritten"])
+        # Re-anchored AND present on disk → not in the missing report.
+        assert all(m["slot"] != "gld_usd_swap"
+                   for m in report["class_path_missing"])
+
+    def test_missing_class_path_is_reported_at_restore_time(
+            self, snapshot, tmp_path, monkeypatch):
+        """A class_path that exists nowhere on the target must be flagged NOW,
+        while the operator is watching — not at the next engine start, when
+        the skip is one log line in an unattended restart."""
+        monkeypatch.setattr(state_file, "FOREX_COST_BASIS_PATH", tmp_path / "forex.json")
+        report = state_file.restore_state(
+            snapshot,
+            plugin_dir=tmp_path / "dst" / "plugins",
+            plugin_store=tmp_path / "dst" / "store.db",
+            expected_account=ACCOUNT,
+        )
+        missing = {m["slot"] for m in report["class_path_missing"]}
+        assert {"gld_usd_swap", "watchdog"} <= missing
+        assert "MISSING class_path" in state_file.format_restore_report(report)
+
+    def test_paths_outside_the_source_roots_pass_through_unchanged(
+            self, snapshot, tmp_path, monkeypatch):
+        """The fixture's registry paths (/src/...) are under neither the source
+        plugin dir nor the source root, so re-anchoring must leave them alone
+        — rewriting a path we cannot place would be a guess."""
+        monkeypatch.setattr(state_file, "FOREX_COST_BASIS_PATH", tmp_path / "forex.json")
+        dst_store = tmp_path / "dst" / "store.db"
+        report = state_file.restore_state(
+            snapshot, plugin_dir=tmp_path / "dst" / "plugins",
+            plugin_store=dst_store, expected_account=ACCOUNT,
+        )
+        assert report["class_path_rewritten"] == []
+        entry = next(e for e in PluginStore(dst_store).list_registry()
+                     if e["slot"] == "gld_usd_swap")
+        assert entry["class_path"] == "/src/plugins/gld_usd_swap/plugin.py"
+
+    def test_dry_run_still_reports_rewrites_and_missing(
+            self, source, tmp_path, monkeypatch):
+        monkeypatch.setattr(state_file, "FOREX_COST_BASIS_PATH", tmp_path / "forex.json")
+        snap = self._snapshot_with_real_class_path(source)
+        dst_plugins = tmp_path / "dst" / "plugins"
+        report = state_file.restore_state(
+            snap, plugin_dir=dst_plugins, plugin_store=tmp_path / "dst" / "store.db",
+            expected_account=ACCOUNT, dry_run=True,
+        )
+        assert any(r["slot"] == "gld_usd_swap"
+                   for r in report["class_path_rewritten"])
+        # Target file doesn't exist (dry run created nothing) → reported.
+        assert any(m["slot"] == "gld_usd_swap"
+                   for m in report["class_path_missing"])
+        assert not dst_plugins.exists()

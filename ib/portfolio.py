@@ -243,6 +243,24 @@ class Portfolio(IBClient):
         all_positions.extend(self._forex_positions.values())
         return all_positions
 
+    @property
+    def positions_ready(self) -> bool:
+        """Whether ``positions`` can be treated as authoritative RIGHT NOW.
+
+        True only while connected AND the reqPositions snapshot has completed.
+        This goes False again on every reconnect: _on_connected re-runs
+        ``load()``, which clears both the position dict and _positions_done
+        before re-requesting — so for a few seconds after any recovered
+        connection, ``positions`` is empty because it has been RESET, not
+        because the account is empty. Anything that reconciles against
+        ``positions`` must check this, not just ``connected``.
+
+        The ``connected`` conjunction also covers shutdown, where
+        _positions_done is set merely to unblock waiters: without it,
+        "ready" would read True over a torn-down connection.
+        """
+        return self.connected and self._positions_done.is_set()
+
     async def wait_for_positions(self, timeout: float = 30.0) -> bool:
         """Wait until reqPositions has delivered a complete position snapshot.
 

@@ -692,3 +692,38 @@ class TestResolveSocketPath:
         from ibctl import DEFAULT_SOCKET_PATH
         path, err = self._resolve(set())
         assert path == DEFAULT_SOCKET_PATH and err is None
+
+
+class TestStateArgs:
+    """_state_args must reject what it does not understand.
+
+    The same discipline resolve_socket_path applies to an unrecognized --port:
+    a silently skipped flag is bad enough, but here a typo'd `--acount U123`
+    would also promote `U123` into the positional PATH — restoring the wrong
+    file for the wrong reason with no warning at all.
+    """
+
+    def test_known_flags_parse(self):
+        from ibctl import _state_args
+        opts = _state_args(["STATE.json", "--account", "DU1", "-o", "out.json",
+                            "--confirm", "--json"])
+        assert opts == {"account": "DU1", "output": "out.json",
+                        "path": "STATE.json", "confirm": True, "json": True}
+
+    def test_unknown_flag_is_a_hard_error(self, capsys):
+        from ibctl import _state_args
+        with pytest.raises(SystemExit):
+            _state_args(["--acount", "DU1"])
+        assert "Unknown or incomplete option '--acount'" in capsys.readouterr().out
+
+    def test_flag_missing_its_value_is_a_hard_error(self, capsys):
+        from ibctl import _state_args
+        with pytest.raises(SystemExit):
+            _state_args(["--account"])
+        assert "--account" in capsys.readouterr().out
+
+    def test_second_positional_is_a_hard_error(self, capsys):
+        from ibctl import _state_args
+        with pytest.raises(SystemExit):
+            _state_args(["one.json", "two.json"])
+        assert "Unexpected extra argument" in capsys.readouterr().out

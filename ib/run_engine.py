@@ -68,12 +68,19 @@ async def startup_plugin_sequence(pe) -> None:
     downloaded yet" just as often as "account holds nothing", so the snapshot
     must be confirmed complete before it can be treated as the truth.
 
+    And when the snapshot never arrives, plugins stay loaded but are NOT
+    auto-started. The reconcile-before-start ordering exists because starting
+    opens the door to trading; a timeout must not become a side door through
+    the same wall. The engine waits generously (five minutes) precisely so
+    this path stays rare on unattended restarts.
+
     Every step runs in a thread so the asyncio event loop stays free for IB
     socket I/O — ``plugin.start()`` may call ``get_historical_data()``, which
     blocks on ``threading.Event.wait()``, and AsyncIBTransport needs the loop
     to deliver those responses.
     """
     pending = []
+    positions_ready = True
     try:
         result = await asyncio.to_thread(pe.load_registered_plugins)
         pending = result["pending_start"]
@@ -88,12 +95,15 @@ async def startup_plugin_sequence(pe) -> None:
         #
         # But never reconcile against a position list that has not arrived.
         # Skipping reconciliation leaves the ledger stale until the watchdog's
-        # next hourly pass; reconciling against a phantom-empty account deletes
-        # real holdings. Only one of those is recoverable.
+        # next pass; reconciling against a phantom-empty account deletes real
+        # holdings. Only one of those is recoverable. The wait is generous
+        # (five minutes, not the 30s default) because what rides on it is
+        # whether plugins get to auto-start at all — see below — and an IB
+        # gateway that is merely slow should not cost an unattended restart
+        # its strategies.
         portfolio = getattr(pe, "portfolio", None)
-        positions_ready = True
         if portfolio is not None and hasattr(portfolio, "wait_for_positions"):
-            positions_ready = await portfolio.wait_for_positions()
+            positions_ready = await portfolio.wait_for_positions(timeout=300.0)
 
         if not positions_ready:
             logger.error(
@@ -105,13 +115,34 @@ async def startup_plugin_sequence(pe) -> None:
         else:
             logger.info("Reconciling plugin holdings with account...")
             report = await asyncio.to_thread(pe.reconcile_with_account)
-            if report.get("discrepancies"):
+            if report.get("error"):
+                # reconcile_with_account's own positions_ready guard can still
+                # refuse (e.g. a disconnect between the wait and the call).
+                positions_ready = False
+                logger.error(f"Startup reconciliation refused: {report['error']}")
+            elif report.get("discrepancies"):
                 for line in pe.format_reconciliation_report(report).split("\n"):
                     logger.info(line)
             else:
                 logger.info("Reconciliation complete: holdings match account")
 
-    if pending:
+    if pending and not positions_ready:
+        # Starting a plugin opens the door to trading, and its ledger was
+        # never squared against the account this session — the sequence's
+        # whole reason for reconciling first. An earlier version started them
+        # anyway on this path, which reopened by timeout the exact hazard the
+        # reconcile ordering closes: gld_usd_swap subscribes to live bars on
+        # start and can place an MOC order against holdings that may be stale
+        # or, after a STATE restore, from another machine entirely. Loaded-
+        # but-not-started loses at most a session of trading; trading on an
+        # unsquared ledger can buy a position the account already holds.
+        logger.error(
+            f"NOT auto-starting plugins {pending}: their ledgers were never "
+            "reconciled this session (no position snapshot). They remain "
+            "loaded. Once positions are up, run 'ibctl reconcile', then "
+            "'ibctl plugin start <slot>' for each."
+        )
+    elif pending:
         started = await asyncio.to_thread(pe.start_loaded_plugins, pending)
         if started["started"]:
             logger.info(f"Auto-started plugins: {started['started']}")
@@ -1553,6 +1584,17 @@ class EngineCommandHandler:
         try:
             pe = self.engine.plugin_executive
             report = pe.reconcile_with_account()
+
+            if report.get("error"):
+                # Refused (no portfolio, or the position snapshot has not
+                # arrived since the last [re]connect). Surface it as an error
+                # so the operator retries, rather than reading an empty
+                # discrepancy list as "everything matches".
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"Reconciliation refused: {report['error']}",
+                    data={"report": report},
+                )
 
             if output_json:
                 message = json.dumps(report, indent=2)

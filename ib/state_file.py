@@ -243,6 +243,22 @@ def load_state(path: Optional[Path] = None) -> Dict[str, Any]:
     return snapshot
 
 
+def _reanchor(path_str: str, mappings: List[tuple]) -> str:
+    """Rewrite a path under a source root to the same path under a target root.
+
+    First mapping that contains the path wins; a path under none of them is
+    returned unchanged.
+    """
+    p = Path(path_str)
+    for src, dst in mappings:
+        try:
+            rel = p.relative_to(src)
+        except ValueError:
+            continue
+        return str(Path(dst) / rel)
+    return path_str
+
+
 def restore_state(
     snapshot: Dict[str, Any],
     plugin_dir: Optional[Path] = None,
@@ -259,11 +275,27 @@ def restore_state(
     An account mismatch is a hard error by default. Restoring a paper snapshot
     over a live account's stores (or vice versa) would cross exactly the
     paper/live boundary the rest of the engine works to keep separate.
+
+    Registry ``class_path`` entries are RE-ANCHORED from the source machine's
+    roots (``source.plugin_dir``, ``source.repo_root``) to this machine's.
+    The registry stores absolute paths, so without this a snapshot restored
+    onto a machine whose repo lives anywhere else round-trips the *source*
+    machine's paths — and ``load_registered_plugins`` then skips every slot
+    with nothing but a log warning, leaving a platform that starts cleanly
+    and silently trades nothing. That failure defeated the module's stated
+    purpose ("STATE file + repo image is sufficient") for any relocation that
+    changed the path, which is most of them. A class_path that still does not
+    exist after re-anchoring is reported in ``class_path_missing`` HERE, at
+    restore time, when the operator is watching — not at the next engine
+    start, when nobody is.
     """
     report: Dict[str, Any] = {
         "account_id": snapshot.get("source", {}).get("account_id"),
         "registry_restored": [],
+        "registry_failed": [],
         "registry_extra": [],
+        "class_path_rewritten": [],
+        "class_path_missing": [],
         "files_restored": [],
         "files_failed": [],
         "forex_cost_basis_restored": False,
@@ -288,10 +320,34 @@ def restore_state(
     plugin_dir = plugin_dir_path(plugin_dir)
     store_path = Path(plugin_store) if plugin_store else plugin_store_path_for(account_id)
 
+    # Re-anchor registry class_paths from the source machine's roots to ours.
+    # source.plugin_dir is tried before source.repo_root: the plugin dir is
+    # normally inside the repo, and the more specific mapping must win when the
+    # target overrides IB_PLUGIN_DIR to somewhere outside it.
+    source = snapshot.get("source", {})
+    mappings = []
+    if source.get("plugin_dir"):
+        mappings.append((source["plugin_dir"], str(plugin_dir)))
+    if source.get("repo_root"):
+        mappings.append((source["repo_root"], str(repo_root())))
+
+    registry = []
+    for entry in snapshot.get("plugin_registry", []):
+        entry = dict(entry)
+        original = entry.get("class_path", "")
+        rewritten = _reanchor(original, mappings)
+        if rewritten != original:
+            entry["class_path"] = rewritten
+            report["class_path_rewritten"].append(
+                {"slot": entry["slot"], "from": original, "to": rewritten})
+        if not Path(entry.get("class_path", "")).is_file():
+            report["class_path_missing"].append(
+                {"slot": entry["slot"], "class_path": entry.get("class_path", "")})
+        registry.append(entry)
+
     # Plugin registry: the snapshot wins for every slot it names.
     from .plugin_store import PluginStore
 
-    registry = snapshot.get("plugin_registry", [])
     if not dry_run:
         # The target may be a bare machine where nothing has created this path yet.
         store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,7 +361,7 @@ def restore_state(
                 entry.get("status", "unloaded"),
                 entry.get("config"),
             )
-            (report["registry_restored"] if ok else report["files_failed"]).append(entry["slot"])
+            (report["registry_restored"] if ok else report["registry_failed"]).append(entry["slot"])
     else:
         store = PluginStore(store_path) if store_path.is_file() else None
         existing = {e["slot"] for e in store.list_registry()} if store else set()
@@ -363,8 +419,19 @@ def format_restore_report(report: Dict[str, Any]) -> str:
     ]
     if report.get("forex_cost_basis_restored"):
         lines.append("  forex cost basis          : restored")
+    for item in report.get("class_path_rewritten", []):
+        lines.append(
+            f"  class_path re-anchored    : {item['slot']}: {item['from']} -> {item['to']}")
+    for item in report.get("class_path_missing", []):
+        lines.append(
+            f"  MISSING class_path        : {item['slot']}: {item['class_path']} — "
+            "this slot will be SKIPPED at engine start; fix the path or place "
+            "the repo image before starting")
+    if report.get("registry_failed"):
+        lines.append(
+            f"  REGISTRY FAILED           : {', '.join(report['registry_failed'])}")
     if report.get("files_failed"):
-        lines.append(f"  FAILED                    : {', '.join(report['files_failed'])}")
+        lines.append(f"  FAILED files              : {', '.join(report['files_failed'])}")
     if report.get("registry_extra"):
         lines.append(
             "  slots on this machine but not in the STATE file (left untouched — "
