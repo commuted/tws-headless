@@ -681,3 +681,95 @@ class TestResubscribeInstruments:
             engine._data_feed.subscribe.assert_called_once()
 
 
+
+
+class TestShutdownCompletion:
+    """stop() must be awaitable to completion, not just to 'requested'.
+
+    _shutdown_event fires at the START of stop(), so run_forever() returns
+    while stop() is still working. Callers that exit on that signal tear the
+    process down mid-shutdown — observed live on 2026-08-04 losing both the
+    PluginExecutive state flush and the on_stopped STATE snapshot.
+    """
+
+    def test_stopped_event_starts_unset(self, engine):
+        assert not engine._stopped_event.is_set()
+
+    def test_stop_sets_stopped_event(self, engine):
+        engine._state = EngineState.RUNNING
+        engine._plugin_executive = None
+        engine._data_feed = Mock()
+        engine._connection_manager = Mock()
+        engine._connection_manager.stop = AsyncMock()
+
+        asyncio.run(engine.stop())
+
+        assert engine._stopped_event.is_set()
+
+    def test_stop_sets_stopped_event_even_when_shutdown_raises(self, engine):
+        """A failed shutdown must not leave a waiter blocked forever."""
+        engine._state = EngineState.RUNNING
+        engine._plugin_executive = None
+        engine._data_feed = Mock()
+        engine._data_feed.stop.side_effect = RuntimeError("data feed wedged")
+        engine._connection_manager = Mock()
+        engine._connection_manager.stop = AsyncMock()
+
+        asyncio.run(engine.stop())
+
+        assert engine._state == EngineState.ERROR
+        assert engine._stopped_event.is_set()
+
+    def test_wait_until_stopped_returns_true_once_stopped(self, engine):
+        async def scenario():
+            engine._stopped_event.set()
+            return await engine.wait_until_stopped(timeout=1.0)
+
+        assert asyncio.run(scenario()) is True
+
+    def test_wait_until_stopped_times_out_when_stop_never_finishes(self, engine):
+        """Timing out must return False, not hang the process forever."""
+        async def scenario():
+            return await engine.wait_until_stopped(timeout=0.05)
+
+        assert asyncio.run(scenario()) is False
+
+    def test_wait_until_stopped_waits_for_an_in_flight_stop(self, engine):
+        """The real race: stop() scheduled as a task, caller waits it out."""
+        engine._state = EngineState.RUNNING
+        engine._plugin_executive = None
+        engine._data_feed = Mock()
+        engine._connection_manager = Mock()
+
+        order = []
+
+        async def slow_disconnect():
+            await asyncio.sleep(0.05)
+            order.append("shutdown_finished")
+
+        engine._connection_manager.stop = slow_disconnect
+        engine.on_stopped = lambda: order.append("on_stopped")
+
+        async def scenario():
+            asyncio.create_task(engine.stop())
+            await asyncio.sleep(0)  # let stop() begin and set _shutdown_event
+            assert engine._shutdown_event.is_set()   # "requested"
+            assert not engine._stopped_event.is_set()  # but not "done"
+            await engine.wait_until_stopped(timeout=2.0)
+            order.append("waiter_resumed")
+
+        asyncio.run(scenario())
+
+        # The waiter must not resume until the whole shutdown body has run.
+        assert order == ["shutdown_finished", "on_stopped", "waiter_resumed"]
+
+    def test_start_clears_stopped_event(self, engine):
+        """A restarted engine must not look already-stopped."""
+        engine._stopped_event.set()
+        engine._connection_manager = Mock()
+        engine._connection_manager.start = AsyncMock(return_value=False)
+        engine.config.auto_reconnect = False
+
+        asyncio.run(engine.start())
+
+        assert not engine._stopped_event.is_set()
