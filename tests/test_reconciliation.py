@@ -140,6 +140,68 @@ class TestReconcileWithAccount:
         assert report["discrepancies"] == []
         assert report["adjustments"] == []
 
+    def test_refuses_when_positions_not_ready(self):
+        """The guard lives INSIDE reconcile_with_account, not at call sites.
+
+        The empty-positions window is not a startup-only condition:
+        Portfolio.load() re-runs on every reconnect and clears the position
+        dict before re-requesting it, so the watchdog's periodic pass and
+        `ibctl reconcile` can land in the window too. Reconciling there reads
+        every plugin holding as a phantom and strips it — the 2026-08-04
+        incident, reachable from three call sites of which only one waited.
+        """
+        plugin = MockPlugin("momentum", positions=[
+            {"symbol": "GLD", "quantity": 26, "cost_basis": 300.0}])
+        portfolio = MockPortfolio(positions=[])   # empty because NOT ARRIVED
+        portfolio.positions_ready = False
+        unassigned = MockPlugin("_unassigned", is_system=True)
+        pe = self.create_executive(
+            portfolio=portfolio,
+            plugins={"momentum": plugin, "_unassigned": unassigned},
+            unassigned_plugin=unassigned,
+        )
+
+        report = pe.reconcile_with_account()
+
+        assert "error" in report
+        assert report["discrepancies"] == []
+        assert report["adjustments"] == []
+        # The holding the unguarded version would have deleted as a phantom:
+        assert plugin.holdings.get_position("GLD").quantity == 26
+
+    def test_proceeds_when_positions_ready(self):
+        """The guard must not block honest reconciles: with the snapshot
+        confirmed complete, an empty account really is empty and the phantom
+        removal is correct."""
+        plugin = MockPlugin("momentum", positions=[
+            {"symbol": "GLD", "quantity": 26, "cost_basis": 300.0}])
+        portfolio = MockPortfolio(positions=[])
+        portfolio.positions_ready = True
+        unassigned = MockPlugin("_unassigned", is_system=True)
+        pe = self.create_executive(
+            portfolio=portfolio,
+            plugins={"momentum": plugin, "_unassigned": unassigned},
+            unassigned_plugin=unassigned,
+        )
+
+        report = pe.reconcile_with_account()
+
+        assert "error" not in report
+        assert plugin.holdings.get_position("GLD") is None
+
+    def test_portfolio_without_the_flag_is_trusted(self):
+        """Mocks and legacy portfolios without positions_ready must still
+        reconcile — the default is permissive so only the real Portfolio,
+        which knows its own snapshot state, can refuse."""
+        portfolio = MockPortfolio(positions=[])   # no positions_ready attribute
+        unassigned = MockPlugin("_unassigned", is_system=True)
+        pe = self.create_executive(
+            portfolio=portfolio,
+            plugins={"_unassigned": unassigned},
+            unassigned_plugin=unassigned,
+        )
+        assert "error" not in pe.reconcile_with_account()
+
     def test_no_discrepancies(self):
         """Test reconciliation when plugin holdings match account"""
         # Plugin claims 100 SPY at $450
@@ -1027,10 +1089,33 @@ class TestReconcileWaitsForPositions:
         assert "reconcile" not in calls
         pe.reconcile_with_account.assert_not_called()
 
-    def test_plugins_still_start_when_positions_never_arrive(self):
+    def test_plugins_stay_loaded_but_unstarted_when_positions_never_arrive(self):
+        """No snapshot, no reconcile — and therefore NO AUTO-START.
+
+        An earlier version started the pending plugins anyway on this path,
+        which reopened by timeout the exact hazard the reconcile-before-start
+        ordering closes: a plugin subscribing to live bars and trading on a
+        ledger never squared against the account this session. Loaded-but-
+        unstarted loses at most a session; trading unsquared can double-buy.
+        """
         pe, calls = self._pe(positions_ready=False)
         self._run(pe)
-        assert calls == ["load", "wait_positions", "start"]
+        assert calls == ["load", "wait_positions"]
+        pe.start_loaded_plugins.assert_not_called()
+
+    def test_plugins_stay_unstarted_when_reconcile_itself_refuses(self):
+        """reconcile_with_account has its own positions_ready guard (a
+        disconnect can land between the wait and the call). A refusal from it
+        must gate the auto-start exactly as a failed wait does."""
+        pe, calls = self._pe(positions_ready=True)
+        pe.reconcile_with_account.side_effect = lambda: (
+            calls.append("reconcile"),
+            {"error": "Position snapshot not ready", "discrepancies": [],
+             "adjustments": []},
+        )[1]
+        self._run(pe)
+        assert calls == ["load", "wait_positions", "reconcile"]
+        pe.start_loaded_plugins.assert_not_called()
 
     def test_tolerates_a_portfolio_without_the_barrier(self):
         """Older/mocked portfolios lacking wait_for_positions must not crash."""

@@ -676,6 +676,15 @@ class WatchdogPlugin(PluginBase):
             logger.error(f"Watchdog reconciliation failed: {e}")
             return False
 
+        if report.get("error"):
+            # Refused (typically: position snapshot not ready during a
+            # reconnect window). Not a failure and not a full interval's wait:
+            # roll the clock back so the next watchdog tick retries, once the
+            # snapshot has re-arrived.
+            logger.warning(f"Watchdog reconciliation deferred: {report['error']}")
+            self._last_reconcile = 0.0
+            return False
+
         discrepancies = report.get("discrepancies", [])
         if discrepancies:
             kinds = sorted({d.get("type", "?") for d in discrepancies})

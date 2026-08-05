@@ -316,6 +316,20 @@ class TestPeriodicReconcile:
         plugin._maybe_reconcile()
         assert _alerts(plugin) == []
 
+    def test_refused_reconcile_defers_and_retries_next_tick(self, tmp_path):
+        """A refusal (position snapshot not ready — e.g. the watchdog's pass
+        landed in a reconnect window) is neither drift nor failure: no alert,
+        and the interval clock is rolled back so the next tick retries instead
+        of leaving the ledger unchecked for a full interval."""
+        plugin, executive = self._wired(tmp_path, [])
+        executive.reconcile_with_account.return_value = {
+            "error": "Position snapshot not ready",
+            "discrepancies": [], "adjustments": [],
+        }
+        assert plugin._maybe_reconcile() is False
+        assert _alerts(plugin) == []
+        assert plugin._last_reconcile == 0.0
+
     def test_not_due_skipped(self, tmp_path):
         plugin, executive = self._wired(tmp_path, [])
         plugin._last_reconcile = time.time()

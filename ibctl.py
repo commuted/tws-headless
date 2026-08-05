@@ -639,7 +639,14 @@ def _discover_account() -> str:
 
 
 def _state_args(subargs: list) -> dict:
-    """Parse the flags shared by the state subcommands."""
+    """Parse the flags shared by the state subcommands.
+
+    Unknown flags are a hard error, exactly as resolve_socket_path treats an
+    unrecognized --port: a silently skipped flag is bad enough on its own, but
+    here a typo'd `--acount U123` would also promote `U123` into the
+    positional PATH — restoring the wrong file for the wrong reason with no
+    warning at all.
+    """
     opts = {"account": None, "output": None, "path": None,
             "confirm": False, "json": False}
     i = 0
@@ -654,9 +661,16 @@ def _state_args(subargs: list) -> dict:
         elif a == "--json":
             opts["json"] = True;              i += 1
         elif not a.startswith("-"):
+            if opts["path"] is not None:
+                print(f"[ERROR] Unexpected extra argument '{a}' "
+                      f"(PATH already given: {opts['path']}).")
+                sys.exit(1)
             opts["path"] = a;                 i += 1
         else:
-            i += 1
+            print(f"[ERROR] Unknown or incomplete option '{a}' for the state "
+                  "subcommand. Valid: --account ACCT, -o/--output PATH, "
+                  "--confirm, --json.")
+            sys.exit(1)
     return opts
 
 
@@ -672,6 +686,22 @@ def _state_collect(subargs: list) -> None:
     opts = _state_args(subargs)
     state_mod = _state_module()
     account = opts["account"] or _discover_account()
+
+    # Collection reads plugin state.json files that a RUNNING engine only
+    # flushes at stop/save points, so a snapshot taken mid-session is stale by
+    # however long the session has run. Warn — don't refuse: a leftover socket
+    # from a crashed engine shouldn't block collecting, and the engine writes
+    # its own STATE.json on any clean stop anyway.
+    live_sockets = [p for p in (DEFAULT_SOCKET_PATH,
+                                _socket_for_env("paper"),
+                                _socket_for_env("live"))
+                    if os.path.exists(p)]
+    if live_sockets:
+        print(f"[WARN] An engine may be running (socket present: "
+              f"{', '.join(live_sockets)}). A snapshot from a running system "
+              "reads each plugin's last-flushed state, not its live state — "
+              "prefer stopping the engine first (it writes STATE.json itself "
+              "on a clean stop).")
 
     snapshot = state_mod.collect_state(account)
     path = state_mod.write_state(
