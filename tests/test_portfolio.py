@@ -6,6 +6,7 @@ and order handling. Uses mocks to avoid actual IB connections.
 """
 
 import asyncio
+import logging
 import pytest
 from unittest.mock import MagicMock, patch, PropertyMock, AsyncMock
 from threading import Lock
@@ -1252,14 +1253,27 @@ class TestHistoricalBarRouting:
 
 
 class TestHistoricalBarLogging:
-    """Both callbacks must log unconditionally, before the entry lookup —
-    the base ibapi.wrapper.EWrapper would have logged this itself
-    (logAnswer()), but our override replaces the base method entirely
-    without replicating that call. Without an unconditional log line here,
-    IB genuinely never delivering a bar and our own bookkeeping silently
-    dropping one (entry is None) are indistinguishable from the log alone —
-    exactly the ambiguity that made a week of live-feed debugging harder
-    than it needed to be."""
+    """The base ibapi.wrapper.EWrapper would have logged these itself
+    (logAnswer()), but our overrides replace the base methods entirely without
+    replicating that call. Without a log line, IB genuinely never delivering a
+    bar and our own bookkeeping silently dropping one (entry is None) are
+    indistinguishable — exactly the ambiguity that made a week of live-feed
+    debugging harder than it needed to be.
+
+    historicalData still logs unconditionally at INFO: it fires once per fetch,
+    so it costs nothing.
+
+    historicalDataUpdate no longer does, because it fires per bar per
+    subscription every few seconds — 205k lines and 59% of a 42MB engine.log by
+    2026-08-05, which helped hide a real eight-hour outage inside that file.
+    Both halves of the original ambiguity are still covered, and better:
+      - our own silent drop is the anomaly, so it is now a WARNING, not an INFO
+        line the reader has to notice is missing a counterpart;
+      - a dead feed is caught by the watchdog's bar-staleness check (600s during
+        RTH, with an alert and auto-remediation), which post-dates the debugging
+        session this docstring remembers and reads seconds_since_last_bar from
+        _kutd_last_bar — still updated on every delivered bar.
+    The routine delivered bar falls to DEBUG, so --verbose restores it."""
 
     def test_historical_data_logs_when_entry_found(self, portfolio_instance, caplog):
         portfolio_instance._historical_requests = {7: (lambda b: None, None, None, True, [])}
@@ -1283,17 +1297,38 @@ class TestHistoricalBarLogging:
         assert "historicalData reqId=99" in caplog.text
         assert "entry_found=False" in caplog.text
 
-    def test_historical_data_update_logs_when_entry_found(self, portfolio_instance, caplog):
+    def test_historical_data_update_delivered_bar_is_quiet_at_info(self, portfolio_instance, caplog):
+        """Per-bar, per-subscription: this is the flood, so it must not be INFO."""
         portfolio_instance._historical_requests = {7: (lambda b: None, None, None, True, [])}
         bar = MagicMock(date="20260721 09:35:00", close=368.5)
 
         with caplog.at_level("INFO"):
             portfolio_instance.historicalDataUpdate(7, bar)
 
-        assert "historicalDataUpdate reqId=7" in caplog.text
-        assert "entry_found=True" in caplog.text
+        assert caplog.text == ""
 
-    def test_historical_data_update_logs_when_entry_missing(self, portfolio_instance, caplog):
+    def test_historical_data_update_delivered_bar_is_visible_at_debug(self, portfolio_instance, caplog):
+        portfolio_instance._historical_requests = {7: (lambda b: None, None, None, True, [])}
+        bar = MagicMock(date="20260721 09:35:00", close=368.5)
+
+        with caplog.at_level("DEBUG"):
+            portfolio_instance.historicalDataUpdate(7, bar)
+
+        assert "historicalDataUpdate reqId=7" in caplog.text
+
+    def test_historical_data_update_still_feeds_the_staleness_watchdog(self, portfolio_instance):
+        """The watchdog now owns dead-feed detection, so this must keep ticking."""
+        import time as _t
+        portfolio_instance._historical_requests = {7: (lambda b: None, None, None, True, [])}
+        portfolio_instance._kutd_last_bar = {7: 0.0}
+        bar = MagicMock(date="20260721 09:35:00", close=368.5)
+
+        portfolio_instance.historicalDataUpdate(7, bar)
+
+        assert portfolio_instance._kutd_last_bar[7] > _t.time() - 5
+
+    def test_historical_data_update_dropped_bar_warns(self, portfolio_instance, caplog):
+        """Our own silent drop stays loud — louder than before, in fact."""
         portfolio_instance._historical_requests = {}
         bar = MagicMock(date="20260721 09:35:00", close=368.5)
 
@@ -1301,7 +1336,8 @@ class TestHistoricalBarLogging:
             portfolio_instance.historicalDataUpdate(99, bar)
 
         assert "historicalDataUpdate reqId=99" in caplog.text
-        assert "entry_found=False" in caplog.text
+        assert "dropped" in caplog.text
+        assert any(r.levelname == "WARNING" for r in caplog.records)
 
     def test_log_line_includes_bar_date_and_close(self, portfolio_instance, caplog):
         """The whole point is diagnosing a live feed — the log line must
@@ -1310,7 +1346,7 @@ class TestHistoricalBarLogging:
         portfolio_instance._historical_requests = {7: (lambda b: None, None, None, True, [])}
         bar = MagicMock(date="20260721 09:35:00", close=368.5)
 
-        with caplog.at_level("INFO"):
+        with caplog.at_level("DEBUG"):
             portfolio_instance.historicalDataUpdate(7, bar)
 
         assert "20260721 09:35:00" in caplog.text

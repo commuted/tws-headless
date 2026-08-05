@@ -25,8 +25,15 @@ import asyncio
 import logging
 import sys
 import os
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, List
+
+# Engine log rotation. The file is the operator's record of what the engine did
+# overnight, so the cap is generous — 10 files of 10MB. Rotation matters more
+# than the exact size: before this the file simply grew forever.
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUPS = 10
 
 # Setup logging
 logging.basicConfig(
@@ -317,11 +324,28 @@ def main():
         )
         sys.exit(EXIT_ALREADY_RUNNING)
 
+    # The ibapi library logs every request and every raw error payload at INFO
+    # (47.8k lines, 13% of a 42MB engine.log on 2026-08-05). All of it is
+    # redundant: ib.client re-logs each error at a level that reflects its
+    # severity and in a readable form, immediately after. Keep the library at
+    # WARNING unless the operator explicitly asked for verbose.
+    logging.getLogger("ibapi").setLevel(
+        logging.DEBUG if args.verbose else logging.WARNING
+    )
+
     # Env-keyed log file (in addition to console logging from basicConfig).
+    #
+    # Rotating, because this file had no size bound at all: 42MB and 344k lines
+    # reaching back three weeks by 2026-08-05, which is a large part of why an
+    # eight-hour outage went unnoticed inside it. LOG_MAX_BYTES * LOG_BACKUPS
+    # caps the set; with the INFO floods above removed that is a long history,
+    # not a small one.
     log_file = log_path_for(env)
     try:
         log_file.parent.mkdir(parents=True, exist_ok=True)
-        _file_handler = logging.FileHandler(log_file)
+        _file_handler = RotatingFileHandler(
+            log_file, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS,
+        )
         _file_handler.setFormatter(
             logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
         )
