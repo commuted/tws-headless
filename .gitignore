@@ -55,3 +55,8 @@ historical/*.db
 historical/*.db-shm
 historical/*.db-wal
 historical/config.json
+
+# STATE snapshot (holds live positions; travels with a filesystem image of the
+# repo, never committed)
+STATE.json
+STATE.json.tmp

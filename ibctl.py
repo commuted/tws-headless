@@ -605,6 +605,161 @@ def _historical_purge(subargs: list) -> None:
     print(f"[OK] Purged {deleted} bar(s) for {symbol} / {bar_size} / {what} from {db_path}")
 
 
+# =============================================================================
+# STATE snapshots — handled entirely locally
+#
+# These read on-disk stores directly and never touch the command socket, which
+# is the point: the engine writes a STATE file when it stops, and this is the
+# redundant path for collecting the same snapshot from a system that is already
+# stopped (or whose engine died without writing one).
+# =============================================================================
+
+def _discover_account() -> str:
+    """Infer the account from the per-account plugin store DBs in $HOME.
+
+    Exits with guidance rather than guessing when there is more than one, since
+    picking the wrong account here would write one account's positions into
+    another's state files.
+    """
+    import glob
+    prefix = os.path.join(os.path.expanduser("~"), ".ib_plugin_store_")
+    accounts = sorted(
+        os.path.basename(p)[len(".ib_plugin_store_"):-len(".db")]
+        for p in glob.glob(prefix + "*.db")
+        if not p.endswith(("-wal", "-shm"))
+    )
+    if len(accounts) == 1:
+        return accounts[0]
+    if not accounts:
+        print("[ERROR] No per-account plugin store found in ~. Pass --account ACCOUNT.")
+    else:
+        print(f"[ERROR] Multiple accounts found ({', '.join(accounts)}). "
+              f"Pass --account ACCOUNT to choose one.")
+    sys.exit(1)
+
+
+def _state_args(subargs: list) -> dict:
+    """Parse the flags shared by the state subcommands."""
+    opts = {"account": None, "output": None, "path": None,
+            "confirm": False, "json": False}
+    i = 0
+    while i < len(subargs):
+        a = subargs[i]
+        if a == "--account" and i + 1 < len(subargs):
+            opts["account"] = subargs[i + 1]; i += 2
+        elif a in ("-o", "--output") and i + 1 < len(subargs):
+            opts["output"] = subargs[i + 1];  i += 2
+        elif a == "--confirm":
+            opts["confirm"] = True;           i += 1
+        elif a == "--json":
+            opts["json"] = True;              i += 1
+        elif not a.startswith("-"):
+            opts["path"] = a;                 i += 1
+        else:
+            i += 1
+    return opts
+
+
+def _state_module():
+    """Import the state_file module from the repo next to this script."""
+    sys.path.insert(0, _IBCTL_DIR)
+    from ib import state_file
+    return state_file
+
+
+def _state_collect(subargs: list) -> None:
+    """Collect a STATE snapshot from a stopped system and write it to a file."""
+    opts = _state_args(subargs)
+    state_mod = _state_module()
+    account = opts["account"] or _discover_account()
+
+    snapshot = state_mod.collect_state(account)
+    path = state_mod.write_state(
+        snapshot, opts["output"] or opts["path"] or state_mod.default_state_path()
+    )
+    print(f"[OK] STATE collected for {account} → {path}")
+    print(f"     {len(snapshot['plugin_registry'])} registry entries, "
+          f"{len(snapshot['plugin_files'])} plugin files")
+    for item in snapshot.get("not_carried", []):
+        if item.get("exists"):
+            print(f"     not carried: {item['path']} ({item['reason']})")
+
+
+def _state_show(subargs: list) -> None:
+    """Summarize a STATE file without applying it."""
+    opts = _state_args(subargs)
+    state_mod = _state_module()
+    path = opts["path"] or state_mod.default_state_path()
+    try:
+        snapshot = state_mod.load_state(path)
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        sys.exit(1)
+
+    if opts["json"]:
+        print(json.dumps(snapshot, indent=2, default=str))
+        return
+
+    src = snapshot.get("source", {})
+    print(f"STATE file : {path}")
+    print(f"  created  : {snapshot.get('created_at')}")
+    print(f"  account  : {src.get('account_id')} ({src.get('env')})")
+    print(f"  host     : {src.get('host')}")
+    print(f"  commit   : {src.get('repo_commit')}")
+    print(f"  plugins  : {len(snapshot.get('plugin_registry', []))} registry entries")
+    for entry in snapshot.get("plugin_registry", []):
+        print(f"    {entry['slot']:<24} {entry.get('status', '?'):<10} {entry.get('class_path', '')}")
+    print(f"  files    : {len(snapshot.get('plugin_files', []))}")
+    for entry in snapshot.get("plugin_files", []):
+        print(f"    {entry['path']}")
+    for item in snapshot.get("not_carried", []):
+        if item.get("exists"):
+            print(f"  not carried: {item['path']} ({item['reason']})")
+
+
+def _state_restore(subargs: list) -> None:
+    """Apply a STATE file to this machine's stores (offline).
+
+    Defaults to a dry run — writing another machine's positions and plugin
+    registry over this one's is not something to do on a typo.
+    """
+    opts = _state_args(subargs)
+    state_mod = _state_module()
+    path = opts["path"] or state_mod.default_state_path()
+    try:
+        snapshot = state_mod.load_state(path)
+        report = state_mod.restore_state(
+            snapshot,
+            expected_account=opts["account"],
+            dry_run=not opts["confirm"],
+        )
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        sys.exit(1)
+
+    print(state_mod.format_restore_report(report))
+    if not opts["confirm"]:
+        print("\nDry run — nothing was written. Re-run with --confirm to apply.")
+
+
+def _state_dispatch(subargs: list) -> None:
+    """Route `ibctl.py state <sub>`; never touches the command socket."""
+    if not subargs:
+        print("Usage: state <collect|show|restore> [PATH] [--account ACCOUNT] "
+              "[-o PATH] [--json] [--confirm]")
+        sys.exit(1)
+    sub = subargs[0].lower()
+    if sub == "collect":
+        _state_collect(subargs[1:])
+    elif sub == "show":
+        _state_show(subargs[1:])
+    elif sub == "restore":
+        _state_restore(subargs[1:])
+    else:
+        print(f"Unknown state subcommand '{sub}'. Use collect, show, or restore.")
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Command-line client for TWS Headless",
@@ -684,6 +839,14 @@ Commands:
   historical get-db    Show the current DB path.
 
   reconcile            Sync plugin holdings with IB account
+
+  STATE snapshots (local — no running engine required):
+  state collect [--account ACCT] [-o PATH]
+                       Collect a relocation snapshot from a stopped system
+  state show [PATH] [--json]
+                       Summarize a STATE file without applying it
+  state restore [PATH] [--account ACCT] [--confirm]
+                       Apply a STATE file to this machine (dry run without --confirm)
   pause                Pause algorithm/plugin execution
   resume               Resume algorithm/plugin execution
   ping                 Test server connectivity
@@ -783,6 +946,12 @@ Examples:
     if not args.command:
         parser.print_help()
         sys.exit(0)
+        return
+
+    # STATE subcommand — entirely local, and dispatched before socket resolution
+    # because its whole purpose is to work on a system with no engine running.
+    if args.command[0].lower() == "state":
+        _state_dispatch(args.command[1:])
         return
 
     # Resolve which engine socket to talk to (paper vs live separation).

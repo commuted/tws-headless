@@ -22,6 +22,15 @@
 #
 #   NO_RESTART=1 ./start_trading.sh ...   # old behavior: single run, no loop
 #
+# STATE restore:
+#   RESTORE_STATE=1 ./start_trading.sh ...            # restore ./STATE.json
+#   RESTORE_STATE=/path/STATE.json ./start_trading.sh # restore a specific file
+#   Applies to the FIRST run only. A supervised restart must not wind the engine
+#   back to the snapshot: by then the restored state is already on disk and the
+#   session has moved past it, so re-applying an old snapshot would discard live
+#   progress. The engine writes a fresh ./STATE.json on every clean stop unless
+#   NO_STATE_ON_STOP=1.
+#
 # Lid-switch inhibit:
 #   While the engine process is alive, a systemd handle-lid-switch inhibitor
 #   keeps closing the clamshell from suspending the machine (2026-07-29: a
@@ -52,8 +61,22 @@ if command -v systemd-inhibit >/dev/null 2>&1; then
              --mode=block)
 fi
 
+# STATE flags. RESTORE_STATE=1 means "the default ./STATE.json"; any other value
+# is taken as an explicit path.
+STATE_ARGS=()
+if [[ -n "${RESTORE_STATE:-}" ]]; then
+    if [[ "$RESTORE_STATE" == "1" ]]; then
+        STATE_ARGS+=(--restore-state)
+    else
+        STATE_ARGS+=(--restore-state "$RESTORE_STATE")
+    fi
+fi
+if [[ "${NO_STATE_ON_STOP:-0}" == "1" ]]; then
+    STATE_ARGS+=(--no-state-on-stop)
+fi
+
 if [[ "${NO_RESTART:-0}" == "1" ]]; then
-    exec "${INHIBIT[@]}" python3 -m ib.run_engine --port "$PORT" --mode "$MODE"
+    exec "${INHIBIT[@]}" python3 -m ib.run_engine --port "$PORT" --mode "$MODE" "${STATE_ARGS[@]}"
 fi
 
 BACKOFF=5
@@ -70,9 +93,16 @@ trap 'INTERRUPTED=1' INT TERM
 
 while true; do
     START_TS=$(date +%s)
-    "${INHIBIT[@]}" python3 -m ib.run_engine --port "$PORT" --mode "$MODE"
+    "${INHIBIT[@]}" python3 -m ib.run_engine --port "$PORT" --mode "$MODE" "${STATE_ARGS[@]}"
     CODE=$?
     ELAPSED=$(( $(date +%s) - START_TS ))
+
+    # Drop --restore-state after the first run — see "STATE restore" in the
+    # header. --no-state-on-stop, if set, must survive every restart.
+    STATE_ARGS=()
+    if [[ "${NO_STATE_ON_STOP:-0}" == "1" ]]; then
+        STATE_ARGS+=(--no-state-on-stop)
+    fi
 
     if [[ "$INTERRUPTED" == "1" || "$CODE" == "0" || "$CODE" == "130" || "$CODE" == "143" ]]; then
         echo "Engine exited (code=$CODE after ${ELAPSED}s) — not restarting."
