@@ -55,11 +55,15 @@
 #   Stop on first failure:
 #     ./run_tests.sh -x
 #
-# KNOWN PRE-EXISTING FAILURES (as of last audit)
-#   test_plugin_execution_log.py::TestCommissionApportionment::test_three_plugin_split
-#     Float precision: 0.3 * 1.50 yields 0.449999... instead of 0.45.
-#   test_main.py (several tests)
-#     Depend on runtime state or unimplemented stubs; fail without a live engine.
+# KNOWN PRE-EXISTING FAILURES
+#   None. The suite is green as of 2026-08-04 — a failure here is yours.
+#
+#   This section previously listed test_plugin_execution_log.py's commission
+#   apportionment test (float precision) and "several" test_main.py tests as
+#   expected failures. Both now pass, and the entries had outlived the problems
+#   by long enough that the list was teaching readers to skim past real
+#   breakage. Add something back only while it is actually failing, with the
+#   reason and a way out.
 #
 # REQUIREMENTS
 #   - Python 3.10+
