@@ -109,6 +109,18 @@ while true; do
         exit "$CODE"
     fi
 
+    # Code 3: another engine already owns this environment (ib/environment.py
+    # EXIT_ALREADY_RUNNING). Retrying cannot fix a misconfiguration, and
+    # retrying quietly is how this went unnoticed for eight hours on
+    # 2026-08-05 — a second supervisor relaunching every five minutes while
+    # the first engine held the client id, so no orders were ever placed.
+    if [[ "$CODE" == "3" ]]; then
+        MSG="$(date -Is) engine refused to start: another engine already owns this environment — not restarting"
+        echo "$MSG" >&2
+        echo "$MSG" >> "$RESTART_LOG"
+        exit "$CODE"
+    fi
+
     # A healthy long run means the previous failure was resolved; start the
     # backoff ladder over instead of climbing from where it left off.
     if (( ELAPSED >= RUN_RESET_SECS )); then

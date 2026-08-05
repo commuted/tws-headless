@@ -265,3 +265,52 @@ class TestIbctlSocketResolution:
         path, err = m.resolve_socket_path(None, None, None,
                                           exists=self._NONE_EXIST)
         assert path == m.DEFAULT_SOCKET_PATH and err is None
+
+
+# ---------------------------------------------------------------------------
+# environment.engine_already_running — duplicate-engine guard
+# ---------------------------------------------------------------------------
+
+class TestEngineAlreadyRunning:
+    """Two engines on one environment both default to --client-id 1, and IB
+    answers only the first. The second sees a connection timeout and aborts on
+    a missing managed account, with nothing naming the cause — eight hours of
+    that on 2026-08-05. This guard is what makes it immediate and specific."""
+
+    def test_live_socket_is_detected(self, tmp_path):
+        import socket
+
+        path = str(tmp_path / "live.sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(1)
+        try:
+            assert env.engine_already_running(path) is True
+        finally:
+            srv.close()
+
+    def test_stale_socket_file_does_not_block_startup(self, tmp_path):
+        """A crashed engine leaves its socket behind.
+
+        Treating a leftover file as "already running" would be a worse failure
+        than the one being prevented: the engine could never restart without
+        someone manually deleting it.
+        """
+        import socket
+
+        path = str(tmp_path / "stale.sock")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(path)
+        s.close()  # file remains, nobody listening
+
+        import os
+        assert os.path.exists(path)
+        assert env.engine_already_running(path) is False
+
+    def test_missing_socket_is_not_running(self, tmp_path):
+        assert env.engine_already_running(str(tmp_path / "absent.sock")) is False
+
+    def test_exit_code_is_distinct_from_generic_failure(self):
+        """The supervisor keys on this to stop retrying, so it must not be 1."""
+        assert env.EXIT_ALREADY_RUNNING == 3
+        assert env.EXIT_ALREADY_RUNNING not in (0, 1, 130, 143)

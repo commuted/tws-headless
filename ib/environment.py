@@ -18,9 +18,15 @@ Design:
 All functions here are pure so they can be unit-tested without a live connection.
 """
 
+import socket as _socket
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
+
+# Exit code for "another engine already owns this environment". Distinct from
+# the generic failure code so a supervisor can tell a misconfiguration (never
+# going to fix itself) from a transient startup failure worth retrying.
+EXIT_ALREADY_RUNNING = 3
 
 
 class TradingEnv(str, Enum):
@@ -109,6 +115,38 @@ def log_path_for(env: Union[str, TradingEnv], base_dir: Optional[Path] = None) -
     env = _coerce_env(env)
     root = base_dir if base_dir is not None else Path(__file__).resolve().parent.parent
     return root / "logs" / env.value / "engine.log"
+
+
+def engine_already_running(socket_path: Union[str, Path], timeout: float = 2.0) -> bool:
+    """True if a live engine is already listening on this command socket.
+
+    Connects rather than merely testing for the file. A crashed engine leaves
+    its socket behind, and refusing to start because of a leftover file would be
+    a worse failure than the one this prevents — the engine would never come
+    back up without manual cleanup.
+
+    Two engines sharing one environment is always a misconfiguration, and a
+    silent one: both default to --client-id 1, IB never answers the second
+    connection, and the only symptom is a connection timeout followed by an
+    abort about a missing managed account. Nothing in that chain names the
+    cause. Detecting it here turns eight hours of silent retries into an
+    immediate, specific error.
+    """
+    path = str(socket_path)
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(path)
+        return True
+    except (FileNotFoundError, ConnectionRefusedError):
+        # No socket, or a stale one nobody is listening on: safe to start.
+        return False
+    except OSError:
+        # Anything else (permissions, wrong socket type) is not evidence of a
+        # running engine; let startup proceed and fail on its own terms.
+        return False
+    finally:
+        sock.close()
 
 
 def check_env_consistency(
