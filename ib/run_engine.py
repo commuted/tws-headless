@@ -294,6 +294,29 @@ def main():
     # Env-keyed command socket (unless the user gave an explicit --socket).
     socket_path = args.socket or socket_path_for(env)
 
+    # Refuse to be the second engine on this environment. Starting one anyway
+    # is never useful: both processes default to --client-id 1, IB silently
+    # ignores the second connection, and the failure surfaces only as a
+    # connection timeout and an abort about a missing managed account. On
+    # 2026-08-05 that ran for eight hours — a supervisor restarting the
+    # live-order engine every five minutes while a dry_run engine held the
+    # client id, and nothing in the logs pointing at why.
+    #
+    # Running two engines deliberately is still possible: give the second one
+    # its own --socket (and --client-id), and this check does not fire.
+    from .environment import engine_already_running, EXIT_ALREADY_RUNNING
+    if not args.no_server and engine_already_running(socket_path):
+        logger.error(
+            f"An engine is already running on this {env.value} environment "
+            f"(command socket {socket_path} is live). Refusing to start a "
+            f"second one: both would default to --client-id {args.client_id}, "
+            "and IB answers only the first — the second would sit in a "
+            "connection-timeout loop without ever trading. Stop the running "
+            "engine with './ibctl.py stop', or give this one its own --socket "
+            "and --client-id."
+        )
+        sys.exit(EXIT_ALREADY_RUNNING)
+
     # Env-keyed log file (in addition to console logging from basicConfig).
     log_file = log_path_for(env)
     try:
@@ -465,9 +488,13 @@ def main():
                 f"{engine.config.managed_accounts_timeout:.0f}s after connect). "
                 "Refusing to start on shared/default state without a known "
                 "account — paper/live separation and the environment guardrail "
-                "cannot be enforced. Common transient causes: TWS/Gateway just "
-                "logged in or mid-restart, or 2FA pending. The supervisor will "
-                "retry with backoff."
+                "cannot be enforced. If this repeats rather than clearing on "
+                f"its own, suspect --client-id {args.client_id}: IB answers "
+                "only the first connection to use an id and never replies to "
+                "the second, which looks exactly like this. Check for another "
+                "engine or API client on this gateway. Transient causes that "
+                "do clear: TWS/Gateway just logged in or mid-restart, or 2FA "
+                "pending. The supervisor will retry with backoff."
             )
             logger.error(abort["reason"])
             return
