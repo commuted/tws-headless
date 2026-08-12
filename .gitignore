@@ -30,8 +30,11 @@ env/
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs. The numbered suffixes are RotatingFileHandler's backups
+# (engine.log.1, .2, ...) — *.log does not match them, so without this
+# a 45MB rotated log sat untracked and one 'git add -A' from history.
 *.log
+*.log.[0-9]*
 
 # Local config (may contain credentials)
 config.local.py
