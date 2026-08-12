@@ -1260,13 +1260,51 @@ class PluginBase(ABC):
         if shared_holdings and self.name not in shared_holdings.algorithms:
             shared_holdings.register_algorithm(self.name)
 
+    def mark_to_market(self) -> None:
+        """Refresh each held position's current_price from the live portfolio.
+
+        current_price is written once, by add_position() at fill time, and never
+        again — so every value derived from it drifts further from reality the
+        longer a position is held. On 2026-08-05 gld_usd_swap was reported at
+        $23,562.38 against a true mark of $23,962.52, because its 26 GLD were
+        still priced at the previous day's 374.18 fill while GLD closed at
+        389.57.
+
+        This is the same failure market_value had before it became a derived
+        property, one level down: that fix removed a stored field that could go
+        stale, and left the stored field it derives from. Deriving current_price
+        the same way is not possible — a HoldingPosition has no route to a price
+        source — so it is refreshed at the point of use instead.
+
+        Silently does nothing without a portfolio (backtests, unit tests) or for
+        a symbol the account does not hold, leaving the last known price rather
+        than zeroing a position that is simply not in this account's snapshot.
+        """
+        if not self.portfolio or not self._holdings:
+            return
+        for position in self._holdings.current_positions:
+            try:
+                live = self.portfolio.get_position(position.symbol)
+            except Exception as e:
+                logger.debug(f"mark_to_market: no live price for {position.symbol}: {e}")
+                continue
+            price = getattr(live, "current_price", 0.0) if live else 0.0
+            if price:
+                position.current_price = price
+
     def get_effective_holdings(self) -> Dict:
         """
         Get holdings from appropriate source (shared or per-plugin).
 
+        Marks to market first: this is the single choke point every consumer of
+        a plugin's holdings value goes through (the account summary, the
+        executive's holdings summary, reconciliation), so refreshing here fixes
+        all of them rather than each remembering to ask.
+
         Returns:
             Dict with cash, positions, total_value
         """
+        self.mark_to_market()
         if self._shared_holdings:
             return self._shared_holdings.get_algorithm_holdings(self.name)
         elif self._holdings:

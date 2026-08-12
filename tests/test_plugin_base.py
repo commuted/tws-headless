@@ -946,3 +946,63 @@ class TestTradingHoursDefault:
 
         plugin = WindowedPlugin()
         assert plugin.trading_hours() == [(dt_time(9, 15), dt_time(16, 0))]
+
+
+class TestMarkToMarket:
+    """current_price is written once by add_position() at fill time and never
+    again, so every value derived from it drifts as the position is held. On
+    2026-08-05 gld_usd_swap was reported at $23,562.38 against a true mark of
+    $23,962.52 — 26 GLD still priced at the previous day's 374.18 fill while
+    GLD closed at 389.57."""
+
+    def _plugin_holding(self, symbol, qty, fill_price, tmp_path=None):
+        p = ConcreteTestPlugin(name="mtm_test")
+        p.load()
+        p.holdings.add_position(symbol, qty, fill_price, fill_price)
+        return p
+
+    def _portfolio_at(self, symbol, price):
+        pos = Mock()
+        pos.symbol = symbol
+        pos.current_price = price
+        portfolio = Mock()
+        portfolio.get_position = lambda s: pos if s == symbol else None
+        return portfolio
+
+    def test_holdings_value_uses_the_live_price(self):
+        p = self._plugin_holding("GLD", 26, 374.18)
+        p.portfolio = self._portfolio_at("GLD", 389.57)
+
+        holdings = p.get_effective_holdings()
+
+        assert holdings["positions"][0]["current_price"] == 389.57
+        assert holdings["positions"][0]["market_value"] == pytest.approx(26 * 389.57)
+
+    def test_stale_fill_price_is_what_it_replaces(self):
+        """Without the refresh this is the number that gets reported."""
+        p = self._plugin_holding("GLD", 26, 374.18)
+        assert p.holdings.current_positions[0].current_price == 374.18
+        p.portfolio = self._portfolio_at("GLD", 389.57)
+        p.mark_to_market()
+        assert p.holdings.current_positions[0].current_price == 389.57
+
+    def test_no_portfolio_leaves_prices_alone(self):
+        """Backtests and unit tests have no portfolio; must not crash or zero."""
+        p = self._plugin_holding("GLD", 26, 374.18)
+        p.portfolio = None
+        p.mark_to_market()
+        assert p.holdings.current_positions[0].current_price == 374.18
+
+    def test_symbol_absent_from_account_keeps_last_known_price(self):
+        """Zeroing here would erase a position's value on a partial snapshot."""
+        p = self._plugin_holding("GLD", 26, 374.18)
+        p.portfolio = self._portfolio_at("QQQ", 500.0)  # no GLD
+        p.mark_to_market()
+        assert p.holdings.current_positions[0].current_price == 374.18
+
+    def test_zero_price_does_not_overwrite(self):
+        """IB reports 0.0 for an unpriced contract — not a real mark."""
+        p = self._plugin_holding("GLD", 26, 374.18)
+        p.portfolio = self._portfolio_at("GLD", 0.0)
+        p.mark_to_market()
+        assert p.holdings.current_positions[0].current_price == 374.18
