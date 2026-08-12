@@ -1492,14 +1492,34 @@ class GldUsdSwapPlugin(PluginBase):
     # ORDER EXECUTION
     # =========================================================================
 
+    def _record_trade(self, when: str) -> None:
+        """Count a trade, once IB has accepted the order.
+
+        These counters used to increment at the top of each order method,
+        before placement — so anything that stopped an order short still
+        counted it. On 2026-08-05 a dry_run engine suppressed a live MKT SELL
+        of 26 GLD and trade_count still went 19 -> 20, recording a trade that
+        never reached the market. A rejection did the same.
+
+        The rule is that the plugin counts a trade unless it has been told the
+        order failed. A portfolio returning None said no — suppressed by
+        dry_run, or rejected. No portfolio at all (backtests, unit tests) is
+        not a refusal: there is nothing there to refuse, the order method logs
+        "[no portfolio]" and the trade is assumed, so it still counts.
+
+        The published signal keeps its own timestamp, taken when the decision
+        was made: the signal genuinely happened even when the order did not.
+        """
+        self._trade_count += 1
+        self._last_trade_time = when
+
     def _place_moc_buy(self, shares: int, reason: str) -> None:
-        self._trade_count    += 1
-        self._last_trade_time = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         self.publish(
             "gld_usd_swap_signals",
             {
-                "timestamp":  self._last_trade_time,
+                "timestamp":  now,
                 "action":     "BUY",
                 "order_type": "MOC",
                 "quantity":   shares,
@@ -1511,6 +1531,7 @@ class GldUsdSwapPlugin(PluginBase):
         )
 
         if not self.portfolio:
+            self._record_trade(now)
             logger.info(f"[no portfolio] MOC BUY {shares} GLD — {reason}")
             return
 
@@ -1523,6 +1544,7 @@ class GldUsdSwapPlugin(PluginBase):
 
         oid = self.portfolio.place_order_custom(contract, order)
         if oid is not None:
+            self._record_trade(now)
             self._pending_order_actions[oid] = "BUY"
             self._pending_order_placed_at[oid] = time.time()
             self.register_order(oid)
@@ -1531,13 +1553,12 @@ class GldUsdSwapPlugin(PluginBase):
             logger.error(f"Failed to place MOC BUY {shares} GLD — {reason}")
 
     def _emit_sell(self, qty: int, reason: str) -> None:
-        self._trade_count    += 1
-        self._last_trade_time = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         self.publish(
             "gld_usd_swap_signals",
             {
-                "timestamp":  self._last_trade_time,
+                "timestamp":  now,
                 "action":     "SELL",
                 "order_type": "MKT",
                 "quantity":   qty,
@@ -1549,6 +1570,7 @@ class GldUsdSwapPlugin(PluginBase):
         )
 
         if not self.portfolio:
+            self._record_trade(now)
             logger.info(f"[no portfolio] MKT SELL {qty} GLD — {reason}")
             return
 
@@ -1561,6 +1583,7 @@ class GldUsdSwapPlugin(PluginBase):
 
         oid = self.portfolio.place_order_custom(contract, order)
         if oid is not None:
+            self._record_trade(now)
             self._pending_order_actions[oid] = "SELL"
             self._pending_order_placed_at[oid] = time.time()
             self.register_order(oid)
@@ -1575,13 +1598,12 @@ class GldUsdSwapPlugin(PluginBase):
         _apply_signed_fill_to_holdings handles that crossing-through-zero
         correctly on fill, so this is just a SELL like _emit_sell, tagged
         differently so on_order_fill knows to set _short_gld."""
-        self._trade_count    += 1
-        self._last_trade_time = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         self.publish(
             "gld_usd_swap_signals",
             {
-                "timestamp":  self._last_trade_time,
+                "timestamp":  now,
                 "action":     "SELL",
                 "order_type": "MOC",
                 "quantity":   shares,
@@ -1593,6 +1615,7 @@ class GldUsdSwapPlugin(PluginBase):
         )
 
         if not self.portfolio:
+            self._record_trade(now)
             logger.info(f"[no portfolio] MOC SHORT SELL {shares} GLD — {reason}")
             return
 
@@ -1605,6 +1628,7 @@ class GldUsdSwapPlugin(PluginBase):
 
         oid = self.portfolio.place_order_custom(contract, order)
         if oid is not None:
+            self._record_trade(now)
             self._pending_order_actions[oid] = "SHORT_OPEN"
             self._pending_order_placed_at[oid] = time.time()
             self.register_order(oid)
@@ -1615,13 +1639,12 @@ class GldUsdSwapPlugin(PluginBase):
     def _place_cover_buy(self, shares: int, reason: str) -> None:
         """Reset-cadence pause: buy to cover the overnight short at the
         market open, going flat for the intraday session."""
-        self._trade_count    += 1
-        self._last_trade_time = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         self.publish(
             "gld_usd_swap_signals",
             {
-                "timestamp":  self._last_trade_time,
+                "timestamp":  now,
                 "action":     "BUY",
                 "order_type": "MKT",
                 "quantity":   shares,
@@ -1633,6 +1656,7 @@ class GldUsdSwapPlugin(PluginBase):
         )
 
         if not self.portfolio:
+            self._record_trade(now)
             logger.info(f"[no portfolio] MKT COVER BUY {shares} GLD — {reason}")
             return
 
@@ -1645,6 +1669,7 @@ class GldUsdSwapPlugin(PluginBase):
 
         oid = self.portfolio.place_order_custom(contract, order)
         if oid is not None:
+            self._record_trade(now)
             self._pending_order_actions[oid] = "SHORT_COVER"
             self._pending_order_placed_at[oid] = time.time()
             self.register_order(oid)
@@ -1658,13 +1683,12 @@ class GldUsdSwapPlugin(PluginBase):
         account can't sell short. Mirrors _place_moc_short's cadence exactly
         (fresh position every paused evening, closed every paused morning),
         just on a different symbol via an ordinary long purchase."""
-        self._trade_count    += 1
-        self._last_trade_time = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         self.publish(
             "gld_usd_swap_signals",
             {
-                "timestamp":  self._last_trade_time,
+                "timestamp":  now,
                 "action":     "BUY",
                 "order_type": "MOC",
                 "quantity":   shares,
@@ -1676,6 +1700,7 @@ class GldUsdSwapPlugin(PluginBase):
         )
 
         if not self.portfolio:
+            self._record_trade(now)
             logger.info(f"[no portfolio] MOC BUY {shares} GLL — {reason}")
             return
 
@@ -1688,6 +1713,7 @@ class GldUsdSwapPlugin(PluginBase):
 
         oid = self.portfolio.place_order_custom(contract, order)
         if oid is not None:
+            self._record_trade(now)
             self._pending_order_actions[oid] = "GLL_OPEN"
             self._pending_order_placed_at[oid] = time.time()
             self.register_order(oid)
@@ -1699,13 +1725,12 @@ class GldUsdSwapPlugin(PluginBase):
         """Reset-cadence pause, GLL fallback: sell the overnight GLL hedge
         at the market open, going flat for the intraday session — mirrors
         _place_cover_buy's cadence, an ordinary sell instead of a cover."""
-        self._trade_count    += 1
-        self._last_trade_time = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         self.publish(
             "gld_usd_swap_signals",
             {
-                "timestamp":  self._last_trade_time,
+                "timestamp":  now,
                 "action":     "SELL",
                 "order_type": "MKT",
                 "quantity":   shares,
@@ -1717,6 +1742,7 @@ class GldUsdSwapPlugin(PluginBase):
         )
 
         if not self.portfolio:
+            self._record_trade(now)
             logger.info(f"[no portfolio] MKT SELL {shares} GLL — {reason}")
             return
 
@@ -1729,6 +1755,7 @@ class GldUsdSwapPlugin(PluginBase):
 
         oid = self.portfolio.place_order_custom(contract, order)
         if oid is not None:
+            self._record_trade(now)
             self._pending_order_actions[oid] = "GLL_CLOSE"
             self._pending_order_placed_at[oid] = time.time()
             self.register_order(oid)
