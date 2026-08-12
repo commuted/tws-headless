@@ -1492,3 +1492,76 @@ class TestResetCadenceGllFallback:
         plugin.reset_cadence_enabled = True
         plugin._start_subscriptions()
         assert "GLL" in subscribed_symbols
+
+
+# ---------------------------------------------------------------------------
+# trade_count accounting
+# ---------------------------------------------------------------------------
+
+class TestTradeCountOnlyCountsPlacedOrders:
+    """The counters incremented at the top of each order method, before
+    placement, so anything that stopped an order short still counted it. On
+    2026-08-05 a dry_run engine suppressed a live MKT SELL of 26 GLD and
+    trade_count still went 19 -> 20."""
+
+    def _plugin_with_portfolio(self, tmp_path, order_id):
+        plugin = _make_plugin(tmp_path)
+        plugin.portfolio = Mock()
+        plugin.portfolio.place_order_custom = Mock(return_value=order_id)
+        plugin.register_order = Mock()
+        plugin._gld_price = 380.0
+        return plugin
+
+    def test_accepted_order_counts(self, tmp_path):
+        plugin = self._plugin_with_portfolio(tmp_path, order_id=42)
+        plugin._place_moc_buy(26, "test")
+        assert plugin._trade_count == 1
+        assert plugin._last_trade_time is not None
+
+    def test_suppressed_or_rejected_order_does_not_count(self, tmp_path):
+        """place_order_custom returns None in dry_run and on rejection."""
+        plugin = self._plugin_with_portfolio(tmp_path, order_id=None)
+        plugin._place_moc_buy(26, "test")
+        assert plugin._trade_count == 0
+        assert plugin._last_trade_time is None
+
+    def test_signal_is_still_published_when_the_order_is_suppressed(self, tmp_path):
+        """The decision happened even though the trade did not — the signal
+        must still go out, timestamped, or downstream loses the record."""
+        plugin = self._plugin_with_portfolio(tmp_path, order_id=None)
+        plugin.publish = Mock()
+
+        plugin._place_moc_buy(26, "test")
+
+        plugin.publish.assert_called_once()
+        payload = plugin.publish.call_args[0][1]
+        assert payload["action"] == "BUY"
+        assert payload["timestamp"]  # decision time, not a trade time
+
+    def test_every_order_path_counts_only_on_acceptance(self, tmp_path):
+        """All six placement methods shared the same bug; pin all six."""
+        calls = [
+            ("_place_moc_buy",   (26, "r")),
+            ("_emit_sell",       (26, "r")),
+            ("_place_moc_short", (26, "r")),
+            ("_place_cover_buy", (26, "r")),
+            ("_place_gll_buy",   (26, "r")),
+            ("_place_gll_sell",  (26, "r")),
+        ]
+        for name, args in calls:
+            rejected = self._plugin_with_portfolio(tmp_path, order_id=None)
+            getattr(rejected, name)(*args)
+            assert rejected._trade_count == 0, f"{name} counted a rejected order"
+
+            accepted = self._plugin_with_portfolio(tmp_path, order_id=7)
+            getattr(accepted, name)(*args)
+            assert accepted._trade_count == 1, f"{name} did not count an accepted order"
+
+    def test_no_portfolio_still_counts(self, tmp_path):
+        """No portfolio is a simulation, not a refusal — the older behaviour
+        other tests rely on (trade_count as a decision-fired proxy)."""
+        plugin = _make_plugin(tmp_path)
+        assert plugin.portfolio is None
+        plugin._gld_price = 380.0
+        plugin._place_moc_buy(26, "test")
+        assert plugin._trade_count == 1
