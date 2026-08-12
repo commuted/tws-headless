@@ -311,7 +311,9 @@ def main():
     #
     # Running two engines deliberately is still possible: give the second one
     # its own --socket (and --client-id), and this check does not fire.
-    from .environment import engine_already_running, EXIT_ALREADY_RUNNING
+    from .environment import (
+        engine_already_running, EXIT_ALREADY_RUNNING, EXIT_FATAL_CONFIG,
+    )
     if not args.no_server and engine_already_running(socket_path):
         logger.error(
             f"An engine is already running on this {env.value} environment "
@@ -497,7 +499,7 @@ def main():
     # Callbacks
     # Populated by on_started if a paper/live guardrail trips; checked in _run()
     # to hard-fail before any reconciliation or trading occurs.
-    abort = {"reason": None}
+    abort = {"reason": None, "fatal": False}
 
     def on_started():
         logger.info("Engine started successfully")
@@ -535,7 +537,14 @@ def main():
         if err is None:
             err = require_live_confirmation(env, mode_map[mode], args.live_confirmed)
         if err:
+            # A guardrail refusal is a misconfiguration, not a transient fault:
+            # the wrong --env, or immediate/queued against a live account with
+            # no --live-confirmed. Retrying cannot fix either, and retrying
+            # quietly is how a supervisor sat relaunching a non-trading engine
+            # for eight hours on 2026-08-05. Mark it fatal so the supervisor
+            # stops and the operator sees one loud failure.
             abort["reason"] = err
+            abort["fatal"] = True
             logger.error(err)
             return
 
@@ -638,7 +647,8 @@ def main():
             if abort["reason"]:
                 logger.error(f"Aborting startup: {abort['reason']}")
                 await engine.stop()
-                return 1
+                await engine.wait_until_stopped()
+                return EXIT_FATAL_CONFIG if abort["fatal"] else 1
             await engine.run_forever()
             # run_forever() returns as soon as _shutdown_event is set, and
             # stop() sets that at its start — so a stop triggered by Ctrl+C or

@@ -44,9 +44,44 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-export PORT="${1:-7497}"
-export MODE="${2:-dry_run}"
-export IB_PLUGIN_DIR="${3:-$SCRIPT_DIR/plugins}"
+# Two calling conventions, because the positional one silently mangles flags.
+#
+#   ./start_trading.sh 4002 immediate          # positional (original)
+#   ./start_trading.sh --port 4001 --mode immediate --live-confirmed
+#
+# The positional form assigns $1 to PORT and $2 to MODE with no validation, so
+# a flag form went through as PORT="--port", MODE="4001" and the engine died on
+# "argument --port: expected one argument" — an error that says nothing about
+# the actual mistake. Worse, the positional form can only ever forward --port
+# and --mode, so --live-confirmed could never reach the engine and a live run
+# was impossible through this script at all.
+#
+# Anything starting with "-" means the caller is using flags: pass every
+# argument through untouched and let the engine's own argparse own them.
+ENGINE_ARGS=()
+if [[ "${1:-}" == -* ]]; then
+    ENGINE_ARGS=("$@")
+    # Only for the inhibitor description and the restart log below; the engine
+    # reads the real values from ENGINE_ARGS.
+    PORT="(from flags)"
+    MODE="(from flags)"
+    for ((i = 1; i <= $#; i++)); do
+        case "${!i}" in
+            --port) j=$((i + 1)); PORT="${!j:-?}" ;;
+            --mode) j=$((i + 1)); MODE="${!j:-?}" ;;
+        esac
+    done
+else
+    export PORT="${1:-7497}"
+    export MODE="${2:-dry_run}"
+    export IB_PLUGIN_DIR="${3:-$SCRIPT_DIR/plugins}"
+    ENGINE_ARGS=(--port "$PORT" --mode "$MODE")
+    # Anything past the third positional is forwarded, so the positional form
+    # can also reach flags it does not know about.
+    if (($# > 3)); then
+        ENGINE_ARGS+=("${@:4}")
+    fi
+fi
 
 # Run from project root (where ib/ and plugins/ both live)
 cd "$SCRIPT_DIR"
@@ -76,7 +111,7 @@ if [[ "${NO_STATE_ON_STOP:-0}" == "1" ]]; then
 fi
 
 if [[ "${NO_RESTART:-0}" == "1" ]]; then
-    exec "${INHIBIT[@]}" python3 -m ib.run_engine --port "$PORT" --mode "$MODE" "${STATE_ARGS[@]}"
+    exec "${INHIBIT[@]}" python3 -m ib.run_engine "${ENGINE_ARGS[@]}" "${STATE_ARGS[@]}"
 fi
 
 BACKOFF=5
@@ -93,7 +128,7 @@ trap 'INTERRUPTED=1' INT TERM
 
 while true; do
     START_TS=$(date +%s)
-    "${INHIBIT[@]}" python3 -m ib.run_engine --port "$PORT" --mode "$MODE" "${STATE_ARGS[@]}"
+    "${INHIBIT[@]}" python3 -m ib.run_engine "${ENGINE_ARGS[@]}" "${STATE_ARGS[@]}"
     CODE=$?
     ELAPSED=$(( $(date +%s) - START_TS ))
 
@@ -114,6 +149,17 @@ while true; do
     # retrying quietly is how this went unnoticed for eight hours on
     # 2026-08-05 — a second supervisor relaunching every five minutes while
     # the first engine held the client id, so no orders were ever placed.
+    # Code 4: a guardrail refused the configuration (wrong --env for the
+    # account, or immediate/queued against a live account with no
+    # --live-confirmed). Same reasoning as code 3 — retrying a
+    # misconfiguration just hides it.
+    if [[ "$CODE" == "4" ]]; then
+        MSG="$(date -Is) engine refused to start: startup guardrail rejected this configuration — not restarting (reason is the last ERROR in logs/{paper,live}/engine.log)"
+        echo "$MSG" >&2
+        echo "$MSG" >> "$RESTART_LOG"
+        exit "$CODE"
+    fi
+
     if [[ "$CODE" == "3" ]]; then
         MSG="$(date -Is) engine refused to start: another engine already owns this environment — not restarting"
         echo "$MSG" >&2

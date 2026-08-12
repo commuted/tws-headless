@@ -314,3 +314,11 @@ class TestEngineAlreadyRunning:
         """The supervisor keys on this to stop retrying, so it must not be 1."""
         assert env.EXIT_ALREADY_RUNNING == 3
         assert env.EXIT_ALREADY_RUNNING not in (0, 1, 130, 143)
+
+    def test_fatal_config_exit_code_is_its_own(self):
+        """A guardrail refusal must also stop the supervisor, and be
+        distinguishable from the duplicate-engine case and from the exit codes
+        start_trading.sh already treats as 'do not restart'."""
+        assert env.EXIT_FATAL_CONFIG == 4
+        assert env.EXIT_FATAL_CONFIG not in (0, 1, 130, 143)
+        assert env.EXIT_FATAL_CONFIG != env.EXIT_ALREADY_RUNNING

@@ -28,6 +28,12 @@ from typing import Optional, Union
 # going to fix itself) from a transient startup failure worth retrying.
 EXIT_ALREADY_RUNNING = 3
 
+# Exit code for "startup refused by a guardrail" — the wrong --env for the
+# account, or real orders against a live account without --live-confirmed.
+# Also distinct from the generic failure code, and for the same reason: no
+# amount of retrying fixes a misconfiguration.
+EXIT_FATAL_CONFIG = 4
+
 
 class TradingEnv(str, Enum):
     """Trading environment. Inherits str so it formats cleanly into paths/logs."""
