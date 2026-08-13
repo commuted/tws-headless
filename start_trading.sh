@@ -31,7 +31,7 @@
 #   progress. The engine writes a fresh ./STATE.json on every clean stop unless
 #   NO_STATE_ON_STOP=1.
 #
-# Lid-switch inhibit:
+# Lid-switch inhibit (best-effort):
 #   While the engine process is alive, a systemd handle-lid-switch inhibitor
 #   keeps closing the clamshell from suspending the machine (2026-07-29: a
 #   closed lid put the box to sleep through five market hours).  logind
@@ -40,6 +40,13 @@
 #   as long as the engine: during backoff waits and after exit the lid
 #   behaves normally.  Idle/automatic suspend and a manual suspend are NOT
 #   blocked, only the lid switch.
+#
+#   It is never a precondition for starting.  polkit refuses this inhibitor to
+#   any session that is not seat-attached — every SSH session qualifies — so
+#   requiring it meant the engine could not be started from most shells.  When
+#   it is refused the engine starts anyway and says so on stderr.  A live
+#   connection already prevents suspend under the default install (tested
+#   2026-08-12), so this now matters mainly for paper trading.
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -104,14 +111,34 @@ fi
 # Run from project root (where ib/ and plugins/ both live)
 cd "$SCRIPT_DIR"
 
-# See "Lid-switch inhibit" in the header.  Degrades to a bare run where
-# systemd-inhibit is unavailable (containers, non-systemd boxes).
+# See "Lid-switch inhibit" in the header. Best-effort, never a precondition.
+#
+# The inhibitor used to be applied blind, which made it a veto over startup.
+# systemd-inhibit can be installed and still refuse: polkit's
+# org.freedesktop.login1.inhibit-handle-lid-switch is allow_any=no, and its
+# active/inactive tiers only cover seat-attached sessions — so every SSH
+# session, and anything descended from one (a tmux server first started over
+# SSH, a remote-dev agent), is denied outright. Since the command ran as
+# `exec systemd-inhibit ... python3 -m ib.run_engine`, that refusal killed the
+# launch: the engine never started, exited 1, and the supervisor flapped on it.
+#
+# A closed-lid suspend is worth guarding against, but it is not worth being
+# unable to trade over. Probe with a throwaway command and only use the
+# inhibitor if it is actually granted. Live connections already prevent
+# suspend under the default install (tested 2026-08-12), so a refusal there
+# costs nothing; paper is where this still earns its keep.
 INHIBIT=()
 if command -v systemd-inhibit >/dev/null 2>&1; then
-    INHIBIT=(systemd-inhibit --what=handle-lid-switch
-             --who="tws-engine"
-             --why="IB trading engine running (port $PORT, mode $MODE)"
-             --mode=block)
+    if systemd-inhibit --what=handle-lid-switch --who="tws-engine" \
+                       --why="probe" --mode=block true >/dev/null 2>&1; then
+        INHIBIT=(systemd-inhibit --what=handle-lid-switch
+                 --who="tws-engine"
+                 --why="IB trading engine running (port $PORT, mode $MODE)"
+                 --mode=block)
+    else
+        echo "start_trading.sh: lid-switch inhibitor refused (not a seat-attached" \
+             "session); starting without it — a closed lid may suspend this machine." >&2
+    fi
 fi
 
 # STATE flags. RESTORE_STATE=1 means "the default ./STATE.json"; any other value
