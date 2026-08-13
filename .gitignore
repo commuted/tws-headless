@@ -35,6 +35,8 @@ Thumbs.db
 # a 45MB rotated log sat untracked and one 'git add -A' from history.
 *.log
 *.log.[0-9]*
+# gateway_watch.sh's down-state marker (runtime, not source)
+logs/.gateway_down
 
 # Local config (may contain credentials)
 config.local.py

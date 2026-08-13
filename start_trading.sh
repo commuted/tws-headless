@@ -74,12 +74,30 @@ if [[ "${1:-}" == -* ]]; then
 else
     export PORT="${1:-7497}"
     export MODE="${2:-dry_run}"
-    export IB_PLUGIN_DIR="${3:-$SCRIPT_DIR/plugins}"
-    ENGINE_ARGS=(--port "$PORT" --mode "$MODE")
-    # Anything past the third positional is forwarded, so the positional form
-    # can also reach flags it does not know about.
-    if (($# > 3)); then
-        ENGINE_ARGS+=("${@:4}")
+
+    # A port that is not a number is a typo, and letting it through produces
+    # an argparse error naming --port rather than the argument that was wrong.
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+        echo "start_trading.sh: first argument must be a port number, got '$PORT'." >&2
+        echo "  positional: ./start_trading.sh PORT [MODE] [PLUGIN_DIR] [extra flags...]" >&2
+        echo "  flags:      ./start_trading.sh --port 4001 --mode immediate --live-confirmed" >&2
+        exit 2
+    fi
+
+    # The third positional is the plugin directory — but only if it looks like
+    # one. On 2026-08-11 a live run was launched as
+    #     ./start_trading.sh 4001 immediate --live-confirmed
+    # and --live-confirmed was taken as the plugin directory: the engine created
+    # a plugins tree literally named "--live-confirmed", the flag never reached
+    # argparse, and the run aborted on the live-confirmation guardrail with
+    # nothing pointing at the real mistake. A flag here means the positionals
+    # have ended.
+    if [[ -n "${3:-}" && "${3}" != -* ]]; then
+        export IB_PLUGIN_DIR="$3"
+        ENGINE_ARGS=(--port "$PORT" --mode "$MODE" "${@:4}")
+    else
+        export IB_PLUGIN_DIR="$SCRIPT_DIR/plugins"
+        ENGINE_ARGS=(--port "$PORT" --mode "$MODE" "${@:3}")
     fi
 fi
 
@@ -149,6 +167,17 @@ while true; do
     # retrying quietly is how this went unnoticed for eight hours on
     # 2026-08-05 — a second supervisor relaunching every five minutes while
     # the first engine held the client id, so no orders were ever placed.
+    # Code 2: argparse rejected the arguments. Nothing about the next attempt
+    # will differ, and on 2026-08-11 a live launch flapped on this for four
+    # minutes, each cycle logging a restart line rather than the argparse
+    # error itself. The engine never exits 2 for any other reason.
+    if [[ "$CODE" == "2" ]]; then
+        MSG="$(date -Is) engine refused to start: invalid arguments (argparse) — not restarting"
+        echo "$MSG" >&2
+        echo "$MSG" >> "$RESTART_LOG"
+        exit "$CODE"
+    fi
+
     # Code 4: a guardrail refused the configuration (wrong --env for the
     # account, or immediate/queued against a live account with no
     # --live-confirmed). Same reasoning as code 3 — retrying a
