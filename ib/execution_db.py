@@ -455,6 +455,106 @@ class ExecutionDatabase:
             logger.error(f"Failed to get total commission: {e}")
             return 0.0
 
+    def get_commission_report(
+        self,
+        symbol: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Commission and fee totals with a per-symbol breakdown.
+
+        get_total_commission answers "how much in total"; this answers "where
+        did it go", which is the question worth asking when fees are eating a
+        strategy's edge. Commissions carry no symbol of their own, so every row
+        is joined back to its execution.
+
+        Rows whose execution is missing (a commission that arrived without its
+        fill, which IB does occasionally) are still counted in the totals but
+        appear under symbol ``None`` in the breakdown, rather than being
+        silently dropped — an unattributable fee is still money.
+
+        Returns a dict with total_commission, total_realized_pnl,
+        record_count, currency (when unambiguous), and by_symbol, sorted by
+        commission, largest first.
+        """
+        report: Dict[str, Any] = {
+            "symbol": symbol,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+            "total_commission": 0.0,
+            "total_realized_pnl": 0.0,
+            "record_count": 0,
+            "currency": None,
+            "by_symbol": [],
+        }
+
+        where = ["1=1"]
+        params: List[Any] = []
+        if symbol:
+            where.append("(e.symbol = ? OR e.local_symbol = ?)")
+            params.extend([symbol, symbol])
+        if start_date:
+            where.append("c.timestamp >= ?")
+            params.append(start_date.isoformat())
+        if end_date:
+            where.append("c.timestamp <= ?")
+            params.append(end_date.isoformat())
+        clause = " AND ".join(where)
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                cursor.execute(f"""
+                    SELECT COALESCE(SUM(c.commission), 0),
+                           COALESCE(SUM(c.realized_pnl), 0),
+                           COUNT(*)
+                    FROM commissions c
+                    LEFT JOIN executions e ON c.exec_id = e.exec_id
+                    WHERE {clause}
+                """, params)
+                row = cursor.fetchone()
+                if row:
+                    report["total_commission"] = row[0]
+                    report["total_realized_pnl"] = row[1]
+                    report["record_count"] = row[2]
+
+                cursor.execute(f"""
+                    SELECT DISTINCT c.currency
+                    FROM commissions c
+                    LEFT JOIN executions e ON c.exec_id = e.exec_id
+                    WHERE {clause} AND c.currency IS NOT NULL
+                """, params)
+                currencies = [r[0] for r in cursor.fetchall()]
+                if len(currencies) == 1:
+                    report["currency"] = currencies[0]
+
+                cursor.execute(f"""
+                    SELECT e.symbol,
+                           COALESCE(SUM(c.commission), 0),
+                           COALESCE(SUM(c.realized_pnl), 0),
+                           COUNT(*)
+                    FROM commissions c
+                    LEFT JOIN executions e ON c.exec_id = e.exec_id
+                    WHERE {clause}
+                    GROUP BY e.symbol
+                    ORDER BY SUM(c.commission) DESC
+                """, params)
+                report["by_symbol"] = [
+                    {
+                        "symbol": r[0],
+                        "commission": r[1],
+                        "realized_pnl": r[2],
+                        "count": r[3],
+                    }
+                    for r in cursor.fetchall()
+                ]
+
+        except Exception as e:
+            logger.error(f"Failed to build commission report: {e}")
+
+        return report
+
     def get_position_summary(self, symbol: str) -> Dict[str, Any]:
         """
         Get position summary for a symbol including:

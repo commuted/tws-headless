@@ -695,6 +695,8 @@ class EngineCommandHandler:
         server.register_handler("status", self.handle_status)
         server.register_handler("positions", self.handle_positions)
         server.register_handler("summary", self.handle_summary)
+        server.register_handler("account", self.handle_account)
+        server.register_handler("commissions", self.handle_commissions)
         server.register_handler("liquidate", self.handle_liquidate)
         server.register_handler("stop", self.handle_stop)
         server.register_handler("shutdown", self.handle_stop)
@@ -761,6 +763,161 @@ class EngineCommandHandler:
             return CommandResult(
                 status=CommandStatus.ERROR,
                 message=f"Failed to get positions: {e}",
+            )
+
+    def handle_account(self, args: List[str]):
+        """Handle 'account' command - the IB account's own values.
+
+        Distinct from 'summary', which is plugin-oriented: this reports what IB
+        says about the account itself, including every raw tag it sent, with no
+        plugin ledger interpretation layered on top. When a plugin's view and
+        the account disagree, this is the side that is authoritative.
+        """
+        from .command_server import CommandResult, CommandStatus
+        import json
+
+        try:
+            output_json = "--json" in args
+            portfolio = self.engine.portfolio
+            account = portfolio.get_account_summary() if portfolio else None
+
+            if not account:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message="No account summary available (not connected?)",
+                )
+
+            data = {
+                "account_id": account.account_id,
+                "currency": account.currency,
+                "net_liquidation": account.net_liquidation,
+                "total_cash": account.total_cash,
+                "buying_power": account.buying_power,
+                "available_funds": account.available_funds,
+                "is_valid": account.is_valid,
+                # Every tag IB reported, unfiltered. The named fields above are
+                # a convenience view of a few of them, not the whole picture.
+                "values": account.values or {},
+            }
+
+            if output_json:
+                message = json.dumps(data, indent=2, default=str)
+            else:
+                lines = [
+                    "=" * 50,
+                    "ACCOUNT",
+                    "=" * 50,
+                    f"Account:          {account.account_id}",
+                    f"Currency:         {account.currency}",
+                    f"Net Liquidation:  ${account.net_liquidation:,.2f}",
+                    f"Total Cash:       ${account.total_cash:,.2f}",
+                    f"Available Funds:  ${account.available_funds:,.2f}",
+                    f"Buying Power:     ${account.buying_power:,.2f}",
+                ]
+                if not account.is_valid:
+                    lines.append(
+                        "  WARNING: net liquidation is zero — IB has not sent a "
+                        "usable account summary yet; these numbers are not real."
+                    )
+                if account.values:
+                    lines.append("")
+                    lines.append(f"ALL IB TAGS ({len(account.values)}):")
+                    lines.append("-" * 50)
+                    for tag in sorted(account.values):
+                        lines.append(f"  {tag:<28} {account.values[tag]}")
+                lines.append("=" * 50)
+                message = "\n".join(lines)
+
+            return CommandResult(
+                status=CommandStatus.SUCCESS, message=message, data=data,
+            )
+        except Exception as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Failed to get account summary: {e}",
+            )
+
+    def handle_commissions(self, args: List[str]):
+        """Handle 'commissions' command - commission and fee report.
+
+        Usage:
+            commissions [--symbol SYM] [--days N] [--json]
+        """
+        from .command_server import CommandResult, CommandStatus
+        from .execution_db import get_execution_db
+        from datetime import datetime, timedelta
+        import json
+
+        try:
+            output_json = "--json" in args
+
+            symbol = None
+            days = None
+            i = 0
+            while i < len(args):
+                if args[i] == "--symbol" and i + 1 < len(args):
+                    symbol = args[i + 1].upper(); i += 2
+                elif args[i] == "--days" and i + 1 < len(args):
+                    try:
+                        days = int(args[i + 1])
+                    except ValueError:
+                        return CommandResult(
+                            status=CommandStatus.ERROR,
+                            message=f"--days expects a number, got {args[i + 1]!r}",
+                        )
+                    i += 2
+                else:
+                    i += 1
+
+            start_date = datetime.now() - timedelta(days=days) if days else None
+            report = get_execution_db().get_commission_report(
+                symbol=symbol, start_date=start_date,
+            )
+
+            if output_json:
+                message = json.dumps(report, indent=2, default=str)
+            else:
+                cur = report.get("currency") or ""
+                scope = f" for {symbol}" if symbol else ""
+                window = f" over the last {days}d" if days else ""
+                lines = [
+                    "=" * 50,
+                    f"COMMISSIONS AND FEES{scope}{window}",
+                    "=" * 50,
+                    f"Total commission:  ${report['total_commission']:,.2f} {cur}",
+                    f"Realized P&L:      ${report['total_realized_pnl']:,.2f}",
+                    f"Records:           {report['record_count']}",
+                ]
+                if report["record_count"] == 0:
+                    lines.append("")
+                    lines.append(
+                        "  No commission records. IB reports commissions "
+                        "separately from fills, so this stays empty until "
+                        "something actually executes."
+                    )
+                elif report["by_symbol"]:
+                    lines.append("")
+                    lines.append("BY SYMBOL:")
+                    lines.append("-" * 50)
+                    lines.append(f"  {'Symbol':<10} {'Commission':>12} {'Realized':>12} {'N':>5}")
+                    for row in report["by_symbol"]:
+                        # A commission whose execution is missing has no symbol;
+                        # it is still real money, so it is shown, not dropped.
+                        name = row["symbol"] or "(unattributed)"
+                        lines.append(
+                            f"  {name:<10} {row['commission']:>12,.2f} "
+                            f"{row['realized_pnl']:>12,.2f} {row['count']:>5}"
+                        )
+                lines.append("=" * 50)
+                message = "\n".join(lines)
+
+            return CommandResult(
+                status=CommandStatus.SUCCESS, message=message, data=report,
+            )
+        except Exception as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Failed to build commission report: {e}",
             )
 
     def handle_summary(self, args: List[str]):
