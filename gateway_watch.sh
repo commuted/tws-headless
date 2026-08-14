@@ -1,61 +1,58 @@
 #!/bin/bash
 #
-# gateway_watch.sh - Keep IB Gateway reachable, and make it loud when it is not.
+# gateway_watch.sh - Report when IB Gateway stops serving the API. Never acts.
 #
 # WHY THIS EXISTS
 #   On 2026-08-11 at 23:45 IB Gateway went down at its daily reset on descartes
 #   and never came back. The live engine did exactly what it should — retried
 #   the connection 939 times over 15.6 hours — but there was nothing to connect
 #   to, nothing restarted the gateway, and nothing told anybody. A live account
-#   holding 50 GLD went an entire trading session unmanaged, and the outage was
-#   only noticed the next afternoon.
+#   holding 50 GLD went a whole trading session unmanaged, noticed the next
+#   afternoon. The engine cannot cover this: when the gateway is gone the engine
+#   is blind by definition, so the watch has to live outside it.
 #
-#   The engine cannot cover this. When the gateway is gone the engine is blind
-#   by definition, so the watch has to live outside it.
+# WHY IT ONLY REPORTS
+#   This script used to start the gateway when it found it missing. That was
+#   the same mistake as the TWS relaunch removed on 2026-08-14: IB Gateway asks
+#   for credentials on startup, so launching it cannot restore an unattended
+#   system. It replaces "nothing running" with "a login prompt nobody is at",
+#   and on a one-minute timer it would leave a fresh prompt behind every minute.
+#   Three such orphaned prompts from the TWS equivalent is what exposed this.
+#
+#   So: no launching, no killing, no credentials. The alert reaching a human IS
+#   the recovery path. Gateway restarts are IB's own job (AutoRestart=1 in
+#   jts.ini handles the daily reset and keeps its session for about a week);
+#   this only notices when that has not worked.
 #
 # WHAT IT DOES  (run it every minute from a timer or cron)
 #   port open                  -> healthy, silent, exit 0
-#   port closed, no process    -> start the gateway, log it, exit 1
-#   port closed, process alive -> gateway is up but not serving the API, which
-#                                 in practice means it is sitting at a login or
-#                                 2FA prompt. It cannot be fixed from a script:
-#                                 log NEEDS ATTENTION and exit 2.
+#   port closed, process alive -> gateway up but not serving the API, in
+#                                 practice a login or 2FA prompt: exit 2
+#   port closed, no process    -> gateway is gone entirely: exit 2
 #
-#   Every transition is appended to logs/gateway_watch.log. A non-zero exit
-#   makes the systemd unit fail, so `systemctl --user status` and any monitoring
-#   that watches unit state both see it.
+#   Both failures exit non-zero so the systemd unit fails and shows up in
+#   `systemctl --user status` and any unit-state monitoring, not only in a log
+#   file nobody reads. Transitions are appended to logs/gateway_watch.log; a
+#   healthy run stays silent so the log holds only events worth reading.
 #
-# WHAT IT DELIBERATELY DOES NOT DO
-#   It does not touch the trading engine. The engine's own supervisor handles
+#   It does not touch the trading engine either. The engine's supervisor owns
 #   that, and its connection manager reconnects on its own once the gateway is
-#   back — it was already doing so correctly throughout the outage.
-#
-#   It does not store or type credentials. Auto-login means a live trading
-#   password on disk; that is the operator's call, not this script's. With
-#   AutoRestart=1 in jts.ini the gateway keeps its own session across daily
-#   restarts for about a week, and the login prompt case above is the residue
-#   this script reports rather than defeats.
+#   back — it was already doing so correctly throughout the outage above.
 #
 # USAGE
-#   ./gateway_watch.sh [--port PORT] [--gateway PATH] [--no-start]
+#   ./gateway_watch.sh [--port PORT]
 #
-#     --port      API port to check (default 4001, the live gateway; 4002 paper)
-#     --gateway   ibgateway executable (default: newest under ~/Jts/ibgateway)
-#     --no-start  check and report only, never launch anything
+#     --port   API port to check (default 4001, the live gateway; 4002 paper)
 #
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT=4001
-GATEWAY=""
-NO_START=0
 
 while (($#)); do
     case "$1" in
-        --port)     PORT="$2";    shift 2 ;;
-        --gateway)  GATEWAY="$2"; shift 2 ;;
-        --no-start) NO_START=1;   shift ;;
+        --port) PORT="$2"; shift 2 ;;
         *) echo "gateway_watch.sh: unknown argument '$1'" >&2; exit 64 ;;
     esac
 done
@@ -66,26 +63,18 @@ mkdir -p "$LOG_DIR"
 
 note() { echo "$(date -Is) $*" | tee -a "$LOG" >&2; }
 
-# Default to the highest-numbered install, so a gateway auto-update does not
-# silently leave this pointing at a version that is no longer there.
-if [[ -z "$GATEWAY" ]]; then
-    GATEWAY="$(find "$HOME/Jts/ibgateway" -maxdepth 2 -name ibgateway -type f 2>/dev/null \
-               | sort -V | tail -1)"
-fi
-
 port_open() {
     # bash's /dev/tcp rather than ss/lsof: no extra dependency, and it proves
-    # something will actually accept a connection, which is what the engine needs.
-    # The subshell both opens and closes the descriptor; its exit status is the
-    # answer, so nothing leaks into this shell.
+    # something will actually accept a connection, which is what the engine
+    # needs. The subshell both opens and closes the descriptor; its exit status
+    # is the answer, so nothing leaks into this shell.
     (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null
 }
 
 gateway_running() { pgrep -f "Jts/ibgateway/.*/ibgateway|install4j.ibgateway" >/dev/null 2>&1; }
 
 if port_open; then
-    # Only log recoveries, so a healthy minute-by-minute run stays silent and
-    # the log holds nothing but events worth reading.
+    # Only log recoveries, so a healthy minute-by-minute run stays silent.
     if [[ -f "$LOG_DIR/.gateway_down" ]]; then
         note "RECOVERED: IB Gateway is serving the API on port $PORT again"
         rm -f "$LOG_DIR/.gateway_down"
@@ -97,38 +86,12 @@ touch "$LOG_DIR/.gateway_down"
 
 if gateway_running; then
     note "NEEDS ATTENTION: IB Gateway is running but port $PORT is closed — " \
-         "almost certainly waiting at a login or 2FA prompt. No script can " \
-         "clear this; log in on the console. The engine cannot trade until it does."
-    exit 2
+         "almost certainly waiting at a login or 2FA prompt. Log in on the " \
+         "console; the engine cannot trade until you do."
+else
+    note "NEEDS ATTENTION: IB Gateway is not running and port $PORT is closed. " \
+         "Start it and log in on the console; the engine cannot trade until " \
+         "you do. Deliberately not started here — it would only leave a login " \
+         "prompt nobody is at, one per run."
 fi
-
-if ((NO_START)); then
-    note "DOWN: IB Gateway is not running and port $PORT is closed (--no-start, not launching)"
-    exit 1
-fi
-
-if [[ -z "$GATEWAY" || ! -x "$GATEWAY" ]]; then
-    note "DOWN: IB Gateway is not running and no executable was found " \
-         "(looked under $HOME/Jts/ibgateway). Pass --gateway PATH."
-    exit 1
-fi
-
-note "DOWN: IB Gateway not running and port $PORT closed — starting $GATEWAY"
-nohup "$GATEWAY" -J-DjtsConfigDir="$HOME/Jts" >/dev/null 2>&1 &
-disown
-
-# The gateway needs a moment to bind. Report whether the start actually worked
-# rather than assuming it did — a launch that lands on a login prompt looks
-# identical to a successful one until the port opens.
-for _ in $(seq 1 20); do
-    sleep 3
-    if port_open; then
-        note "RECOVERED: IB Gateway started and is serving the API on port $PORT"
-        rm -f "$LOG_DIR/.gateway_down"
-        exit 0
-    fi
-done
-
-note "NEEDS ATTENTION: started IB Gateway but port $PORT did not open within 60s — " \
-     "it is most likely waiting for login. The engine cannot trade until it does."
 exit 2
