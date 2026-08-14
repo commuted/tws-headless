@@ -271,15 +271,18 @@ class TestEngineCommandHandlerSummary:
         assert "ACCOUNT SUMMARY" in result.message
         assert result.data["account"]["total_value"] == 100000.0
 
-    def test_summary_json_output(self):
-        """Test summary with --json flag"""
+    def test_summary_message_is_text_and_data_is_the_structure(self):
+        """--json no longer re-renders `message` as JSON. It used to, which
+        meant the same content appeared twice — an escaped JSON string in
+        `message` duplicating `data` — and left `message`, the field a caller
+        naturally reaches for, as the wrong one to parse."""
         result = self.handler.handle_summary(["--json"])
         assert result.status == CommandStatus.SUCCESS
-        # JSON output should be parseable
-        import json
-        data = json.loads(result.message)
-        assert "account" in data
-        assert "portfolio" in data
+        assert "ACCOUNT SUMMARY" in result.message
+        assert not result.message.lstrip().startswith("{")
+        # nothing lost: the structure is still there, in data
+        assert "account" in result.data
+        assert "portfolio" in result.data
 
     def test_summary_with_plugin_holdings(self):
         """Test summary includes plugin holdings when available"""

@@ -55,11 +55,15 @@ class TestAccountCommand:
         assert result.data["values"] == {"Cushion": "0.87", "GrossPositionValue": "9"}
         assert "Cushion" in result.message
 
-    def test_json_output_is_parseable(self):
+    def test_message_stays_text_even_with_json(self):
+        """`message` is the human view and `data` the machine view — always,
+        regardless of --json. Rendering both as JSON duplicated the content and
+        made `message`, the obvious field to read, the wrong one to parse."""
         result = self._run(["--json"], _account())
-        parsed = json.loads(result.message)
-        assert parsed["account_id"] == "U21830461"
-        assert parsed["values"]["Cushion"] == "0.87"
+        assert "ACCOUNT" in result.message
+        assert not result.message.lstrip().startswith("{")
+        assert result.data["account_id"] == "U21830461"
+        assert result.data["values"]["Cushion"] == "0.87"
 
     def test_invalid_account_is_flagged_not_silently_shown(self):
         """net_liquidation 0 means IB has not sent a usable summary. Printing
@@ -103,9 +107,11 @@ class TestCommissionsCommand:
         assert result.data["total_commission"] == 4.75
         assert "GLD" in result.message and "QQQ" in result.message
 
-    def test_json_output_is_parseable(self):
+    def test_message_stays_text_even_with_json(self):
         result, _ = self._run(["--json"])
-        assert json.loads(result.message)["record_count"] == 3
+        assert "COMMISSIONS AND FEES" in result.message
+        assert not result.message.lstrip().startswith("{")
+        assert result.data["record_count"] == 3
 
     def test_symbol_filter_reaches_the_query(self):
         _, db = self._run(["--symbol", "gld"])
