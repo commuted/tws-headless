@@ -777,22 +777,25 @@ class TestReconcileCommand:
         self.pe.reconcile_with_account.assert_called_once()
         self.pe.format_reconciliation_report.assert_called_once()
 
-    def test_reconcile_json_flag(self):
-        """Test reconcile with --json flag returns JSON"""
-        self.pe.reconcile_with_account.return_value = {
+    def test_message_is_text_and_data_carries_the_report(self):
+        """--json no longer re-renders `message` as JSON. It used to, and the
+        result was the same content twice: an escaped JSON string in `message`
+        duplicating the structure already in `data`. One job per field now."""
+        report = {
             "timestamp": "2024-01-15T10:30:00",
             "discrepancies": [{"type": "test"}],
             "adjustments": [],
             "summary": {}
         }
+        self.pe.reconcile_with_account.return_value = report
 
         result = self.handler.handle_reconcile(["--json"])
 
         assert result.status.value == "success"
-        assert "timestamp" in result.message
-        assert "discrepancies" in result.message
-        # format_reconciliation_report should NOT be called for JSON output
-        self.pe.format_reconciliation_report.assert_not_called()
+        assert result.message == "Formatted report"
+        self.pe.format_reconciliation_report.assert_called_once()
+        # nothing lost: the full report is still reachable, via data
+        assert result.data["report"] == report
 
     def test_reconcile_data_includes_counts(self):
         """Test reconcile result data includes discrepancy and adjustment counts"""

@@ -774,10 +774,8 @@ class EngineCommandHandler:
         the account disagree, this is the side that is authoritative.
         """
         from .command_server import CommandResult, CommandStatus
-        import json
 
         try:
-            output_json = "--json" in args
             portfolio = self.engine.portfolio
             account = portfolio.get_account_summary() if portfolio else None
 
@@ -800,33 +798,30 @@ class EngineCommandHandler:
                 "values": account.values or {},
             }
 
-            if output_json:
-                message = json.dumps(data, indent=2, default=str)
-            else:
-                lines = [
-                    "=" * 50,
-                    "ACCOUNT",
-                    "=" * 50,
-                    f"Account:          {account.account_id}",
-                    f"Currency:         {account.currency}",
-                    f"Net Liquidation:  ${account.net_liquidation:,.2f}",
-                    f"Total Cash:       ${account.total_cash:,.2f}",
-                    f"Available Funds:  ${account.available_funds:,.2f}",
-                    f"Buying Power:     ${account.buying_power:,.2f}",
-                ]
-                if not account.is_valid:
-                    lines.append(
-                        "  WARNING: net liquidation is zero — IB has not sent a "
-                        "usable account summary yet; these numbers are not real."
-                    )
-                if account.values:
-                    lines.append("")
-                    lines.append(f"ALL IB TAGS ({len(account.values)}):")
-                    lines.append("-" * 50)
-                    for tag in sorted(account.values):
-                        lines.append(f"  {tag:<28} {account.values[tag]}")
-                lines.append("=" * 50)
-                message = "\n".join(lines)
+            lines = [
+                "=" * 50,
+                "ACCOUNT",
+                "=" * 50,
+                f"Account:          {account.account_id}",
+                f"Currency:         {account.currency}",
+                f"Net Liquidation:  ${account.net_liquidation:,.2f}",
+                f"Total Cash:       ${account.total_cash:,.2f}",
+                f"Available Funds:  ${account.available_funds:,.2f}",
+                f"Buying Power:     ${account.buying_power:,.2f}",
+            ]
+            if not account.is_valid:
+                lines.append(
+                    "  WARNING: net liquidation is zero — IB has not sent a "
+                    "usable account summary yet; these numbers are not real."
+                )
+            if account.values:
+                lines.append("")
+                lines.append(f"ALL IB TAGS ({len(account.values)}):")
+                lines.append("-" * 50)
+                for tag in sorted(account.values):
+                    lines.append(f"  {tag:<28} {account.values[tag]}")
+            lines.append("=" * 50)
+            message = "\n".join(lines)
 
             return CommandResult(
                 status=CommandStatus.SUCCESS, message=message, data=data,
@@ -846,10 +841,8 @@ class EngineCommandHandler:
         from .command_server import CommandResult, CommandStatus
         from .execution_db import get_execution_db
         from datetime import datetime, timedelta
-        import json
 
         try:
-            output_json = "--json" in args
 
             symbol = None
             days = None
@@ -874,42 +867,39 @@ class EngineCommandHandler:
                 symbol=symbol, start_date=start_date,
             )
 
-            if output_json:
-                message = json.dumps(report, indent=2, default=str)
-            else:
-                cur = report.get("currency") or ""
-                scope = f" for {symbol}" if symbol else ""
-                window = f" over the last {days}d" if days else ""
-                lines = [
-                    "=" * 50,
-                    f"COMMISSIONS AND FEES{scope}{window}",
-                    "=" * 50,
-                    f"Total commission:  ${report['total_commission']:,.2f} {cur}",
-                    f"Realized P&L:      ${report['total_realized_pnl']:,.2f}",
-                    f"Records:           {report['record_count']}",
-                ]
-                if report["record_count"] == 0:
-                    lines.append("")
+            cur = report.get("currency") or ""
+            scope = f" for {symbol}" if symbol else ""
+            window = f" over the last {days}d" if days else ""
+            lines = [
+                "=" * 50,
+                f"COMMISSIONS AND FEES{scope}{window}",
+                "=" * 50,
+                f"Total commission:  ${report['total_commission']:,.2f} {cur}",
+                f"Realized P&L:      ${report['total_realized_pnl']:,.2f}",
+                f"Records:           {report['record_count']}",
+            ]
+            if report["record_count"] == 0:
+                lines.append("")
+                lines.append(
+                    "  No commission records. IB reports commissions "
+                    "separately from fills, so this stays empty until "
+                    "something actually executes."
+                )
+            elif report["by_symbol"]:
+                lines.append("")
+                lines.append("BY SYMBOL:")
+                lines.append("-" * 50)
+                lines.append(f"  {'Symbol':<10} {'Commission':>12} {'Realized':>12} {'N':>5}")
+                for row in report["by_symbol"]:
+                    # A commission whose execution is missing has no symbol;
+                    # it is still real money, so it is shown, not dropped.
+                    name = row["symbol"] or "(unattributed)"
                     lines.append(
-                        "  No commission records. IB reports commissions "
-                        "separately from fills, so this stays empty until "
-                        "something actually executes."
+                        f"  {name:<10} {row['commission']:>12,.2f} "
+                        f"{row['realized_pnl']:>12,.2f} {row['count']:>5}"
                     )
-                elif report["by_symbol"]:
-                    lines.append("")
-                    lines.append("BY SYMBOL:")
-                    lines.append("-" * 50)
-                    lines.append(f"  {'Symbol':<10} {'Commission':>12} {'Realized':>12} {'N':>5}")
-                    for row in report["by_symbol"]:
-                        # A commission whose execution is missing has no symbol;
-                        # it is still real money, so it is shown, not dropped.
-                        name = row["symbol"] or "(unattributed)"
-                        lines.append(
-                            f"  {name:<10} {row['commission']:>12,.2f} "
-                            f"{row['realized_pnl']:>12,.2f} {row['count']:>5}"
-                        )
-                lines.append("=" * 50)
-                message = "\n".join(lines)
+            lines.append("=" * 50)
+            message = "\n".join(lines)
 
             return CommandResult(
                 status=CommandStatus.SUCCESS, message=message, data=report,
@@ -923,10 +913,8 @@ class EngineCommandHandler:
     def handle_summary(self, args: List[str]):
         """Handle 'summary' command - account summary with plugin breakdown"""
         from .command_server import CommandResult, CommandStatus
-        import json
 
         try:
-            output_json = "--json" in args
             portfolio = self.engine.portfolio
 
             account = portfolio.get_account_summary()
@@ -977,45 +965,42 @@ class EngineCommandHandler:
                 "unassigned": unassigned,
             }
 
-            if output_json:
-                message = json.dumps(data, indent=2)
-            else:
-                lines = [
-                    "=" * 50,
-                    "ACCOUNT SUMMARY",
-                    "=" * 50,
-                    f"Total Value:    ${total_value:>12,.2f}",
-                    f"Cash:           ${cash_balance:>12,.2f}",
-                    f"Positions Value: ${total_value - cash_balance:>11,.2f}",
-                    f"Total P&L:      ${total_pnl:>12,.2f}",
-                    f"Positions:      {len(positions):>12}",
-                ]
-                if account_data.get("buying_power"):
-                    lines.append(f"Buying Power:   ${account_data.get('buying_power', 0):>12,.2f}")
+            lines = [
+                "=" * 50,
+                "ACCOUNT SUMMARY",
+                "=" * 50,
+                f"Total Value:    ${total_value:>12,.2f}",
+                f"Cash:           ${cash_balance:>12,.2f}",
+                f"Positions Value: ${total_value - cash_balance:>11,.2f}",
+                f"Total P&L:      ${total_pnl:>12,.2f}",
+                f"Positions:      {len(positions):>12}",
+            ]
+            if account_data.get("buying_power"):
+                lines.append(f"Buying Power:   ${account_data.get('buying_power', 0):>12,.2f}")
 
-                # Show plugin breakdown if available
-                if plugin_holdings:
-                    lines.append("")
-                    lines.append("PLUGIN HOLDINGS:")
-                    lines.append("-" * 50)
-                    for name, info in plugin_holdings.items():
-                        plugin_value = info.get("total_value", 0.0)
-                        plugin_cash = info.get("cash", 0.0)
-                        lines.append(f"  {name}: ${plugin_value:,.2f} (cash: ${plugin_cash:,.2f})")
+            # Show plugin breakdown if available
+            if plugin_holdings:
+                lines.append("")
+                lines.append("PLUGIN HOLDINGS:")
+                lines.append("-" * 50)
+                for name, info in plugin_holdings.items():
+                    plugin_value = info.get("total_value", 0.0)
+                    plugin_cash = info.get("cash", 0.0)
+                    lines.append(f"  {name}: ${plugin_value:,.2f} (cash: ${plugin_cash:,.2f})")
 
-                # Show unassigned
-                if unassigned:
-                    lines.append("")
-                    lines.append("UNASSIGNED:")
-                    lines.append("-" * 50)
-                    unassigned_cash = unassigned.get("cash", 0.0)
-                    unassigned_value = unassigned.get("total_value", 0.0)
-                    unassigned_positions = unassigned.get("positions", [])
-                    lines.append(f"  Cash: ${unassigned_cash:,.2f}")
-                    lines.append(f"  Positions: {len(unassigned_positions)} (${unassigned_value - unassigned_cash:,.2f})")
+            # Show unassigned
+            if unassigned:
+                lines.append("")
+                lines.append("UNASSIGNED:")
+                lines.append("-" * 50)
+                unassigned_cash = unassigned.get("cash", 0.0)
+                unassigned_value = unassigned.get("total_value", 0.0)
+                unassigned_positions = unassigned.get("positions", [])
+                lines.append(f"  Cash: ${unassigned_cash:,.2f}")
+                lines.append(f"  Positions: {len(unassigned_positions)} (${unassigned_value - unassigned_cash:,.2f})")
 
-                lines.append("=" * 50)
-                message = "\n".join(lines)
+            lines.append("=" * 50)
+            message = "\n".join(lines)
 
             return CommandResult(
                 status=CommandStatus.SUCCESS,
@@ -1789,7 +1774,6 @@ class EngineCommandHandler:
             reconcile --json       # Output report as JSON
         """
         from .command_server import CommandResult, CommandStatus
-        import json
 
         if not self.engine.plugin_executive:
             return CommandResult(
@@ -1797,7 +1781,6 @@ class EngineCommandHandler:
                 message="Reconcile command requires plugin executive ",
             )
 
-        output_json = "--json" in args
 
         try:
             pe = self.engine.plugin_executive
@@ -1814,10 +1797,7 @@ class EngineCommandHandler:
                     data={"report": report},
                 )
 
-            if output_json:
-                message = json.dumps(report, indent=2)
-            else:
-                message = pe.format_reconciliation_report(report)
+            message = pe.format_reconciliation_report(report)
 
             discrepancy_count = len(report.get("discrepancies", []))
             adjustment_count = len(report.get("adjustments", []))

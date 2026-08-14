@@ -1021,20 +1021,19 @@ Examples:
             sys.exit(1)
         return
 
-    # A few server-side handlers (ib/run_engine.py's handle_summary and
-    # handle_reconcile) look for a literal "--json" in their own args to
-    # switch their `message` field from human-readable text to a clean JSON
-    # dump — exactly what a `--json` caller wants. But ibctl's --json/-j is
-    # its own *global* argparse flag, consumed by parse_known_args() before
-    # args.command is ever built, so a user-typed "summary --json" can never
-    # reach the server as such — it always arrives as bare "summary", and
-    # --json falls back to wrapping the human-readable message in a JSON
-    # string instead. Re-forward --json on the wire for the commands whose
-    # handlers are confirmed to look for it, so the documented behavior
-    # ("summary --json", "reconcile --json") actually reaches them.
-    _SERVER_JSON_AWARE_COMMANDS = {"summary", "reconcile", "account", "commissions"}
-    if args.json and args.command[0].lower() in _SERVER_JSON_AWARE_COMMANDS:
-        args.command = args.command + ["--json"]
+    # --json is NOT forwarded to the server. It used to be, for the handlers
+    # that re-rendered their `message` as a JSON dump when they saw the flag,
+    # and the result was output carrying the same content twice: `message` held
+    # an escaped JSON string of exactly what `data` already held as structure.
+    # Raw output became unreadable, and `message` — the obvious field to reach
+    # for — was the wrong one to parse.
+    #
+    # Each field now has one job. `message` is always the human-readable text,
+    # `data` is always the machine-readable structure, and --json prints the
+    # whole envelope so scripts can branch on `status` and read `.data`:
+    #
+    #     ./ibctl.py account --json | jq .data
+    #     ./ibctl.py commissions --json | jq '.data.by_symbol'
 
     # Build command string
     command_str = " ".join(args.command)
