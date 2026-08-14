@@ -47,7 +47,6 @@ or ignore holiday alerts).
 import json
 import logging
 import queue
-import subprocess
 import threading
 import time
 import urllib.request
@@ -62,11 +61,6 @@ logger = logging.getLogger(__name__)
 
 _NY = ZoneInfo("America/New_York")
 
-# plugins/watchdog/plugin.py -> repo root, so the default relaunch script
-# path doesn't depend on the engine's current working directory.
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-_DEFAULT_RELAUNCH_SCRIPT = str(_REPO_ROOT / "relaunch_tws.sh")
-
 _RTH_START = (9, 30)
 _RTH_END   = (16, 0)
 
@@ -78,7 +72,7 @@ _DEFAULT_SESSION_WINDOW: List[Tuple[dt_time, dt_time]] = [
     (dt_time(*_RTH_START), dt_time(*_RTH_END)),
 ]
 
-# Known-noisy window, never eligible for an automatic TWS relaunch regardless
+# Known-noisy window, never eligible for escalation regardless
 # of the in-session/off-hours timeout: observed live, recurring connectivity
 # blips around 02:30 Pacific — a fixed 3-hour offset from America/New_York
 # (both zones shift DST on the same date), i.e. ~05:30 ET. Widened to a half
@@ -127,43 +121,33 @@ class WatchdogPlugin(PluginBase):
         #      TWS process untouched, no credentials involved. Cheap and
         #      safe; the natural first escalation past a resubscribe that
         #      didn't work.
-        #   2. auto_relaunch_tws — kill and relaunch the TWS process itself
-        #      (see relaunch_tws.sh). Last resort: TWS may come back up
-        #      asking for credentials again (observed live 2026-07-20 —
-        #      confirmed by the launcher's own log: "Daily auto-restart is
-        #      not enabled" — so this does NOT achieve unattended recovery
-        #      by itself; the alert this fires is what has to reach a human).
+        # There is deliberately no second tier. Killing and relaunching
+        # the TWS process was tried and removed on 2026-08-14: TWS comes
+        # back up asking for credentials, so a relaunch cannot restore an
+        # unattended system — it only replaces a running-but-degraded TWS
+        # with a login prompt, and each attempt leaves another prompt
+        # behind. The code already knew ("Daily auto-restart is not
+        # enabled", observed live 2026-07-20) and kept the tier anyway.
+        # When reconnect is not enough, the alert reaching a human IS the
+        # recovery path.
         #
-        # Both timeout pairs are "timeout, not keep-out" (deliberately
-        # looser off-hours, not disabled): while any plugin's declared
+        # The timeout pair is "timeout, not keep-out" (deliberately looser
+        # off-hours, not disabled): while any plugin's declared
         # trading_hours() window is active, escalate reasonably fast;
         # outside all of them, still escalate eventually rather than leave
-        # a real fault to fester unnoticed until the next session, just on
-        # a much longer clock. reconnect's timeouts sit below relaunch's at
-        # every tier so reconnect always gets tried first, on both clocks.
+        # a real fault to fester unnoticed until the next session.
         self.auto_reconnect_on_stale:        bool  = False
         self.reconnect_in_session_timeout_seconds: float = 600.0    # 10 min
         self.reconnect_off_hours_timeout_seconds:  float = 3600.0   # 1 h
+        # After a reconnect: don't evaluate escalation again until warmup
+        # elapses. Cooldown is the separate, harder floor on repeating the
+        # action, checked independently so it holds even if warmup has
+        # elapsed but feeds are stale again.
         self.reconnect_warmup_seconds:  float = 120.0   # 2 min
         self.reconnect_cooldown_seconds: float = 600.0  # 10 min
 
-        self.auto_relaunch_tws:              bool  = False
-        self.relaunch_script_path:           str   = _DEFAULT_RELAUNCH_SCRIPT
-        self.relaunch_in_session_timeout_seconds: float = 1200.0    # 20 min
-        self.relaunch_off_hours_timeout_seconds:  float = 14400.0   # 4 h
-        # After issuing a reconnect or relaunch: don't even evaluate
-        # escalation again until warmup elapses (reconnect + resubscribe +
-        # one full staleness-check cycle legitimately takes several minutes
-        # — the live TWS relaunch on 2026-07-20 took ~10 min before feeds
-        # could be judged healthy again; a plain reconnect should be
-        # faster). Cooldown is the separate, harder floor on actually
-        # repeating the SAME action, checked independently so it still
-        # holds even if warmup has elapsed but feeds are stale again.
-        self.relaunch_warmup_seconds:  float = 900.0    # 15 min
-        self.relaunch_cooldown_seconds: float = 1800.0  # 30 min
-
         # Known-noisy windows (e.g. the ~02:30 Pacific / ~05:30 ET blip) —
-        # never escalate (reconnect OR relaunch) inside these, regardless
+        # never escalate inside these, regardless
         # of the timeouts above. America/New_York wall-clock,
         # [{"start": "HH:MM", "end": "HH:MM"}].
         self.blackout_windows: List[Dict[str, str]] = list(_DEFAULT_BLACKOUT_WINDOWS)
@@ -185,8 +169,6 @@ class WatchdogPlugin(PluginBase):
         self._stale_since: Optional[float] = None   # epoch; None = currently healthy
         self._last_reconnect: float = 0.0
         self._reconnects: int = 0
-        self._last_relaunch: float = 0.0
-        self._relaunches: int = 0
 
         # --- counters (diagnostics) ---
         self._checks_run:     int = 0
@@ -224,22 +206,12 @@ class WatchdogPlugin(PluginBase):
                 "reconnect_off_hours_timeout_seconds", self.reconnect_off_hours_timeout_seconds)
             self.reconnect_warmup_seconds   = saved.get("reconnect_warmup_seconds",   self.reconnect_warmup_seconds)
             self.reconnect_cooldown_seconds = saved.get("reconnect_cooldown_seconds", self.reconnect_cooldown_seconds)
-            self.auto_relaunch_tws          = saved.get("auto_relaunch_tws",          self.auto_relaunch_tws)
-            self.relaunch_script_path       = saved.get("relaunch_script_path",       self.relaunch_script_path)
-            self.relaunch_in_session_timeout_seconds = saved.get(
-                "relaunch_in_session_timeout_seconds", self.relaunch_in_session_timeout_seconds)
-            self.relaunch_off_hours_timeout_seconds = saved.get(
-                "relaunch_off_hours_timeout_seconds", self.relaunch_off_hours_timeout_seconds)
             self.blackout_windows           = saved.get("blackout_windows",           self.blackout_windows)
-            self.relaunch_warmup_seconds    = saved.get("relaunch_warmup_seconds",    self.relaunch_warmup_seconds)
-            self.relaunch_cooldown_seconds  = saved.get("relaunch_cooldown_seconds",  self.relaunch_cooldown_seconds)
             # Persisted so a plugin (or engine) restart doesn't forget a
-            # reconnect/relaunch just happened and immediately re-escalate
+            # a reconnect just happened and immediately re-escalate
             # before the real system has had time to recover.
             self._last_reconnect            = saved.get("_last_reconnect", self._last_reconnect)
             self._reconnects                = saved.get("_reconnects", self._reconnects)
-            self._last_relaunch             = saved.get("_last_relaunch", self._last_relaunch)
-            self._relaunches                = saved.get("_relaunches", self._relaunches)
 
         # Engine startup already reconciles; first periodic run comes later.
         self._last_reconcile = time.time()
@@ -288,17 +260,9 @@ class WatchdogPlugin(PluginBase):
             "reconnect_off_hours_timeout_seconds":  self.reconnect_off_hours_timeout_seconds,
             "reconnect_warmup_seconds":    self.reconnect_warmup_seconds,
             "reconnect_cooldown_seconds":  self.reconnect_cooldown_seconds,
-            "auto_relaunch_tws":           self.auto_relaunch_tws,
-            "relaunch_script_path":        self.relaunch_script_path,
-            "relaunch_in_session_timeout_seconds": self.relaunch_in_session_timeout_seconds,
-            "relaunch_off_hours_timeout_seconds":  self.relaunch_off_hours_timeout_seconds,
             "blackout_windows":            self.blackout_windows,
-            "relaunch_warmup_seconds":     self.relaunch_warmup_seconds,
-            "relaunch_cooldown_seconds":   self.relaunch_cooldown_seconds,
             "_last_reconnect":             self._last_reconnect,
             "_reconnects":                 self._reconnects,
-            "_last_relaunch":              self._last_relaunch,
-            "_relaunches":                 self._relaunches,
         }
 
     def _save_state(self) -> None:
@@ -430,15 +394,15 @@ class WatchdogPlugin(PluginBase):
             logger.error(f"Watchdog remediation failed: {e}")
 
     # =========================================================================
-    # ESCALATION — automatic TWS relaunch when resubscription alone isn't
-    # clearing the fault (see relaunch_tws.sh for why this bounces the TWS
+    # ESCALATION — force a reconnect when resubscription alone isn't
+    # clearing the fault (the TWS process is never touched
     # process itself rather than driving its GUI)
     # =========================================================================
 
     def _check_stale_feed_escalation(self) -> None:
         """Escalate past resubscription in two further tiers, if enabled:
         force_reconnect() (cheap, no credentials) then, if that still
-        doesn't clear it, a full TWS relaunch (see module docstring / the
+        doesn't clear it. There is no further tier (see the
         __init__ comment block for why these are two separate tiers rather
         than jumping straight to the expensive one).
 
@@ -447,7 +411,7 @@ class WatchdogPlugin(PluginBase):
         separate timeout off-hours — "less aggressive, not disabled" — so
         off-hours has to still be evaluated, just against a longer clock.
         """
-        if not (self.auto_reconnect_on_stale or self.auto_relaunch_tws):
+        if not self.auto_reconnect_on_stale:
             return
         if not self.portfolio or not hasattr(self.portfolio, "keep_up_to_date_feeds"):
             return
@@ -464,10 +428,9 @@ class WatchdogPlugin(PluginBase):
         # all yet, whichever recovery window is later/longer. Reconnect +
         # resubscribe + one full staleness window legitimately takes
         # several minutes (observed live: ~10 min from reconnect to the
-        # first clean check on 2026-07-20, for a full TWS relaunch; a plain
+        # first clean check on 2026-07-20; a plain
         # reconnect should clear faster, hence its own shorter warmup).
-        warming_until = max(self._last_reconnect + self.reconnect_warmup_seconds,
-                            self._last_relaunch + self.relaunch_warmup_seconds)
+        warming_until = self._last_reconnect + self.reconnect_warmup_seconds
         if now < warming_until:
             self._stale_since = None
             return
@@ -495,30 +458,6 @@ class WatchdogPlugin(PluginBase):
 
         in_session = self._in_declared_session(now_et)
         symbols = sorted({f["symbol"] for f in stale_now})
-
-        # Relaunch's timeout is always the longer of the two (see __init__
-        # comment), so check it first: if duration has already reached it,
-        # jump straight there rather than also firing a reconnect this same
-        # cycle — a reconnect will already have had its own chance on an
-        # earlier cycle if auto_reconnect_on_stale is on.
-        relaunch_timeout = (self.relaunch_in_session_timeout_seconds if in_session
-                            else self.relaunch_off_hours_timeout_seconds)
-        if self.auto_relaunch_tws and duration >= relaunch_timeout:
-            if now - self._last_relaunch < self.relaunch_cooldown_seconds:
-                logger.warning(
-                    f"Watchdog: relaunch escalation conditions met "
-                    f"({duration/60:.0f} min stale, in_session={in_session}) "
-                    f"but suppressed by cooldown "
-                    f"({self.relaunch_cooldown_seconds:.0f}s since last relaunch)"
-                )
-                return
-            self._relaunch_tws(
-                f"{len(stale_now)} feed(s) stale ({', '.join(symbols)}) for "
-                f"{duration/60:.0f} min (in_session={in_session}, "
-                f"timeout={relaunch_timeout/60:.0f} min) — resubscription "
-                f"and reconnect did not clear it"
-            )
-            return
 
         reconnect_timeout = (self.reconnect_in_session_timeout_seconds if in_session
                              else self.reconnect_off_hours_timeout_seconds)
@@ -556,7 +495,7 @@ class WatchdogPlugin(PluginBase):
 
     def _in_blackout(self, now: Optional[datetime] = None) -> bool:
         """True if `now` (America/New_York) falls inside a configured
-        blackout window — never eligible for reconnect or relaunch regardless of
+        blackout window — never eligible for reconnect regardless of
         the in-session/off-hours timeout."""
         now = now or datetime.now(_NY)
         t = now.time()
@@ -574,8 +513,7 @@ class WatchdogPlugin(PluginBase):
         """Schedule PluginExecutive.force_reconnect() — a full API
         disconnect/reconnect cycle, TWS process untouched, no credentials
         involved. The cheap tier: try this before paying the cost of a full
-        TWS relaunch (which may end with the engine stuck waiting for a
-        human to log back in — see the auto_relaunch_tws comment)."""
+        reconnect, which never touches the TWS process."""
         self._last_reconnect = time.time()
         self._reconnects += 1
         self._stale_since = None
@@ -592,38 +530,6 @@ class WatchdogPlugin(PluginBase):
             self._executive.force_reconnect(reason)
         except Exception as e:
             logger.error(f"Watchdog: force_reconnect failed: {e}")
-
-    def _relaunch_tws(self, reason: str) -> None:
-        """Fire relaunch_tws.sh (kill the TWS process, relaunch its own
-        installer script) and record the attempt. Fire-and-forget: the
-        script backgrounds the actual TWS process itself, so this only
-        needs to survive long enough to issue the SIGTERM and start the
-        relaunch, not to wait for TWS to finish coming up."""
-        self._last_relaunch = time.time()
-        self._relaunches += 1
-        self._stale_since = None
-        self._save_state()
-        self._raise_alert(
-            "tws_relaunch_triggered",
-            f"Auto-relaunching TWS (attempt #{self._relaunches}): {reason}",
-            reason=reason, relaunch_count=self._relaunches,
-        )
-        try:
-            self.plugin_dir.mkdir(parents=True, exist_ok=True)
-            log_path = self.plugin_dir / "relaunch.log"
-            with open(log_path, "a") as logf:
-                logf.write(
-                    f"\n--- {datetime.now(timezone.utc).isoformat()} "
-                    f"relaunch #{self._relaunches}: {reason} ---\n"
-                )
-                logf.flush()
-                subprocess.Popen(
-                    [self.relaunch_script_path],
-                    stdout=logf, stderr=subprocess.STDOUT,
-                    start_new_session=True,  # outlive our own process group
-                )
-        except Exception as e:
-            logger.error(f"Watchdog: failed to launch relaunch script: {e}")
 
     def _check_stuck_orders(self) -> List[Dict]:
         """Alert once per order with no fill/terminal status past threshold."""
@@ -831,8 +737,6 @@ class WatchdogPlugin(PluginBase):
                     "stale_since":     self._stale_since,
                     "reconnects":      self._reconnects,
                     "last_reconnect":  self._last_reconnect or None,
-                    "relaunches":      self._relaunches,
-                    "last_relaunch":   self._last_relaunch or None,
                 },
             }
 
@@ -853,13 +757,7 @@ class WatchdogPlugin(PluginBase):
                     "reconnect_off_hours_timeout_seconds":  self.reconnect_off_hours_timeout_seconds,
                     "reconnect_warmup_seconds":    self.reconnect_warmup_seconds,
                     "reconnect_cooldown_seconds":  self.reconnect_cooldown_seconds,
-                    "auto_relaunch_tws":           self.auto_relaunch_tws,
-                    "relaunch_script_path":        self.relaunch_script_path,
-                    "relaunch_in_session_timeout_seconds": self.relaunch_in_session_timeout_seconds,
-                    "relaunch_off_hours_timeout_seconds":  self.relaunch_off_hours_timeout_seconds,
                     "blackout_windows":            self.blackout_windows,
-                    "relaunch_warmup_seconds":     self.relaunch_warmup_seconds,
-                    "relaunch_cooldown_seconds":   self.relaunch_cooldown_seconds,
                 },
             }
 
@@ -926,19 +824,6 @@ class WatchdogPlugin(PluginBase):
                 self.reconnect_warmup_seconds = max(0.0, float(value))
             elif key == "reconnect_cooldown_seconds":
                 self.reconnect_cooldown_seconds = max(0.0, float(value))
-            elif key == "auto_relaunch_tws":
-                self.auto_relaunch_tws = bool(value) if not isinstance(value, str) \
-                    else value.strip().lower() in ("1", "true", "yes", "on")
-            elif key == "relaunch_script_path":
-                self.relaunch_script_path = str(value)
-            elif key == "relaunch_in_session_timeout_seconds":
-                self.relaunch_in_session_timeout_seconds = max(60.0, float(value))
-            elif key == "relaunch_off_hours_timeout_seconds":
-                self.relaunch_off_hours_timeout_seconds = max(60.0, float(value))
-            elif key == "relaunch_warmup_seconds":
-                self.relaunch_warmup_seconds = max(0.0, float(value))
-            elif key == "relaunch_cooldown_seconds":
-                self.relaunch_cooldown_seconds = max(0.0, float(value))
             elif key == "blackout_windows":
                 windows = value
                 if isinstance(windows, str):
