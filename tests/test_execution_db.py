@@ -728,3 +728,98 @@ class TestExecutionDatabaseErrorHandling:
         with patch('sqlite3.connect', side_effect=Exception("DB Error")):
             result = execution_db.get_executions_by_symbol("SPY")
             assert result == []
+
+
+class TestCommissionReport:
+    """get_total_commission answers 'how much'; get_commission_report answers
+    'where did it go', which is the question worth asking when fees are eating
+    a strategy's edge."""
+
+    def _fill(self, db, exec_id, symbol, commission, realized=None, when=None):
+        from execution_db import ExecutionRecord, CommissionRecord
+        when = when or datetime(2026, 8, 14, 10, 0, 0)
+        db.insert_execution(ExecutionRecord(
+            exec_id=exec_id, order_id=1, symbol=symbol, sec_type="STK",
+            exchange="SMART", currency="USD", local_symbol=symbol,
+            shares=10.0, cum_qty=10.0, avg_price=100.0, side="BOT",
+            account="DU1", timestamp=when,
+        ))
+        db.insert_commission(CommissionRecord(
+            exec_id=exec_id, commission=commission, currency="USD",
+            realized_pnl=realized, timestamp=when,
+        ))
+
+    def test_empty_db_reports_zeroes_not_an_error(self, execution_db):
+        r = execution_db.get_commission_report()
+        assert r["total_commission"] == 0.0
+        assert r["record_count"] == 0
+        assert r["by_symbol"] == []
+
+    def test_totals_and_breakdown(self, execution_db):
+        self._fill(execution_db, "e1", "GLD", 1.50, realized=10.0)
+        self._fill(execution_db, "e2", "GLD", 2.50, realized=-4.0)
+        self._fill(execution_db, "e3", "QQQ", 0.75, realized=1.0)
+
+        r = execution_db.get_commission_report()
+
+        assert r["total_commission"] == pytest.approx(4.75)
+        assert r["total_realized_pnl"] == pytest.approx(7.0)
+        assert r["record_count"] == 3
+        assert r["currency"] == "USD"
+        # largest commission first
+        assert [b["symbol"] for b in r["by_symbol"]] == ["GLD", "QQQ"]
+        gld = r["by_symbol"][0]
+        assert gld["commission"] == pytest.approx(4.0)
+        assert gld["count"] == 2
+
+    def test_symbol_filter(self, execution_db):
+        self._fill(execution_db, "e1", "GLD", 1.50)
+        self._fill(execution_db, "e2", "QQQ", 0.75)
+
+        r = execution_db.get_commission_report(symbol="QQQ")
+
+        assert r["total_commission"] == pytest.approx(0.75)
+        assert r["record_count"] == 1
+        assert [b["symbol"] for b in r["by_symbol"]] == ["QQQ"]
+
+    def test_date_filter(self, execution_db):
+        self._fill(execution_db, "old", "GLD", 5.00, when=datetime(2026, 1, 1))
+        self._fill(execution_db, "new", "GLD", 1.00, when=datetime(2026, 8, 14))
+
+        r = execution_db.get_commission_report(start_date=datetime(2026, 6, 1))
+
+        assert r["total_commission"] == pytest.approx(1.00)
+        assert r["record_count"] == 1
+
+    def test_commission_without_its_execution_is_still_counted(self, execution_db):
+        """IB sometimes sends a commission whose fill never arrived. Dropping it
+        would understate what was actually paid, so it lands under symbol None."""
+        from execution_db import CommissionRecord
+        execution_db.insert_commission(CommissionRecord(
+            exec_id="orphan", commission=3.25, currency="USD",
+            realized_pnl=None, timestamp=datetime(2026, 8, 14, 11, 0, 0),
+        ))
+
+        r = execution_db.get_commission_report()
+
+        assert r["total_commission"] == pytest.approx(3.25)
+        assert r["record_count"] == 1
+        assert r["by_symbol"][0]["symbol"] is None
+
+    def test_mixed_currencies_reported_as_unknown(self, execution_db):
+        """Summing across currencies would be nonsense; say nothing instead."""
+        from execution_db import ExecutionRecord, CommissionRecord
+        self._fill(execution_db, "e1", "GLD", 1.00)
+        execution_db.insert_execution(ExecutionRecord(
+            exec_id="e2", order_id=2, symbol="EUR", sec_type="CASH",
+            exchange="IDEALPRO", currency="EUR", local_symbol="EUR.USD",
+            shares=1.0, cum_qty=1.0, avg_price=1.1, side="BOT",
+            account="DU1", timestamp=datetime(2026, 8, 14, 10, 0, 0),
+        ))
+        execution_db.insert_commission(CommissionRecord(
+            exec_id="e2", commission=2.00, currency="EUR",
+            realized_pnl=None, timestamp=datetime(2026, 8, 14, 10, 0, 0),
+        ))
+
+        r = execution_db.get_commission_report()
+        assert r["currency"] is None

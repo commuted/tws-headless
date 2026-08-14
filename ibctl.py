@@ -18,6 +18,10 @@ Usage:
     ./ibctl.py positions                       # List all positions
     ./ibctl.py summary                         # Account summary with plugin breakdown
     ./ibctl.py summary --json                  # Account summary as JSON
+    ./ibctl.py account                         # IB account values (all raw tags)
+    ./ibctl.py account --json                  # ...as JSON
+    ./ibctl.py commissions                     # Commission and fee report
+    ./ibctl.py commissions --symbol GLD --days 30 --json
     ./ibctl.py reconcile                       # Sync plugin holdings with IB account
 
     # Simple orders (market only)
@@ -870,6 +874,11 @@ Commands:
 
   reconcile            Sync plugin holdings with IB account
 
+  Account-level (the IB account itself, not plugin ledgers):
+  account [--json]     IB account values, including every raw tag IB sent
+  commissions [--symbol SYM] [--days N] [--json]
+                       Commission and fee report, with a per-symbol breakdown
+
   STATE snapshots (local — no running engine required):
   state collect [--account ACCT] [-o PATH]
                        Collect a relocation snapshot from a stopped system
@@ -1023,7 +1032,7 @@ Examples:
     # string instead. Re-forward --json on the wire for the commands whose
     # handlers are confirmed to look for it, so the documented behavior
     # ("summary --json", "reconcile --json") actually reaches them.
-    _SERVER_JSON_AWARE_COMMANDS = {"summary", "reconcile"}
+    _SERVER_JSON_AWARE_COMMANDS = {"summary", "reconcile", "account", "commissions"}
     if args.json and args.command[0].lower() in _SERVER_JSON_AWARE_COMMANDS:
         args.command = args.command + ["--json"]
 
