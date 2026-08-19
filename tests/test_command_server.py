@@ -652,6 +652,7 @@ class TestRequestQueue:
             token = f"token_{i}"
             queue.try_enqueue(token, "ping")
             queue.complete(token)
+            queue.archive_completed(token)
         # Should have 8 completed (MAX_COMPLETED), 0 active
         assert queue.size == RequestQueue.MAX_COMPLETED
 
@@ -663,6 +664,7 @@ class TestRequestQueue:
             token = f"token_{i}"
             queue.try_enqueue(token, "ping")
             queue.complete(token)
+            queue.archive_completed(token)
         # token_0 was evicted, should be reusable
         result = queue.try_enqueue("token_0", "ping")
         assert result is None  # Success

@@ -86,6 +86,7 @@ import json
 import os
 import socket
 import sys
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Any, Optional
@@ -201,6 +202,8 @@ def send_command(
     timeout: float = 10.0,
     token: Optional[str] = None,
     request_token: Optional[str] = None,
+    async_mode: bool = False,
+    poll_interval: float = 0.5,
 ) -> CommandResult:
     """
     Send a command to the running server.
@@ -211,45 +214,56 @@ def send_command(
         timeout: Connection timeout in seconds
         token: Authentication token (if server requires auth)
         request_token: Optional request token for tracking/dedup
+        async_mode: If True, use async pattern (request token, poll for result)
+        poll_interval: Seconds between polls when async_mode=True
 
     Returns:
         CommandResult from server
     """
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(socket_path)
-        sock.settimeout(timeout)
-
-        # Build wire command: REQ first, then AUTH, then command
-        full_command = command
-        if token:
-            full_command = f"AUTH {token} {full_command}"
-        if request_token:
-            full_command = f"REQ {request_token} {full_command}"
-
-        # Send command
-        sock.sendall((full_command + "\n").encode("utf-8"))
-
-        # Receive response
-        data = b""
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-            if b"\n" in data:
-                break
-
-        sock.close()
-
-        # Parse response
-        response = json.loads(data.decode("utf-8").strip())
-        return CommandResult(
-            status=CommandStatus(response.get("status", "error")),
-            message=response.get("message", ""),
-            data=response.get("data", {}),
-            request_token=response.get("request_token"),
-        )
+        if async_mode:
+            # Step 1: Get a token if not provided
+            if not request_token:
+                token_result = _send_sync_command("request_token", socket_path, timeout, token)
+                if token_result.status != CommandStatus.SUCCESS:
+                    return token_result
+                request_token = token_result.data.get("token")
+                if not request_token:
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Failed to obtain request token",
+                    )
+            
+            # Step 2: Send command with token (will return PENDING immediately)
+            pending_result = _send_sync_command(command, socket_path, timeout, token, request_token)
+            if pending_result.status == CommandStatus.ERROR:
+                return pending_result
+            
+            # Step 3: Poll for result
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                time.sleep(poll_interval)
+                result = _send_sync_command(f"query_result {request_token}", socket_path, timeout, token)
+                
+                if result.status == CommandStatus.PENDING:
+                    # Still processing
+                    continue
+                elif result.status == CommandStatus.ERROR and "No result found" in result.message:
+                    # Result not ready yet
+                    continue
+                else:
+                    # Got result (success or error)
+                    return result
+            
+            # Timeout waiting for result
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Timeout waiting for result (token: {request_token})",
+                data={"token": request_token},
+            )
+        else:
+            # Synchronous mode - original behavior
+            return _send_sync_command(command, socket_path, timeout, token, request_token)
 
     except FileNotFoundError:
         running = [p for e in ("paper", "live")
@@ -271,6 +285,62 @@ def send_command(
             status=CommandStatus.ERROR,
             message=f"Failed to send command: {e}",
         )
+
+
+def _send_sync_command(
+    command: str,
+    socket_path: str,
+    timeout: float,
+    token: Optional[str] = None,
+    request_token: Optional[str] = None,
+) -> CommandResult:
+    """
+    Internal helper to send a command synchronously.
+    
+    Args:
+        command: Command string to send
+        socket_path: Path to Unix socket
+        timeout: Connection timeout in seconds
+        token: Authentication token (if server requires auth)
+        request_token: Optional request token for tracking/dedup
+
+    Returns:
+        CommandResult from server
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(socket_path)
+    sock.settimeout(timeout)
+
+    # Build wire command: REQ first, then AUTH, then command
+    full_command = command
+    if token:
+        full_command = f"AUTH {token} {full_command}"
+    if request_token:
+        full_command = f"REQ {request_token} {full_command}"
+
+    # Send command
+    sock.sendall((full_command + "\n").encode("utf-8"))
+
+    # Receive response
+    data = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+        if b"\n" in data:
+            break
+
+    sock.close()
+
+    # Parse response
+    response = json.loads(data.decode("utf-8").strip())
+    return CommandResult(
+        status=CommandStatus(response.get("status", "error")),
+        message=response.get("message", ""),
+        data=response.get("data", {}),
+        request_token=response.get("request_token"),
+    )
 
 
 def format_result(result: CommandResult, verbose: bool = False):
@@ -955,8 +1025,8 @@ Examples:
     parser.add_argument(
         "--timeout", "-t",
         type=float,
-        default=10.0,
-        help="Timeout in seconds (default: 10)",
+        default=35.0,
+        help="Timeout in seconds (default: 35)",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -975,6 +1045,18 @@ Examples:
     parser.add_argument(
         "--request-token",
         help="Request token for tracking/deduplication",
+    )
+    parser.add_argument(
+        "--async",
+        dest="async_mode",
+        action="store_true",
+        help="Use async mode: request token, queue command, poll for result",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.5,
+        help="Polling interval in seconds for async mode (default: 0.5)",
     )
 
     args, extra = parser.parse_known_args()
@@ -1045,6 +1127,8 @@ Examples:
         timeout=args.timeout,
         token=args.token,
         request_token=args.request_token,
+        async_mode=args.async_mode,
+        poll_interval=args.poll_interval,
     )
 
     # Output result

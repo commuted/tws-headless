@@ -81,6 +81,7 @@ class RequestQueue:
     def __init__(self):
         self._active: Dict[str, RequestEntry] = {}
         self._completed: deque = deque(maxlen=self.MAX_COMPLETED)
+        self._token_counter = 0
 
     def try_enqueue(self, token: str, command: str) -> Optional[str]:
         """
@@ -95,23 +96,58 @@ class RequestQueue:
         return None
 
     def complete(self, token: str, result: Optional[CommandResult] = None) -> None:
-        """Move request from active to completed. deque(maxlen=8) auto-evicts oldest."""
-        entry = self._active.pop(token, None)
+        """Mark request as completed and store result, but keep in active for retrieval."""
+        entry = self._active.get(token)
         if entry is not None:
             entry.status = "completed"
             entry.result = result
             entry.completed_at = time.time()
+
+    def retrieve_result(self, token: str) -> Optional[RequestEntry]:
+        """Retrieve and archive a completed request. Returns None if not found or still active."""
+        entry = self._active.get(token)
+        if entry is None:
+            # Check completed queue
+            for e in self._completed:
+                if e.token == token:
+                    return e
+            return None
+        
+        if entry.status != "completed":
+            # Still running
+            return None
+        
+        # Move to completed archive and return
+        self._active.pop(token)
+        self._completed.append(entry)
+        return entry
+
+    def archive_completed(self, token: str) -> None:
+        """Move a completed request from active to completed archive."""
+        entry = self._active.pop(token, None)
+        if entry is not None and entry.status == "completed":
             self._completed.append(entry)
+
+    def get_status(self, token: str) -> Optional[str]:
+        """Get status of a request. Returns 'active', 'completed', or None if not found."""
+        if token in self._active:
+            return self._active[token].status
+        for e in self._completed:
+            if e.token == token:
+                return "completed"
+        return None
 
     def generate_token(self) -> str:
         """Generate a unique token not in the queue."""
         return self._generate_token()
 
     def _generate_token(self) -> str:
-        """Generate a unique token."""
+        """Generate a unique timestamp-based token with counter for uniqueness."""
         completed_tokens = {e.token for e in self._completed}
         while True:
-            token = secrets.token_hex(8)
+            # Use timestamp + counter for guaranteed uniqueness
+            self._token_counter += 1
+            token = f"{time.time():.6f}-{self._token_counter}"
             if token not in self._active and token not in completed_tokens:
                 return token
 
@@ -177,6 +213,8 @@ class CommandServer:
         # Register built-in commands
         self.register_handler("help", self._handle_help)
         self.register_handler("ping", self._handle_ping)
+        self.register_handler("request_token", self._handle_request_token)
+        self.register_handler("query_result", self._handle_query_result)
 
     def register_handler(
         self,
@@ -287,9 +325,10 @@ class CommandServer:
         """Handle a single client connection."""
         request_token = None
         try:
-            # Read command (newline-terminated) with 30s timeout
+            # Read command (newline-terminated) with 60s timeout
+            # (must be longer than longest command execution, e.g. account command's 30s IB wait)
             try:
-                data = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=30.0)
+                data = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=60.0)
             except asyncio.TimeoutError:
                 return
             except asyncio.IncompleteReadError:
@@ -316,15 +355,16 @@ class CommandServer:
                 await writer.drain()
                 return
 
-            # Run in a thread pool so that long-running plugin commands
-            # (e.g. "plugin request run_tests") do not block the event loop.
-            # The thread-safe send_msg in async_transport uses call_soon_threadsafe
-            # so IB requests made from the thread are still safe.
+            # Execute command immediately and return result (backward compatible)
+            # Async mode is opt-in via client using request_token workflow
             result = await asyncio.to_thread(self._execute_command, remaining)
             result.request_token = request_token
-
             writer.write((result.to_json() + "\n").encode("utf-8"))
             await writer.drain()
+            
+            # Archive the completed request
+            self._request_queue.complete(request_token, result)
+            self._request_queue.archive_completed(request_token)
 
         except Exception as e:
             logger.error(f"Error handling client: {e}")
@@ -339,13 +379,26 @@ class CommandServer:
             except Exception:
                 pass
         finally:
-            if request_token is not None:
-                self._request_queue.complete(request_token)
             try:
                 writer.close()
                 await writer.wait_closed()
             except Exception:
                 pass
+
+    async def _execute_async_command(self, token: str, command_line: str):
+        """Execute a command asynchronously and store the result."""
+        try:
+            result = await asyncio.to_thread(self._execute_command, command_line)
+            result.request_token = token
+            self._request_queue.complete(token, result)
+        except Exception as e:
+            logger.error(f"Error executing async command for token {token}: {e}")
+            error_result = CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Command failed: {e}",
+                request_token=token,
+            )
+            self._request_queue.complete(token, error_result)
 
     def _parse_request_token(self, command_line: str) -> tuple:
         """Extract optional REQ <token> prefix. Returns (token, remaining)."""
@@ -409,6 +462,50 @@ class CommandServer:
             status=CommandStatus.SUCCESS,
             message="pong",
         )
+
+    def _handle_request_token(self, args: List[str]) -> CommandResult:
+        """Handle 'request_token' command - generate a new unique token"""
+        token = self._request_queue.generate_token()
+        return CommandResult(
+            status=CommandStatus.SUCCESS,
+            message=f"Generated token: {token}",
+            data={"token": token},
+        )
+
+    def _handle_query_result(self, args: List[str]) -> CommandResult:
+        """Handle 'query_result TOKEN' command - retrieve result for a token"""
+        if not args:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message="Usage: query_result TOKEN",
+            )
+        
+        token = args[0]
+        entry = self._request_queue.retrieve_result(token)
+        
+        if entry is None:
+            # Check if it's still active
+            status = self._request_queue.get_status(token)
+            if status == "active":
+                return CommandResult(
+                    status=CommandStatus.PENDING,
+                    message=f"Request {token} is still processing",
+                    data={"status": "active"},
+                )
+            else:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message=f"No result found for token: {token}",
+                )
+        
+        # Return the stored result
+        if entry.result:
+            return entry.result
+        else:
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message="Request completed but no result stored",
+            )
 
 
 import socket  # kept for send_command() used by standalone ibctl.py client

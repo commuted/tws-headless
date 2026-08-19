@@ -766,60 +766,133 @@ class EngineCommandHandler:
             )
 
     def handle_account(self, args: List[str]):
-        """Handle 'account' command - the IB account's own values.
+        """Handle 'account' command - request FRESH account data from IB.
 
         Distinct from 'summary', which is plugin-oriented: this reports what IB
         says about the account itself, including every raw tag it sent, with no
         plugin ledger interpretation layered on top. When a plugin's view and
         the account disagree, this is the side that is authoritative.
+
+        This command requests fresh data from IB via reqAccountSummary(), not
+        cached data from portfolio load.
         """
+        import threading
         from .command_server import CommandResult, CommandStatus
+        from ibapi.account_summary_tags import AccountSummaryTags
 
         try:
             portfolio = self.engine.portfolio
-            account = portfolio.get_account_summary() if portfolio else None
-
-            if not account:
+            if not portfolio or not portfolio.connected:
                 return CommandResult(
                     status=CommandStatus.ERROR,
-                    message="No account summary available (not connected?)",
+                    message="Not connected to IB",
                 )
 
+            # Request fresh account summary from IB
+            done = threading.Event()
+            fresh_account = {}
+
+            def on_summary(req_id: int, account: str, tag: str, value: str, currency: str):
+                """Callback for each account summary tag"""
+                if account not in fresh_account:
+                    fresh_account[account] = {"values": {}}
+                fresh_account[account]["values"][tag] = {"value": value, "currency": currency}
+                
+                # Parse key values
+                try:
+                    if tag == "NetLiquidation":
+                        fresh_account[account]["net_liquidation"] = float(value)
+                    elif tag == "TotalCashValue":
+                        fresh_account[account]["total_cash"] = float(value)
+                    elif tag == "BuyingPower":
+                        fresh_account[account]["buying_power"] = float(value)
+                    elif tag == "AvailableFunds":
+                        fresh_account[account]["available_funds"] = float(value)
+                    elif tag == "Currency":
+                        fresh_account[account]["currency"] = value
+                except ValueError:
+                    pass
+
+            def on_end():
+                """Callback when account summary is complete"""
+                done.set()
+
+            # Register temporary callbacks
+            old_summary_cb = portfolio._callbacks.get("accountSummary")
+            old_end_cb = portfolio._callbacks.get("accountSummaryEnd")
+            portfolio._callbacks["accountSummary"] = on_summary
+            portfolio._callbacks["accountSummaryEnd"] = on_end
+
+            try:
+                # Request account summary from IB
+                req_id = portfolio.get_next_req_id()
+                portfolio.reqAccountSummary(req_id, "All", AccountSummaryTags.AllTags)
+
+                # Wait for completion (30 second timeout)
+                if not done.wait(30.0):
+                    portfolio.cancelAccountSummary(req_id)
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Timeout waiting for account summary from IB (30s)",
+                    )
+
+                portfolio.cancelAccountSummary(req_id)
+
+            finally:
+                # Restore original callbacks
+                if old_summary_cb:
+                    portfolio._callbacks["accountSummary"] = old_summary_cb
+                else:
+                    portfolio._callbacks.pop("accountSummary", None)
+                if old_end_cb:
+                    portfolio._callbacks["accountSummaryEnd"] = old_end_cb
+                else:
+                    portfolio._callbacks.pop("accountSummaryEnd", None)
+
+            # Extract first account (usually only one)
+            if not fresh_account:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message="No account data received from IB",
+                )
+
+            account_id = list(fresh_account.keys())[0]
+            account_data = fresh_account[account_id]
+
             data = {
-                "account_id": account.account_id,
-                "currency": account.currency,
-                "net_liquidation": account.net_liquidation,
-                "total_cash": account.total_cash,
-                "buying_power": account.buying_power,
-                "available_funds": account.available_funds,
-                "is_valid": account.is_valid,
-                # Every tag IB reported, unfiltered. The named fields above are
-                # a convenience view of a few of them, not the whole picture.
-                "values": account.values or {},
+                "account_id": account_id,
+                "currency": account_data.get("currency", "USD"),
+                "net_liquidation": account_data.get("net_liquidation", 0.0),
+                "total_cash": account_data.get("total_cash", 0.0),
+                "buying_power": account_data.get("buying_power", 0.0),
+                "available_funds": account_data.get("available_funds", 0.0),
+                "is_valid": account_data.get("net_liquidation", 0.0) > 0,
+                "values": account_data.get("values", {}),
             }
 
             lines = [
                 "=" * 50,
-                "ACCOUNT",
+                "ACCOUNT (FRESH FROM IB)",
                 "=" * 50,
-                f"Account:          {account.account_id}",
-                f"Currency:         {account.currency}",
-                f"Net Liquidation:  ${account.net_liquidation:,.2f}",
-                f"Total Cash:       ${account.total_cash:,.2f}",
-                f"Available Funds:  ${account.available_funds:,.2f}",
-                f"Buying Power:     ${account.buying_power:,.2f}",
+                f"Account:          {account_id}",
+                f"Currency:         {data['currency']}",
+                f"Net Liquidation:  ${data['net_liquidation']:,.2f}",
+                f"Total Cash:       ${data['total_cash']:,.2f}",
+                f"Available Funds:  ${data['available_funds']:,.2f}",
+                f"Buying Power:     ${data['buying_power']:,.2f}",
             ]
-            if not account.is_valid:
+            if not data["is_valid"]:
                 lines.append(
                     "  WARNING: net liquidation is zero — IB has not sent a "
                     "usable account summary yet; these numbers are not real."
                 )
-            if account.values:
+            if data["values"]:
                 lines.append("")
-                lines.append(f"ALL IB TAGS ({len(account.values)}):")
+                lines.append(f"ALL IB TAGS ({len(data['values'])}):")
                 lines.append("-" * 50)
-                for tag in sorted(account.values):
-                    lines.append(f"  {tag:<28} {account.values[tag]}")
+                for tag in sorted(data["values"]):
+                    val_info = data["values"][tag]
+                    lines.append(f"  {tag:<28} {val_info['value']}")
             lines.append("=" * 50)
             message = "\n".join(lines)
 
@@ -827,22 +900,33 @@ class EngineCommandHandler:
                 status=CommandStatus.SUCCESS, message=message, data=data,
             )
         except Exception as e:
+            import traceback
             return CommandResult(
                 status=CommandStatus.ERROR,
-                message=f"Failed to get account summary: {e}",
+                message=f"Failed to get account summary: {e}\n{traceback.format_exc()}",
             )
 
     def handle_commissions(self, args: List[str]):
-        """Handle 'commissions' command - commission and fee report.
+        """Handle 'commissions' command - request FRESH commission data from IB.
 
         Usage:
-            commissions [--symbol SYM] [--days N] [--json]
+            commissions [--symbol SYM] [--days N]
+
+        This command requests fresh execution and commission data from IB via
+        reqExecutions(), not just cached data from the local database.
         """
+        import threading
         from .command_server import CommandResult, CommandStatus
         from .execution_db import get_execution_db
         from datetime import datetime, timedelta
 
         try:
+            portfolio = self.engine.portfolio
+            if not portfolio or not portfolio.connected:
+                return CommandResult(
+                    status=CommandStatus.ERROR,
+                    message="Not connected to IB",
+                )
 
             symbol = None
             days = None
@@ -862,6 +946,43 @@ class EngineCommandHandler:
                 else:
                     i += 1
 
+            # Request fresh executions from IB
+            done = threading.Event()
+            
+            def on_exec_end(req_id: int):
+                """Callback when execution download is complete"""
+                done.set()
+
+            # Register temporary callback
+            old_exec_end_cb = portfolio._callbacks.get("execDetailsEnd")
+            portfolio._callbacks["execDetailsEnd"] = on_exec_end
+
+            try:
+                from ibapi.execution import ExecutionFilter
+                
+                # Request executions from IB
+                req_id = portfolio.get_next_req_id()
+                exec_filter = ExecutionFilter()
+                # Empty filter gets all executions for today
+                
+                portfolio._executions_done.clear()
+                portfolio.reqExecutions(req_id, exec_filter)
+
+                # Wait for completion (30 second timeout)
+                if not done.wait(30.0):
+                    return CommandResult(
+                        status=CommandStatus.ERROR,
+                        message="Timeout waiting for executions from IB (30s)",
+                    )
+
+            finally:
+                # Restore original callback
+                if old_exec_end_cb:
+                    portfolio._callbacks["execDetailsEnd"] = old_exec_end_cb
+                else:
+                    portfolio._callbacks.pop("execDetailsEnd", None)
+
+            # Now query the database for commission report
             start_date = datetime.now() - timedelta(days=days) if days else None
             report = get_execution_db().get_commission_report(
                 symbol=symbol, start_date=start_date,
