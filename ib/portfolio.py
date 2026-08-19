@@ -2160,6 +2160,10 @@ class Portfolio(IBClient):
         except ValueError:
             pass
 
+        # Invoke registered callback if present
+        if "accountSummary" in self._callbacks:
+            self._callbacks["accountSummary"](reqId, account, tag, value, currency)
+
     def accountSummaryEnd(self, reqId: int):
         """Called when account summary is complete"""
         logger.debug("Account summary complete")

@@ -29,7 +29,9 @@ def _account(**kw):
     acct.buying_power = kw.get("buying_power", 1_000_000.0)
     acct.available_funds = kw.get("available_funds", 24_811.74)
     acct.is_valid = kw.get("is_valid", True)
-    acct.values = kw.get("values", {"NetLiquidation": "250000", "Cushion": "0.87"})
+    # Use provided net_liquidation in values dict if not explicitly overridden
+    default_values = {"NetLiquidation": str(acct.net_liquidation), "Cushion": "0.87"}
+    acct.values = kw.get("values", default_values)
     return acct
 
 
@@ -37,10 +39,62 @@ class TestAccountCommand:
     def _run(self, args, account):
         handler, engine = _handler()
         portfolio = Mock()
-        portfolio.get_account_summary.return_value = account
+        portfolio.connected = True if account else False
+        portfolio.get_next_req_id = Mock(return_value=1)
+        portfolio.reqAccountSummary = Mock()
+        portfolio.cancelAccountSummary = Mock()
+        portfolio._callbacks = {}
+        
+        # Mock threading.Event to simulate immediate completion
+        mock_event = Mock()
+        mock_event.wait = Mock(return_value=True)
+        
+        # Simulate IB callbacks if account data provided
+        if account:
+            def mock_req_account_summary(req_id, group, tags):
+                # Simulate accountSummary callbacks
+                if "accountSummary" in portfolio._callbacks:
+                    # Parse key values from account object - use actual values
+                    # so is_valid calculation works correctly
+                    net_liq = account.net_liquidation
+                    portfolio._callbacks["accountSummary"](
+                        req_id, account.account_id, "NetLiquidation", 
+                        str(net_liq), "USD"
+                    )
+                    portfolio._callbacks["accountSummary"](
+                        req_id, account.account_id, "TotalCashValue", 
+                        str(account.total_cash), "USD"
+                    )
+                    portfolio._callbacks["accountSummary"](
+                        req_id, account.account_id, "BuyingPower", 
+                        str(account.buying_power), "USD"
+                    )
+                    portfolio._callbacks["accountSummary"](
+                        req_id, account.account_id, "AvailableFunds", 
+                        str(account.available_funds), "USD"
+                    )
+                    portfolio._callbacks["accountSummary"](
+                        req_id, account.account_id, "Currency", 
+                        account.currency, "USD"
+                    )
+                    # Add all raw tags
+                    for tag, val in account.values.items():
+                        val_str = val if isinstance(val, str) else str(val)
+                        portfolio._callbacks["accountSummary"](
+                            req_id, account.account_id, tag, val_str, "USD"
+                        )
+                # Simulate accountSummaryEnd callback
+                if "accountSummaryEnd" in portfolio._callbacks:
+                    portfolio._callbacks["accountSummaryEnd"]()
+            
+            portfolio.reqAccountSummary.side_effect = mock_req_account_summary
+        
         engine.portfolio = portfolio
         handler.engine = engine
-        return handler.handle_account(args)
+        
+        # Patch threading.Event to return our mock
+        with patch("threading.Event", return_value=mock_event):
+            return handler.handle_account(args)
 
     def test_reports_the_named_fields(self):
         result = self._run([], _account())
@@ -52,7 +106,9 @@ class TestAccountCommand:
         """The named fields are a convenience view of a few tags, not all of
         them; anything IB sent must survive the round trip."""
         result = self._run([], _account(values={"Cushion": "0.87", "GrossPositionValue": "9"}))
-        assert result.data["values"] == {"Cushion": "0.87", "GrossPositionValue": "9"}
+        # Values are now stored as {"value": str, "currency": str} objects
+        assert result.data["values"]["Cushion"]["value"] == "0.87"
+        assert result.data["values"]["GrossPositionValue"]["value"] == "9"
         assert "Cushion" in result.message
 
     def test_message_stays_text_even_with_json(self):
@@ -63,12 +119,13 @@ class TestAccountCommand:
         assert "ACCOUNT" in result.message
         assert not result.message.lstrip().startswith("{")
         assert result.data["account_id"] == "U21830461"
-        assert result.data["values"]["Cushion"] == "0.87"
+        assert result.data["values"]["Cushion"]["value"] == "0.87"
 
     def test_invalid_account_is_flagged_not_silently_shown(self):
         """net_liquidation 0 means IB has not sent a usable summary. Printing
         zeroes as if they were real is how a disconnected engine looks solvent."""
-        result = self._run([], _account(is_valid=False, net_liquidation=0.0))
+        result = self._run([], _account(is_valid=False, net_liquidation=0.0, 
+                                        total_cash=0.0, buying_power=0.0, available_funds=0.0))
         assert "WARNING" in result.message
         assert result.data["is_valid"] is False
 
@@ -96,10 +153,32 @@ class TestCommissionsCommand:
 
     def _run(self, args, report=None):
         handler, engine = _handler()
+        portfolio = Mock()
+        portfolio.connected = True
+        portfolio.get_next_req_id = Mock(return_value=1)
+        portfolio.reqExecutions = Mock()
+        portfolio._callbacks = {}
+        portfolio._executions_done = Mock()
+        portfolio._executions_done.clear = Mock()
+        
+        # Mock threading.Event to simulate immediate completion
+        mock_event = Mock()
+        mock_event.wait = Mock(return_value=True)
+        
+        # Simulate execDetailsEnd callback
+        def mock_req_executions(req_id, exec_filter):
+            if "execDetailsEnd" in portfolio._callbacks:
+                portfolio._callbacks["execDetailsEnd"](req_id)
+        
+        portfolio.reqExecutions.side_effect = mock_req_executions
+        
+        engine.portfolio = portfolio
         handler.engine = engine
         db = Mock()
         db.get_commission_report.return_value = report if report is not None else self.REPORT
-        with patch("ib.execution_db.get_execution_db", return_value=db):
+        
+        with patch("ib.execution_db.get_execution_db", return_value=db), \
+             patch("threading.Event", return_value=mock_event):
             return handler.handle_commissions(args), db
 
     def test_reports_totals_and_breakdown(self):
