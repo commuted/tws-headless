@@ -240,6 +240,25 @@ _PENDING_ORDER_ALERT_SECONDS = 1800
 # otherwise silently disable all trading (including exits) with zero errors.
 _PARSE_FAILURE_ALERT_THRESHOLD = 10
 
+# IB error codes that mean an order was outright rejected and no orderStatus
+# transition will follow. Treated as terminal in on_ib_error: the pending-order
+# tracker is cleared so the stuck-order alerter (and the watchdog plugin) stop
+# re-firing every 30 min. Codes not on this list stay alert-only — some IB
+# order-attributed codes are advisories, not rejections. Extend as new
+# rejection modes are seen in practice.
+_TERMINAL_REJECT_CODES = frozenset({
+    201,    # Order rejected — reason: …
+    202,    # Order cancelled — reason: …
+    203,    # The security is not available or allowed for this account
+    321,    # Server error validating message (malformed order)
+    388,    # Order size does not conform to market rule
+    434,    # Order size does not conform to market rule
+    10052,  # Invalid time in force
+    10147,  # OrderId to cancel not found
+    10148,  # OrderId to cancel is in a state that cannot be cancelled
+    10289,  # Short sale not permitted for this security
+})
+
 # After (re)subscribing, IB replays a burst of already-completed backfill bars
 # (via historicalData) before live updates start (via historicalDataUpdate).
 # Session decisions must never fire from a replayed bar — a backfilled
@@ -1579,6 +1598,7 @@ class GldUsdSwapPlugin(PluginBase):
         order.action        = "SELL"
         order.totalQuantity = qty
         order.orderType     = "MKT"
+        order.tif           = "DAY"
         order.transmit      = True
 
         oid = self.portfolio.place_order_custom(contract, order)
@@ -1665,6 +1685,7 @@ class GldUsdSwapPlugin(PluginBase):
         order.action        = "BUY"
         order.totalQuantity = shares
         order.orderType     = "MKT"
+        order.tif           = "DAY"
         order.transmit      = True
 
         oid = self.portfolio.place_order_custom(contract, order)
@@ -1751,6 +1772,7 @@ class GldUsdSwapPlugin(PluginBase):
         order.action        = "SELL"
         order.totalQuantity = shares
         order.orderType     = "MKT"
+        order.tif           = "DAY"
         order.transmit      = True
 
         oid = self.portfolio.place_order_custom(contract, order)
@@ -2011,6 +2033,27 @@ class GldUsdSwapPlugin(PluginBase):
 
     def on_ib_error(self, req_id: int, error_code: int, error_string: str) -> None:
         is_order = req_id in self._pending_order_actions
+
+        # Outright rejection: clear pending-order state so the stuck-order
+        # alerter and watchdog stop re-firing every 30 min. Idempotent with
+        # on_order_status (whichever fires second finds nothing to pop and
+        # no-ops via the `if action` guard there).
+        if is_order and error_code in _TERMINAL_REJECT_CODES:
+            action = self._pending_order_actions.pop(req_id, None)
+            self._pending_order_placed_at.pop(req_id, None)
+            self._pending_alerted.discard(req_id)
+            self._alert(
+                "order_rejected",
+                f"{action} order {req_id} rejected by IB "
+                f"[code={error_code}] {error_string} — "
+                f"no fill occurred; holdings unchanged, manual reconciliation "
+                f"may be needed",
+                order_id=req_id, action=action,
+                error_code=error_code, error_string=error_string,
+            )
+            self._save_state()
+            return
+
         self._alert(
             "ib_error",
             f"IB error on {'order' if is_order else 'request'} {req_id}: "
