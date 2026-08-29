@@ -1171,6 +1171,24 @@ class Portfolio(IBClient):
     # Order Placement and Management
     # =========================================================================
 
+    def placeOrder(self, orderId: int, contract: Contract, order: Order) -> None:
+        # Stamp the account tag before the order leaves this process. IB
+        # Gateway rejects an order with no account with error code 435
+        # ("You must specify an account.") at OrderValidationProcessor —
+        # locally, so no orderStatus callback ever fires and the caller
+        # thinks the order is still pending. Fill it in from managed_accounts,
+        # unless the caller already picked a specific sub-account.
+        if not getattr(order, "account", ""):
+            if self.managed_accounts:
+                order.account = self.managed_accounts[0]
+            else:
+                logger.error(
+                    f"Refusing to place order {orderId} for {contract.symbol}: "
+                    f"no managed account known yet (IB error 435 would follow)"
+                )
+                return
+        super().placeOrder(orderId, contract, order)
+
     @property
     def orders(self) -> List[OrderRecord]:
         """Get list of all tracked orders"""
