@@ -45,6 +45,43 @@ class TestLifecycle:
         assert plugin2._regime_at_prior_close == REGIME_CASH
         assert plugin2._trade_count == 4
 
+    def test_stale_pending_orders_are_swept_on_load(self, tmp_path):
+        """A pending entry older than the DAY-TIF horizon must not survive a
+        restart — its order is certainly dead at IB by then, and keeping the
+        record would keep _restored_pending_buy and the stuck-order alerter
+        firing forever."""
+        import time as _time
+
+        plugin = _make_plugin(tmp_path)
+        plugin.start()
+        # Two entries: one fresh, one from 30 hours ago.
+        plugin._pending_order_actions = {101: "SELL", 202: "BUY"}
+        now = _time.time()
+        plugin._pending_order_placed_at = {101: now, 202: now - 30 * 3600}
+        plugin.stop()
+
+        plugin2 = _make_plugin(tmp_path)
+        plugin2.start()
+        # Old one gone; fresh one preserved.
+        assert 202 not in plugin2._pending_order_actions
+        assert plugin2._pending_order_actions.get(101) == "SELL"
+
+    def test_placed_at_survives_restart(self, tmp_path):
+        """The persisted placed_at is what makes the sweep decision correct
+        — if it snapped back to "now" on load, no entry would ever age out."""
+        import time as _time
+
+        plugin = _make_plugin(tmp_path)
+        plugin.start()
+        plugin._pending_order_actions = {77: "SELL"}
+        original_ts = _time.time() - 1234.5
+        plugin._pending_order_placed_at = {77: original_ts}
+        plugin.stop()
+
+        plugin2 = _make_plugin(tmp_path)
+        plugin2.start()
+        assert plugin2._pending_order_placed_at[77] == pytest.approx(original_ts)
+
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -707,13 +744,19 @@ class TestAlerting:
         plugin, received = self._bus_plugin(tmp_path)
         plugin._pending_order_actions[55] = "BUY"
 
+        # 201 is on _TERMINAL_REJECT_CODES since 1c01e41 — the plugin now
+        # emits order_rejected (which also scrubs pending state) instead
+        # of the generic ib_error for known-terminal codes on an order.
         plugin.on_ib_error(55, 201, "Order rejected - insufficient funds")
 
         assert len(received) == 1
         payload = received[0].payload
-        assert payload["kind"] == "ib_error"
-        assert payload["is_order"] is True
+        assert payload["kind"] == "order_rejected"
         assert payload["error_code"] == 201
+        assert payload["action"] == "BUY"
+        # Terminal-reject path scrubs the pending record so the stuck-order
+        # alerter and watchdog stop re-firing.
+        assert 55 not in plugin._pending_order_actions
 
     def test_stuck_pending_order_alerts_once(self, tmp_path):
         import time as _time

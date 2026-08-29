@@ -253,6 +253,7 @@ _TERMINAL_REJECT_CODES = frozenset({
     321,    # Server error validating message (malformed order)
     388,    # Order size does not conform to market rule
     434,    # Order size does not conform to market rule
+    435,    # You must specify an account (Gateway-side validation reject)
     10052,  # Invalid time in force
     10147,  # OrderId to cancel not found
     10148,  # OrderId to cancel is in a state that cannot be cancelled
@@ -413,6 +414,17 @@ class GldUsdSwapPlugin(PluginBase):
         self.vol_window:            int   = 20
         self.derivative_percentile: int   = 50
         self.allocation_dollars:    float = 10_000.0
+        # Minimum fractional gap fast/slow must show for a per-ETF gold/cash
+        # vote to count.  Prevents float64 summation associativity (fast=
+        # sum(buf[-5:])/5 vs slow=sum(buf)/20) from choosing the tie-break
+        # on a genuinely stationary tape.  Ties bias toward NOT-gold, which
+        # in the composite AND-OR reduces to the cash-lean side — the
+        # conservative default matching how the plugin already treats
+        # warm-up.  1e-8 leaves ~6 orders of margin above ULP noise (~1e-14
+        # for these price magnitudes) while sitting far below any real bar-
+        # tick contribution to a 20-sample SMA (a $0.01 tick moves a 20-bar
+        # average by 5e-4 — five orders above this threshold).
+        self.regime_deadband:       float = 1e-8
 
         # --- reset-cadence overlay (opt-in; see module docstring) ---
         self.reset_cadence_enabled: bool  = False
@@ -513,6 +525,7 @@ class GldUsdSwapPlugin(PluginBase):
             self.vol_window              = saved.get("vol_window",              self.vol_window)
             self.derivative_percentile   = saved.get("derivative_percentile",   self.derivative_percentile)
             self.allocation_dollars      = saved.get("allocation_dollars",      self.allocation_dollars)
+            self.regime_deadband         = saved.get("regime_deadband",         self.regime_deadband)
             self.reset_cadence_enabled   = saved.get("reset_cadence_enabled",   self.reset_cadence_enabled)
             self.reset_lookback_days     = saved.get("reset_lookback_days",     self.reset_lookback_days)
             self.reset_cooldown_days     = saved.get("reset_cooldown_days",     self.reset_cooldown_days)
@@ -531,11 +544,38 @@ class GldUsdSwapPlugin(PluginBase):
                 int(oid): action
                 for oid, action in saved.get("pending_orders", {}).items()
             }
-            # Age restored orders from now — if they stay unresolved, the
-            # stuck-order alert fires after the normal threshold.
+            # Restore placed_at from the previous save if available; fall
+            # back to "now" for entries missing a timestamp (older state
+            # files pre-persistence).
+            saved_placed_at = saved.get("pending_orders_placed_at", {}) or {}
+            _now = time.time()
             self._pending_order_placed_at = {
-                oid: time.time() for oid in self._pending_order_actions
+                oid: float(saved_placed_at.get(str(oid), _now))
+                for oid in self._pending_order_actions
             }
+            # All orders this plugin places are DAY-TIF (MKT and MOC). A DAY
+            # order that hasn't hit a terminal status within one full session
+            # cycle (~20h covers overnight + the next morning restart) is
+            # certainly dead at IB — either filled long ago or expired at the
+            # close. Sweep them so the stuck-order alerter and the
+            # _restored_pending_buy hold-flag stop firing on ghost state.
+            # For bit-exact confirmation of borderline cases, snapshot
+            # reqAllOpenOrders() at start and drop any local entry IB doesn't
+            # know about — not yet wired here; the age sweep is sufficient
+            # for the observed failure mode (permId isn't tracked, so cross-
+            # session correlation isn't possible without that plumbing).
+            _MAX_PENDING_AGE_SECS = 20 * 3600
+            _stale = [oid for oid, ts in self._pending_order_placed_at.items()
+                      if _now - ts > _MAX_PENDING_AGE_SECS]
+            for oid in _stale:
+                action = self._pending_order_actions.pop(oid, None)
+                self._pending_order_placed_at.pop(oid, None)
+                age_h = (_now - float(saved_placed_at.get(str(oid), _now))) / 3600
+                logger.warning(
+                    f"Sweeping stale pending {action} order {oid} "
+                    f"(age {age_h:.1f}h > 20h; DAY-TIF orders can't survive "
+                    f"past the following market close)"
+                )
             logger.info(
                 f"Restored: holding={self._holding_gld}, "
                 f"prior_regime={self._regime_at_prior_close}, "
@@ -703,6 +743,7 @@ class GldUsdSwapPlugin(PluginBase):
             "vol_window":            self.vol_window,
             "derivative_percentile": self.derivative_percentile,
             "allocation_dollars":    self.allocation_dollars,
+            "regime_deadband":       self.regime_deadband,
             "reset_cadence_enabled": self.reset_cadence_enabled,
             "reset_lookback_days":   self.reset_lookback_days,
             "reset_cooldown_days":   self.reset_cooldown_days,
@@ -718,8 +759,12 @@ class GldUsdSwapPlugin(PluginBase):
             "rinf":                  self._rinf.save(),
             # In-flight orders survive a restart so an unresolved MOC buy can
             # never be silently forgotten (and duplicated) after a crash.
+            # placed_at is persisted alongside so the load-time sweep can
+            # judge age against real elapsed wall-clock, not "restarted now."
             "pending_orders":        {str(oid): action for oid, action
                                       in self._pending_order_actions.items()},
+            "pending_orders_placed_at": {str(oid): ts for oid, ts
+                                         in self._pending_order_placed_at.items()},
         }
 
     def _save_state(self) -> None:
@@ -1258,14 +1303,18 @@ class GldUsdSwapPlugin(PluginBase):
         if not self._uup.warmed_up(self.slow_bars):
             return   # primary signal not ready
 
-        uup_gold = self._uup.fast_sma < self._uup.slow_sma   # USD weakening
+        # Dead-band: require a positive gap of at least regime_deadband
+        # (relative to slow_sma) for a per-ETF vote to lean gold. A tie
+        # falls to False, matching the conservative cash-lean default.
+        eps = self.regime_deadband
+        uup_gold = (self._uup.slow_sma - self._uup.fast_sma) > abs(self._uup.slow_sma) * eps
 
         if self._tlt.warmed_up(self.slow_bars):
-            tlt_gold = self._tlt.fast_sma > self._tlt.slow_sma   # nominal rates falling
+            tlt_gold = (self._tlt.fast_sma - self._tlt.slow_sma) > abs(self._tlt.slow_sma) * eps
 
             if (self._gld_in_uptrend and self._rinf.warmed_up(self.slow_bars)):
                 # GLD structural uptrend: extend with RINF (stagflation scenario)
-                rinf_gold = self._rinf.fast_sma > self._rinf.slow_sma
+                rinf_gold = (self._rinf.fast_sma - self._rinf.slow_sma) > abs(self._rinf.slow_sma) * eps
                 gold = uup_gold and (tlt_gold or rinf_gold)
                 mode = "UUP+TLT|RINF(meta)"
             else:
@@ -2165,6 +2214,11 @@ class GldUsdSwapPlugin(PluginBase):
                 self.derivative_percentile = max(1, min(99, int(value)))
             elif key == "allocation_dollars":
                 self.allocation_dollars = max(0.0, float(value))
+            elif key == "regime_deadband":
+                v = float(value)
+                if v < 0:
+                    return {"success": False, "message": "regime_deadband must be >= 0"}
+                self.regime_deadband = v
             elif key == "reset_cadence_enabled":
                 self.reset_cadence_enabled = bool(value)
             elif key == "reset_lookback_days":
@@ -2197,6 +2251,7 @@ class GldUsdSwapPlugin(PluginBase):
             "  plugin request gld_usd_swap set_parameter '{\"key\": \"vol_window\",            \"value\": 20}'\n"
             "  plugin request gld_usd_swap set_parameter '{\"key\": \"derivative_percentile\", \"value\": 50}'\n"
             "  plugin request gld_usd_swap set_parameter '{\"key\": \"allocation_dollars\",    \"value\": 10000}'\n"
+            "  plugin request gld_usd_swap set_parameter '{\"key\": \"regime_deadband\",       \"value\": 1e-8}'\n"
             "  plugin request gld_usd_swap set_parameter '{\"key\": \"reset_cadence_enabled\", \"value\": true}'\n"
             "  plugin request gld_usd_swap set_parameter '{\"key\": \"reset_lookback_days\",   \"value\": 42}'\n"
             "  plugin request gld_usd_swap set_parameter '{\"key\": \"reset_cooldown_days\",   \"value\": 126}'\n"
