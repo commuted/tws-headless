@@ -127,6 +127,12 @@ class TradingEngine:
         """
         self.config = config or EngineConfig()
         self._state = EngineState.STOPPED
+        # Wall-clock timestamp of this engine object's construction — the closest
+        # thing to "this process started" that isn't platform-specific. Exposed
+        # through get_status()["started_at"] so operators (and ibctl status) can
+        # show uptime without shelling out to ps. Naive datetime to match the
+        # existing started_at fields on data_feed and plugin_executive stats.
+        self._started_at = datetime.now()
         self._shutdown_event = asyncio.Event()
         # Set only once stop() has fully finished. _shutdown_event fires at the
         # START of stop(), so it says "shutdown was requested", not "shutdown is
@@ -882,6 +888,8 @@ class TradingEngine:
         status = {
             "state": self._state.value,
             "connected": self.is_connected,
+            "started_at": self._started_at.isoformat(),
+            "uptime_seconds": (datetime.now() - self._started_at).total_seconds(),
             "connection": self._connection_manager.get_status(),
             "data_feed": self._data_feed.get_status(),
             "subscribed_symbols": list(self._subscribed_symbols),
