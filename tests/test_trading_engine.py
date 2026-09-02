@@ -466,6 +466,39 @@ class TestGetStatus:
             assert "plugin_executive" in status
             assert status["subscribed_symbols"] == ["SPY"]
 
+    def test_get_status_includes_started_at_and_uptime(self):
+        """get_status must expose started_at + uptime_seconds so ibctl status
+        can show 'Uptime: ...' — otherwise the display silently regresses to
+        'Uptime: 0s' since handle_status defaults .get('uptime_seconds', 0)."""
+        import time as _time
+        with patch('trading_engine.Portfolio'):
+            engine = TradingEngine()
+            engine._connection_manager = Mock()
+            engine._connection_manager.get_status = Mock(return_value={})
+            engine._connection_manager.is_connected = False
+            engine._data_feed = Mock()
+            engine._data_feed.get_status = Mock(return_value={})
+
+            _time.sleep(0.05)   # gives uptime_seconds room to be > 0 deterministically
+            status = engine.get_status()
+
+            assert "started_at" in status
+            assert "uptime_seconds" in status
+            assert status["uptime_seconds"] > 0
+            # ISO-8601 shape — parseable back with fromisoformat
+            from datetime import datetime as _dt
+            _dt.fromisoformat(status["started_at"])  # raises if malformed
+
+    def test_started_at_captured_at_construction(self):
+        """Two engines constructed sequentially must record different start
+        times — proving _started_at is captured per-instance, not shared."""
+        import time as _time
+        with patch('trading_engine.Portfolio'):
+            a = TradingEngine()
+            _time.sleep(0.02)
+            b = TradingEngine()
+            assert b._started_at > a._started_at
+
 
 class TestDataAccess:
     """Tests for data access methods"""
