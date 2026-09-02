@@ -675,6 +675,23 @@ def _display_state(raw: str) -> str:
     return _STATE_DISPLAY.get(raw, raw)
 
 
+def _format_uptime(seconds: float) -> str:
+    # Compact d/h/m/s uptime — same shape ps(1)'s ELAPSED uses so it lines up
+    # with what an operator would see from ps -o etime. Only prints the leading
+    # non-zero units, so a fresh engine reads "12s", not "0d 0h 0m 12s".
+    seconds = int(max(0, seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {mins}m"
+    if hours:
+        return f"{hours}h {mins}m"
+    if mins:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
 class EngineCommandHandler:
     """
     Command handler for the trading engine.
@@ -723,7 +740,8 @@ class EngineCommandHandler:
             message = (
                 f"Engine: {status['state']} | "
                 f"Connected: {status['connected']} | "
-                f"Positions: {status['portfolio']['positions'] if status['portfolio'] else 0}"
+                f"Positions: {status['portfolio']['positions'] if status['portfolio'] else 0} | "
+                f"Uptime: {_format_uptime(status.get('uptime_seconds', 0))}"
             )
 
             return CommandResult(

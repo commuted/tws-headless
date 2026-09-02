@@ -215,6 +215,48 @@ class TestEngineCommandHandlerStatus:
         assert result.status == CommandStatus.SUCCESS
         assert "Positions: 2" in result.message
 
+    def test_status_shows_uptime(self):
+        """Status message must show engine uptime — operators use it to know
+        when the process started without shelling out to ps."""
+        # Simulate get_status returning uptime_seconds like the real engine does.
+        real_get_status = self.engine.get_status
+        self.engine.get_status = lambda: {**real_get_status(), "uptime_seconds": 3725}  # 1h 2m 5s
+        result = self.handler.handle_status([])
+        assert result.status == CommandStatus.SUCCESS
+        assert "Uptime: 1h 2m" in result.message
+
+
+class TestFormatUptime:
+    """Tests for _format_uptime helper — leading-non-zero-units rendering."""
+
+    def test_seconds_only(self):
+        from ib.run_engine import _format_uptime
+        assert _format_uptime(0) == "0s"
+        assert _format_uptime(12) == "12s"
+        assert _format_uptime(59) == "59s"
+
+    def test_minutes_and_seconds(self):
+        from ib.run_engine import _format_uptime
+        assert _format_uptime(60) == "1m 0s"
+        assert _format_uptime(3599) == "59m 59s"
+
+    def test_hours_and_minutes(self):
+        from ib.run_engine import _format_uptime
+        assert _format_uptime(3600) == "1h 0m"
+        assert _format_uptime(3725) == "1h 2m"
+        assert _format_uptime(86399) == "23h 59m"
+
+    def test_days_and_hours(self):
+        from ib.run_engine import _format_uptime
+        assert _format_uptime(86400) == "1d 0h 0m"
+        assert _format_uptime(86400 + 3600 * 2 + 60 * 30) == "1d 2h 30m"
+
+    def test_negative_and_float(self):
+        from ib.run_engine import _format_uptime
+        # Clock skew or fractional seconds mustn't blow up
+        assert _format_uptime(-5) == "0s"
+        assert _format_uptime(12.9) == "12s"
+
 
 class TestEngineCommandHandlerPositions:
     """Tests for positions command"""
