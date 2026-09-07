@@ -49,9 +49,29 @@ Usage:
     ./recorder.py                       # one pass; this is the cron entry point
     ./recorder.py --watchlist my.json
 
-Cron, once a day, comfortably inside even the 1-minute window:
-    17 20 * * 1-5  cd /home/ron/tws-headless && ./historical/recorder.py \
-                       >> historical/recorder.log 2>&1
+CRON. Once a day sits comfortably inside even the 1-minute window.
+
+Cron fires on the machine's LOCAL time, which here is America/Los_Angeles, so
+20:17 local is 23:17 ET -- past the 20:00 ET post-market close and far from
+the gld_usd_swap decision points (MOC near 15:50 ET, MOO near 09:30 ET). Both
+US zones observe DST on the same dates, so that three-hour offset holds all
+year. On a machine in any other zone this needs recomputing: the window to
+stay out of is roughly 09:25-16:05 ET.
+
+The reason to schedule out of hours is PACING HEADROOM, not load. These
+requests travel over the engine's single IB connection and draw on the same
+budget (about 60 historical requests per 10 minutes) that a strategy would
+use at a decision point. The engine itself does not stall while a fetch is in
+flight -- command_server.py dispatches through asyncio.to_thread, so the
+handler's blocking wait never occupies the event loop.
+
+    17 20 * * 1-5 cd /home/ron/claude/tws-headless && \
+        /home/ron/claude/env_claude/bin/python historical/recorder.py \
+        >> historical/recorder.log 2>&1
+
+The interpreter is named explicitly rather than relying on the shebang:
+ibctl imports ib/ to store what it fetches, so a python without ibapi pulls
+the bars successfully and then dies saving them.
 """
 
 import argparse
