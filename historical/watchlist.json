@@ -1,0 +1,65 @@
+[
+  {
+    "symbol": "GLD",
+    "type": "etf",
+    "bar_size": "1 min",
+    "what": "TRADES",
+    "use_rth": false
+  },
+  {
+    "symbol": "GLD",
+    "type": "etf",
+    "bar_size": "1 min",
+    "what": "BID",
+    "use_rth": false
+  },
+  {
+    "symbol": "GLD",
+    "type": "etf",
+    "bar_size": "1 min",
+    "what": "ASK",
+    "use_rth": false
+  },
+  {
+    "symbol": "GLD",
+    "type": "etf",
+    "bar_size": "5 mins",
+    "what": "TRADES",
+    "use_rth": false
+  },
+  {
+    "symbol": "GLD",
+    "type": "etf",
+    "bar_size": "5 mins",
+    "what": "BID",
+    "use_rth": false
+  },
+  {
+    "symbol": "GLD",
+    "type": "etf",
+    "bar_size": "5 mins",
+    "what": "ASK",
+    "use_rth": false
+  },
+  {
+    "symbol": "GLD",
+    "type": "etf",
+    "bar_size": "1 hour",
+    "what": "TRADES",
+    "use_rth": false
+  },
+  {
+    "symbol": "GLD",
+    "type": "etf",
+    "bar_size": "1 hour",
+    "what": "BID",
+    "use_rth": false
+  },
+  {
+    "symbol": "GLD",
+    "type": "etf",
+    "bar_size": "1 hour",
+    "what": "ASK",
+    "use_rth": false
+  }
+]
