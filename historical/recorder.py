@@ -49,6 +49,44 @@ Usage:
     ./recorder.py                       # one pass; this is the cron entry point
     ./recorder.py --watchlist my.json
 
+NOT A PRODUCTION DEPENDENCY. Nothing in the live path reads any of this.
+The gld_usd_swap plugin fills its own history and always has -- via
+subscribe_live_bars (which auto-caches) and get_bars_cached -- and every
+series it asks for is use_rth=True: 5-minute TRADES for GLD/GLL, MIDPOINT for
+UUP/TLT/RINF. Every series recorded here is use_rth=False. The two do not
+overlap in the (symbol, bar_size, what_to_show, use_rth) key, so this neither
+duplicates the plugin's fetching nor competes for its rows, and stopping it
+cannot affect trading.
+
+What it exists for is RESEARCH the plugin's own data cannot answer: extended
+hours, and BID/ASK as separate series. Those are the questions about fills
+and spreads that daily and RTH-only bars are structurally unable to settle.
+
+WHERE TO CONSIDER TERMINATING IT. Reasonable triggers:
+
+  * the fill/microstructure questions get answered, or get abandoned;
+  * the strategy is decided to stay RTH-only, so pre-market execution is
+    never going to be on the table;
+  * the daily cost stops being worth it -- roughly 9-12 historical requests
+    against the engine's shared IB pacing budget, plus steady growth in
+    bars.db.
+
+HOW TO TERMINATE, in increasing order of finality:
+
+  1. Remove the crontab line. That is the whole of it -- collection stops,
+     nothing else changes, and what has been collected stays queryable.
+  2. Delete historical/recorder.py and historical/watchlist.json. No import
+     anywhere refers to them; ibctl, BarStore and the engine are untouched.
+  3. Purge the series, per series:
+         ./ibctl.py historical purge --symbol GLD --bar-size "1 min" \
+             --what BID --no-rth
+
+BEFORE STEP 3, understand what is being discarded. The point of recording
+forward is that IB will not serve these bars again: the 1-minute history ages
+out at roughly 30 days and the 5-minute at six months, so anything held past
+those windows exists only in bars.db, which is gitignored and has no backup
+story of its own. Steps 1 and 2 are reversible. Step 3 is not.
+
 CRON. Once a day sits comfortably inside even the 1-minute window.
 
 Cron fires on the machine's LOCAL time, which here is America/Los_Angeles, so
@@ -354,6 +392,8 @@ def main():
     print()
     print(f"  done, {failures} failed request(s). "
           f"Re-run with --status to confirm coverage advanced.")
+    print("  (Research dependency -- no live strategy reads these series. See the")
+    print("   module docstring for when and how to retire it.)")
     return 1 if (at_risk or failures) else 0
 
 
