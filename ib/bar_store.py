@@ -211,10 +211,18 @@ def _compute_gaps(
     gaps = []
     cursor = start_dt
     for cov_start, cov_end in sorted(coverage, key=lambda x: x[0]):
+        if cursor >= end_dt:
+            break
         if cov_end <= cursor:
             continue
         if cov_start > cursor:
-            gaps.append((cursor, cov_start))
+            # Clamp to end_dt. Without it, a coverage interval lying BEYOND
+            # the requested range still terminates the gap, so asking for one
+            # day in front of a distant island returns a gap reaching all the
+            # way to that island. Measured live before this line existed: a
+            # "1 D" request produced a 63-day gap, chunked into 3 IB requests
+            # and 11,952 bars, where 1 request and ~300 bars were asked for.
+            gaps.append((cursor, min(cov_start, end_dt)))
         cursor = max(cursor, cov_end)
         if cursor >= end_dt:
             break
@@ -355,6 +363,14 @@ class BarStore:
             each gap (or for the full range when force=True).  The returned
             objects must expose .date, .open, .high, .low, .close, .volume,
             and optionally .wap and .barCount.
+
+            RAISE to signal that the fetch FAILED — the chunk is then left
+            uncovered and will be retried on a later call. RETURN an empty
+            list to assert that the source was reached and genuinely has no
+            data for the range; that IS recorded as coverage, so the range is
+            not requested again. Returning [] on an error is therefore a way
+            to lose data permanently, and the two cases must not be
+            conflated by the caller.
         force
             If True, bypass the cache, fetch the full range from IB, and
             overwrite any cached bars in [start_dt, end_dt].
@@ -376,6 +392,7 @@ class BarStore:
                 logger.debug(f"BarStore {key.symbol}/{key.bar_size}: fully cached")
 
         max_secs = _MAX_FETCH_SECONDS.get(bar_size, _DEFAULT_MAX_FETCH_SECONDS)
+        failed = 0
 
         for gap_start, gap_end in gaps:
             for chunk_start, chunk_end in _chunk_gap(gap_start, gap_end, max_secs):
@@ -385,12 +402,27 @@ class BarStore:
                 try:
                     bars = fetch_fn(chunk_start, chunk_end) or []
                 except Exception as exc:
+                    # A FAILED fetch must not extend coverage. Recording the
+                    # range as held when the request never reached IB creates
+                    # a permanent hole: the gap logic will never ask again,
+                    # and nothing downstream can tell the difference between
+                    # "no bars exist here" and "we never managed to look".
+                    # One gateway outage would otherwise silently truncate a
+                    # series forever.
+                    failed += 1
                     logger.error(
-                        f"  fetch_fn failed for {key.symbol} "
-                        f"{chunk_start} → {chunk_end}: {exc}"
+                        f"  fetch_fn FAILED for {key.symbol} "
+                        f"{chunk_start} → {chunk_end}: {exc} "
+                        f"— coverage NOT extended, will retry on a later call"
                     )
-                    bars = []
+                    continue
 
+                # An empty RETURN is different from a raise, and the
+                # distinction is the whole contract: it asserts that IB was
+                # reached and had nothing for this range. That is real
+                # information — pre-inception history, holidays, halts — and
+                # it must be recorded, or every such range is re-requested
+                # forever at the cost of one round trip each time.
                 with self._write_lock:
                     n = self._store_bars(key, bars, chunk_start, chunk_end)
                     self._update_coverage(key, chunk_start, chunk_end)
@@ -400,6 +432,13 @@ class BarStore:
                     f"{chunk_start} → {chunk_end}"
                 )
 
+        if failed:
+            logger.warning(
+                f"BarStore {key.symbol}/{key.bar_size}/{key.what_to_show}: "
+                f"{failed} chunk(s) failed and were left uncovered; the range "
+                f"returned below is incomplete and those gaps will be "
+                f"re-attempted next call"
+            )
         return self._query_bars(key, start_dt, end_dt)
 
     def coverage_summary(

@@ -171,6 +171,18 @@ class TestComputeGaps:
         gaps = _compute_gaps(coverage, _dt(2024, 1, 1), _dt(2024, 1, 31))
         assert gaps == [(_dt(2024, 1, 10), _dt(2024, 1, 20))]
 
+    def test_coverage_entirely_after_range(self):
+        """A request wholly in front of an existing island must not reach it."""
+        coverage = [(_dt(2024, 3, 1), _dt(2024, 3, 10))]
+        gaps = _compute_gaps(coverage, _dt(2024, 1, 1), _dt(2024, 1, 5))
+        assert gaps == [(_dt(2024, 1, 1), _dt(2024, 1, 5))]
+
+    def test_coverage_starts_inside_and_ends_after(self):
+        """The gap stops at the coverage, not at end_dt, when it starts first."""
+        coverage = [(_dt(2024, 1, 10), _dt(2024, 3, 1))]
+        gaps = _compute_gaps(coverage, _dt(2024, 1, 1), _dt(2024, 1, 20))
+        assert gaps == [(_dt(2024, 1, 1), _dt(2024, 1, 10))]
+
     def test_multiple_gaps(self):
         coverage = [
             (_dt(2024, 1, 5), _dt(2024, 1, 10)),
