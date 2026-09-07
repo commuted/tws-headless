@@ -108,8 +108,42 @@ PYTEST="$PYTHON -m pytest"
 #   Picked up by conftest.py to register the 'ib' package and bare-name
 #   aliases for each submodule.
 
+# Split arguments into pytest FLAGS and test PATHS.
+#
+# This used to end with "${@:-$SCRIPT_DIR/tests}", which reads as "use $@, or
+# the default path when $@ is empty" -- so passing ANY argument, even a bare
+# -q, dropped the default path entirely. pytest then fell back to collecting
+# from the current directory, quietly pulling in the plugin suites as well:
+# 2536 tests instead of 2165. A flag intended to change reporting silently
+# changed scope, and narrowing a run with -k widened it instead.
+#
+# Flags and paths are now kept apart, so the default path survives any number
+# of flags and is only replaced by an explicit path argument.
+FLAGS=()
+PATHS=()
+take_value=0
+for arg in "$@"; do
+    if [[ $take_value -eq 1 ]]; then
+        FLAGS+=("$arg"); take_value=0; continue
+    fi
+    case "$arg" in
+        # Options whose value is a separate argument; the value must stay with
+        # the flag, or "--ignore tests/foo" would be read as a test path.
+        -k|-m|-p|-n|-o|--maxfail|--deselect|--ignore|--rootdir|--import-mode)
+            FLAGS+=("$arg"); take_value=1 ;;
+        -*) FLAGS+=("$arg") ;;
+        *)  PATHS+=("$arg") ;;
+    esac
+done
+if [[ ${#PATHS[@]} -eq 0 ]]; then
+    PATHS=("$SCRIPT_DIR/tests")
+fi
+
+# ${arr[@]+"${arr[@]}"} rather than "${arr[@]}" so an empty array does not
+# trip `set -u` on bash < 4.4.
 IB_PKG_PARENT="$IB_TMP" \
 $PYTEST \
     --rootdir="$SCRIPT_DIR/tests" \
     --import-mode=importlib \
-    "${@:-$SCRIPT_DIR/tests}"
+    ${FLAGS[@]+"${FLAGS[@]}"} \
+    "${PATHS[@]}"
