@@ -303,8 +303,33 @@ class TradingEngine:
             if req_id == probe_req_id and error_code == 10089 and not result.done():
                 result.set_result(3)
 
-        self._portfolio._callbacks["marketDataType"] = _on_mdt
-        self._portfolio._callbacks["error"] = _on_probe_error
+        # _callbacks is a single-slot dict, so installing the probe's handlers
+        # displaces whatever was already registered — in a plugin-enabled
+        # engine that is PluginExecutive._handle_ib_error_for_plugins (see
+        # plugin_executive.py, "error" registration). The probe used to pop
+        # both keys on the way out instead of restoring them, which unhooked
+        # plugin error dispatch permanently on the first connect: no
+        # "ib_error" alert ever fired, and every plugin's terminal-reject
+        # handling (on_ib_error) became dead code, so Gateway-side rejects
+        # sat in pending_orders until the watchdog noticed 30 minutes later.
+        # Save the previous handlers and delegate to them, then put them back.
+        _prev_cbs = {
+            k: self._portfolio._callbacks.get(k)
+            for k in ("marketDataType", "error")
+        }
+
+        def _on_mdt_chained(req_id: int, mdt: int):
+            _on_mdt(req_id, mdt)
+            if _prev_cbs["marketDataType"]:
+                _prev_cbs["marketDataType"](req_id, mdt)
+
+        def _on_probe_error_chained(req_id: int, error_code: int, error_string: str):
+            _on_probe_error(req_id, error_code, error_string)
+            if _prev_cbs["error"]:
+                _prev_cbs["error"](req_id, error_code, error_string)
+
+        self._portfolio._callbacks["marketDataType"] = _on_mdt_chained
+        self._portfolio._callbacks["error"] = _on_probe_error_chained
 
         try:
             from ibapi.contract import Contract
@@ -337,8 +362,11 @@ class TradingEngine:
                 )
                 return 1
         finally:
-            self._portfolio._callbacks.pop("marketDataType", None)
-            self._portfolio._callbacks.pop("error", None)
+            for _k, _prev in _prev_cbs.items():
+                if _prev is None:
+                    self._portfolio._callbacks.pop(_k, None)
+                else:
+                    self._portfolio._callbacks[_k] = _prev
             try:
                 self._portfolio.cancelMktData(probe_req_id)
             except Exception:

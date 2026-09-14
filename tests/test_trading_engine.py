@@ -644,6 +644,53 @@ class TestOnConnected:
             engine._plugin_executive.start.assert_called_once()
 
 
+class TestMarketDataProbeCallbacks:
+    """The probe borrows portfolio._callbacks, which is a single-slot dict.
+
+    It used to pop "error" on the way out instead of restoring it, which
+    permanently unhooked PluginExecutive._handle_ib_error_for_plugins on the
+    first connect: no ib_error alert ever fired and every plugin's
+    on_ib_error (terminal-reject handling) became dead code.
+    """
+
+    @pytest.fixture
+    def probe_engine(self, engine):
+        engine._portfolio._callbacks = {}
+        engine._portfolio.get_next_req_id.return_value = 500
+        engine.config.market_data_type = None
+        return engine
+
+    def _prior_handlers(self, engine):
+        seen = []
+        engine._portfolio._callbacks["error"] = \
+            lambda r, c, s: seen.append(("error", r, c, s))
+        engine._portfolio._callbacks["marketDataType"] = \
+            lambda r, m: seen.append(("mdt", r, m))
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_prior_error_handler_is_restored(self, probe_engine):
+        seen = self._prior_handlers(probe_engine)
+        await probe_engine._detect_market_data_type()
+        probe_engine._portfolio._callbacks["error"](1, 2, "x")
+        assert seen == [("error", 1, 2, "x")]
+
+    @pytest.mark.asyncio
+    async def test_prior_handler_still_sees_errors_during_the_probe(self, probe_engine):
+        seen = self._prior_handlers(probe_engine)
+        task = asyncio.ensure_future(probe_engine._detect_market_data_type())
+        await asyncio.sleep(0)
+        probe_engine._portfolio._callbacks["error"](500, 10089, "no live data")
+        assert await task == 3                      # probe consumed it
+        assert ("error", 500, 10089, "no live data") in seen   # and forwarded it
+
+    @pytest.mark.asyncio
+    async def test_absent_handlers_are_not_invented(self, probe_engine):
+        await probe_engine._detect_market_data_type()
+        assert "error" not in probe_engine._portfolio._callbacks
+        assert "marketDataType" not in probe_engine._portfolio._callbacks
+
+
 class TestCreateEngine:
     """Tests for create_engine factory function"""
 
