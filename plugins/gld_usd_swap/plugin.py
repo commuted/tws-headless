@@ -185,6 +185,7 @@ from typing import Dict, List, Optional, Tuple
 from ibapi.order import Order as IbOrder
 
 from ib.contract_builder import ContractBuilder
+from ib.models import TERMINAL_ORDER_REJECT_CODES
 from plugins.base import PluginBase, PluginState, TradeSignal
 
 logger = logging.getLogger(__name__)
@@ -244,20 +245,16 @@ _PARSE_FAILURE_ALERT_THRESHOLD = 10
 # transition will follow. Treated as terminal in on_ib_error: the pending-order
 # tracker is cleared so the stuck-order alerter (and the watchdog plugin) stop
 # re-firing every 30 min. Codes not on this list stay alert-only — some IB
-# order-attributed codes are advisories, not rejections. Extend as new
-# rejection modes are seen in practice.
-_TERMINAL_REJECT_CODES = frozenset({
-    201,    # Order rejected — reason: …
-    202,    # Order cancelled — reason: …
-    203,    # The security is not available or allowed for this account
-    321,    # Server error validating message (malformed order)
-    388,    # Order size does not conform to market rule
-    434,    # Order size does not conform to market rule
-    435,    # You must specify an account (Gateway-side validation reject)
-    10052,  # Invalid time in force
+# order-attributed codes are advisories, not rejections.
+#
+# The placement rejects live in ib.models.TERMINAL_ORDER_REJECT_CODES, shared
+# with Portfolio.error() so the engine's own order records and this plugin's
+# pending-order tracker can never disagree about what is terminal. Add new
+# placement rejects there; the two codes below are cancel-path only and mean
+# nothing to a freshly placed order, so they stay local.
+_TERMINAL_REJECT_CODES = TERMINAL_ORDER_REJECT_CODES | frozenset({
     10147,  # OrderId to cancel not found
     10148,  # OrderId to cancel is in a state that cannot be cancelled
-    10289,  # Short sale not permitted for this security
 })
 
 # After (re)subscribing, IB replays a burst of already-completed backfill bars
@@ -1608,6 +1605,7 @@ class GldUsdSwapPlugin(PluginBase):
         order.action           = "BUY"
         order.totalQuantity    = shares
         order.orderType        = "MOC"
+        order.tif              = "DAY"
         order.transmit         = True
 
         oid = self.portfolio.place_order_custom(contract, order)
@@ -1693,6 +1691,7 @@ class GldUsdSwapPlugin(PluginBase):
         order.action           = "SELL"
         order.totalQuantity    = shares
         order.orderType        = "MOC"
+        order.tif              = "DAY"
         order.transmit         = True
 
         oid = self.portfolio.place_order_custom(contract, order)
@@ -1779,6 +1778,7 @@ class GldUsdSwapPlugin(PluginBase):
         order.action           = "BUY"
         order.totalQuantity    = shares
         order.orderType        = "MOC"
+        order.tif              = "DAY"
         order.transmit         = True
 
         oid = self.portfolio.place_order_custom(contract, order)

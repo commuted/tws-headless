@@ -47,6 +47,75 @@ def _saved_state(tmp_path: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Order field completeness
+# ---------------------------------------------------------------------------
+
+class _CapturingPortfolio:
+    """Stands in for Portfolio.place_order_custom, keeping the Order object."""
+
+    def __init__(self):
+        self.orders = []
+
+    def place_order_custom(self, contract, order):
+        self.orders.append(order)
+        return 100 + len(self.orders)
+
+
+class TestOrderTimeInForce:
+    """Every order this plugin builds must carry a time in force.
+
+    ibapi's Order() leaves tif empty and Gateway rejects that with error 10052
+    ("Invalid time in force:Empty") at local validation — no orderStatus
+    callback follows, so the order looks pending forever. Commit 1c01e41 set
+    tif on the three MKT builders and missed all three MOC builders, which is
+    how a live MOC re-entry was silently rejected on 2026-09-14.
+    """
+
+    def _plugin(self, tmp_path):
+        p = _make_plugin(tmp_path)
+        p.portfolio = _CapturingPortfolio()
+        p._gld_price = 393.5
+        p._gll_price = 40.0
+        return p
+
+    def test_moc_buy_has_day_tif(self, tmp_path):
+        p = self._plugin(tmp_path)
+        p._place_moc_buy(25, "test")
+        order = p.portfolio.orders[-1]
+        assert order.orderType == "MOC"
+        assert order.tif == "DAY"
+
+    def test_moc_short_has_day_tif(self, tmp_path):
+        p = self._plugin(tmp_path)
+        p._place_moc_short(25, "test")
+        order = p.portfolio.orders[-1]
+        assert order.orderType == "MOC"
+        assert order.tif == "DAY"
+
+    def test_mkt_sell_has_day_tif(self, tmp_path):
+        p = self._plugin(tmp_path)
+        p._emit_sell(25, "test")
+        order = p.portfolio.orders[-1]
+        assert order.orderType == "MKT"
+        assert order.tif == "DAY"
+
+
+class TestTerminalRejectCodes:
+    """The plugin shares the engine's placement-reject list so the two can
+    never disagree about which errors end an order's life."""
+
+    def test_shares_the_engine_list(self):
+        from ib.models import TERMINAL_ORDER_REJECT_CODES
+        from plugins.gld_usd_swap.plugin import _TERMINAL_REJECT_CODES
+        assert TERMINAL_ORDER_REJECT_CODES <= _TERMINAL_REJECT_CODES
+
+    def test_covers_both_live_rejection_modes(self):
+        from plugins.gld_usd_swap.plugin import _TERMINAL_REJECT_CODES
+        assert 435 in _TERMINAL_REJECT_CODES      # missing account
+        assert 10052 in _TERMINAL_REJECT_CODES    # empty time in force
+
+
+# ---------------------------------------------------------------------------
 # on_order_fill
 # ---------------------------------------------------------------------------
 
