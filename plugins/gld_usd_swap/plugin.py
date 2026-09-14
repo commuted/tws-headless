@@ -236,6 +236,27 @@ _CLOSE_WINDOW_ET = ((15, 45), (15, 55))
 # only advances on bar callbacks, so it mainly covers intraday sells.)
 _PENDING_ORDER_ALERT_SECONDS = 1800
 
+# When a pending order stops being actionable, keyed by order type (ET clock).
+# Alerting forever is not a resolution: an order that cannot fill has to leave
+# the tracker, or the hold flag and the stuck-order alerter both keep reasoning
+# from it. On 2026-09-14 a rejected MOC BUY sat in pending_orders across a
+# restart and flipped holding_gld to True, which would have made the next
+# close skip its re-entry entirely.
+#
+# Expiry CANCELS at IB before clearing. Clearing alone is unsafe: an order the
+# plugin has forgotten but IB is still working would fill into a tracker that
+# no longer knows its action, and on_order_fill would drop the fill on the
+# floor with holdings never updated. Cancelling first makes "no longer viable"
+# true rather than assumed; a cancel of an already-dead order just returns
+# 10147/10148, both of which are terminal codes here anyway.
+#
+# MKT orders are placed in the open window and fill in seconds, so anything
+# still pending once that window has passed is not going to fill usefully.
+# MOC orders stay live until the closing auction prints at 16:00, so they must
+# NOT be expired before it is over and the fill has had time to arrive.
+_MKT_PENDING_EXPIRY_ET = (9, 50)    # just past _OPEN_WINDOW_ET's end
+_MOC_PENDING_EXPIRY_ET = (16, 15)   # just past the 16:00 auction print
+
 # Alert after this many consecutive unparseable bar timestamps — session
 # decisions match on the parsed clock time, so a format/timezone drift would
 # otherwise silently disable all trading (including exits) with zero errors.
@@ -480,6 +501,7 @@ class GldUsdSwapPlugin(PluginBase):
         # --- pending order tracking (order_id → "BUY"/"SELL") ---
         self._pending_order_actions: Dict[int, str] = {}
         self._pending_order_placed_at: Dict[int, float] = {}  # order_id → time.time()
+        self._pending_order_types: Dict[int, str] = {}   # order_id → "MKT"/"MOC"
         self._pending_alerted: set = set()   # order_ids already alerted as stuck
 
         # --- bar-timestamp parse failure tracking (timezone/format drift) ---
@@ -550,6 +572,15 @@ class GldUsdSwapPlugin(PluginBase):
                 oid: float(saved_placed_at.get(str(oid), _now))
                 for oid in self._pending_order_actions
             }
+            # Order type decides the expiry deadline. State files written
+            # before this was tracked have none, so an unknown type takes the
+            # MOC deadline — the later of the two, which never expires an
+            # order that might still be working.
+            saved_types = saved.get("pending_order_types", {}) or {}
+            self._pending_order_types = {
+                oid: str(saved_types.get(str(oid), "MOC"))
+                for oid in self._pending_order_actions
+            }
             # All orders this plugin places are DAY-TIF (MKT and MOC). A DAY
             # order that hasn't hit a terminal status within one full session
             # cycle (~20h covers overnight + the next morning restart) is
@@ -567,6 +598,7 @@ class GldUsdSwapPlugin(PluginBase):
             for oid in _stale:
                 action = self._pending_order_actions.pop(oid, None)
                 self._pending_order_placed_at.pop(oid, None)
+                self._pending_order_types.pop(oid, None)
                 age_h = (_now - float(saved_placed_at.get(str(oid), _now))) / 3600
                 logger.warning(
                     f"Sweeping stale pending {action} order {oid} "
@@ -762,6 +794,8 @@ class GldUsdSwapPlugin(PluginBase):
                                       in self._pending_order_actions.items()},
             "pending_orders_placed_at": {str(oid): ts for oid, ts
                                          in self._pending_order_placed_at.items()},
+            "pending_order_types":   {str(oid): t for oid, t
+                                      in self._pending_order_types.items()},
         }
 
     def _save_state(self) -> None:
@@ -1200,6 +1234,7 @@ class GldUsdSwapPlugin(PluginBase):
 
         if is_live:
             self._check_pending_order_age()
+            self._expire_stale_pending_orders()
 
         if symbol == "GLD":
             self._gld_price = close
@@ -1613,6 +1648,7 @@ class GldUsdSwapPlugin(PluginBase):
             self._record_trade(now)
             self._pending_order_actions[oid] = "BUY"
             self._pending_order_placed_at[oid] = time.time()
+            self._pending_order_types[oid] = order.orderType
             self.register_order(oid)
             logger.info(f"MOC BUY {shares} GLD (order_id={oid}) — {reason}")
         else:
@@ -1653,6 +1689,7 @@ class GldUsdSwapPlugin(PluginBase):
             self._record_trade(now)
             self._pending_order_actions[oid] = "SELL"
             self._pending_order_placed_at[oid] = time.time()
+            self._pending_order_types[oid] = order.orderType
             self.register_order(oid)
             logger.info(f"MKT SELL {qty} GLD (order_id={oid}) — {reason}")
         else:
@@ -1699,6 +1736,7 @@ class GldUsdSwapPlugin(PluginBase):
             self._record_trade(now)
             self._pending_order_actions[oid] = "SHORT_OPEN"
             self._pending_order_placed_at[oid] = time.time()
+            self._pending_order_types[oid] = order.orderType
             self.register_order(oid)
             logger.info(f"MOC SHORT SELL {shares} GLD (order_id={oid}) — {reason}")
         else:
@@ -1741,6 +1779,7 @@ class GldUsdSwapPlugin(PluginBase):
             self._record_trade(now)
             self._pending_order_actions[oid] = "SHORT_COVER"
             self._pending_order_placed_at[oid] = time.time()
+            self._pending_order_types[oid] = order.orderType
             self.register_order(oid)
             logger.info(f"MKT COVER BUY {shares} GLD (order_id={oid}) — {reason}")
         else:
@@ -1786,6 +1825,7 @@ class GldUsdSwapPlugin(PluginBase):
             self._record_trade(now)
             self._pending_order_actions[oid] = "GLL_OPEN"
             self._pending_order_placed_at[oid] = time.time()
+            self._pending_order_types[oid] = order.orderType
             self.register_order(oid)
             logger.info(f"MOC BUY {shares} GLL (order_id={oid}) — {reason}")
         else:
@@ -1829,6 +1869,7 @@ class GldUsdSwapPlugin(PluginBase):
             self._record_trade(now)
             self._pending_order_actions[oid] = "GLL_CLOSE"
             self._pending_order_placed_at[oid] = time.time()
+            self._pending_order_types[oid] = order.orderType
             self.register_order(oid)
             logger.info(f"MKT SELL {shares} GLL (order_id={oid}) — {reason}")
         else:
@@ -1855,10 +1896,88 @@ class GldUsdSwapPlugin(PluginBase):
                 message_type="alert",
             )
 
+    def _resync_holding_flag(self) -> str:
+        """Re-derive holding_gld from the plugin's own holdings.
+
+        Nothing but a fill removes shares from holdings, so once an order is
+        dead the holdings ARE the truth: shares that failed to sell are still
+        held, and a buy that never filled bought nothing. Without this the flag
+        drifts from them — a rejected MOC BUY left holding_gld=True across a
+        restart on 2026-09-14, which would have made the next close take the
+        "rolling overnight" branch and skip its re-entry.
+
+        Refuses to act on a ledger it cannot read: with holdings unloaded
+        every accessor reports 0, and flipping the flag to False on that would
+        make the next close place a duplicate entry. An unreadable ledger is
+        not evidence of being flat.
+
+        Returns a short description of what changed, for the caller's alert.
+        """
+        if self.holdings is None:
+            return f"holding_gld={self._holding_gld} (holdings unavailable, not resynced)"
+        signed = self._current_gld_shares_signed()
+        was, self._holding_gld = self._holding_gld, signed > 0
+        if was == self._holding_gld:
+            return f"holding_gld={self._holding_gld} (unchanged, {signed:g} shares)"
+        logger.warning(
+            f"holding_gld {was} -> {self._holding_gld}: resynced from holdings "
+            f"({signed:g} GLD shares)"
+        )
+        return f"holding_gld={was} -> {self._holding_gld} ({signed:g} shares)"
+
+    def _expire_stale_pending_orders(self) -> None:
+        """Drop pending orders whose session moment has passed.
+
+        An order that can no longer do anything useful must leave the tracker,
+        or the hold flag and the stuck-order alerter keep reasoning from it
+        forever. See _MKT_PENDING_EXPIRY_ET / _MOC_PENDING_EXPIRY_ET for why
+        the deadline differs by order type, and why this cancels at IB first
+        rather than only clearing local state.
+        """
+        now_et = datetime.now(_NY_TZ)
+        for oid in list(self._pending_order_actions):
+            placed = self._pending_order_placed_at.get(oid)
+            if placed is None:
+                continue
+            order_type = self._pending_order_types.get(oid, "MOC")
+            hh, mm = (_MOC_PENDING_EXPIRY_ET if order_type == "MOC"
+                      else _MKT_PENDING_EXPIRY_ET)
+            deadline = datetime.fromtimestamp(placed, tz=_NY_TZ).replace(
+                hour=hh, minute=mm, second=0, microsecond=0
+            )
+            if now_et <= deadline:
+                continue
+
+            action = self._pending_order_actions.pop(oid, None)
+            self._pending_order_placed_at.pop(oid, None)
+            self._pending_order_types.pop(oid, None)
+            self._pending_alerted.discard(oid)
+
+            cancelled = False
+            if self.portfolio:
+                try:
+                    cancelled = bool(self.portfolio.cancel_order(oid))
+                except Exception as e:
+                    logger.error(f"cancel_order({oid}) failed during expiry: {e}")
+
+            holding = self._resync_holding_flag()
+            self._alert(
+                "order_expired",
+                f"{action} order {oid} ({order_type}) expired — past its "
+                f"{hh:02d}:{mm:02d} ET deadline with no fill; "
+                f"cancel_sent={cancelled}; unsold shares remain in holdings, "
+                f"{holding}",
+                order_id=oid, action=action, order_type=order_type,
+                cancel_sent=cancelled,
+            )
+            self._save_state()
+
     def _check_pending_order_age(self) -> None:
         """Alert once per order that has no fill/terminal status past the
         threshold. Runs on live bar callbacks, so it covers intraday orders;
-        the watchdog plugin covers the overnight MOC window on wall clock."""
+        the watchdog plugin covers the overnight MOC window on wall clock.
+        Retiring those orders is _expire_stale_pending_orders' job — this pass
+        only reads the tracker, that one mutates it."""
         now = time.time()
         for oid, placed in self._pending_order_placed_at.items():
             if oid in self._pending_alerted:
@@ -1991,6 +2110,7 @@ class GldUsdSwapPlugin(PluginBase):
     def on_order_fill(self, order_record) -> None:
         action = self._pending_order_actions.pop(order_record.order_id, None)
         self._pending_order_placed_at.pop(order_record.order_id, None)
+        self._pending_order_types.pop(order_record.order_id, None)
         self._pending_alerted.discard(order_record.order_id)
         qty    = float(order_record.filled_quantity or 0)
         price  = float(order_record.avg_fill_price or 0.0)
@@ -2066,14 +2186,18 @@ class GldUsdSwapPlugin(PluginBase):
             return
         action = self._pending_order_actions.pop(order_record.order_id, None)
         self._pending_order_placed_at.pop(order_record.order_id, None)
+        self._pending_order_types.pop(order_record.order_id, None)
         self._pending_alerted.discard(order_record.order_id)
         if action:
+            # Any fills that did happen have already been applied by
+            # on_order_fill, so holdings carry both the filled part and the
+            # unsold remainder. Derive the flag from them.
+            holding = self._resync_holding_flag()
             self._alert(
                 "order_terminal",
                 f"{action} order {order_record.order_id} "
                 f"{order_record.status.value} — "
-                f"holding_gld={self._holding_gld} unchanged; "
-                f"manual reconciliation may be needed",
+                f"unsold shares remain in holdings, {holding}",
                 order_id=order_record.order_id,
                 action=action,
                 status=order_record.status.value,
@@ -2090,13 +2214,20 @@ class GldUsdSwapPlugin(PluginBase):
         if is_order and error_code in _TERMINAL_REJECT_CODES:
             action = self._pending_order_actions.pop(req_id, None)
             self._pending_order_placed_at.pop(req_id, None)
+            self._pending_order_types.pop(req_id, None)
             self._pending_alerted.discard(req_id)
+            # A reject means no fill, so the holdings are already correct:
+            # unsold shares are still there, an unfilled buy bought nothing.
+            # Resync the flag to them rather than leaving it where the order
+            # left it — a stale True here is what would make the next close
+            # skip its re-entry.
+            holding = self._resync_holding_flag()
             self._alert(
                 "order_rejected",
                 f"{action} order {req_id} rejected by IB "
                 f"[code={error_code}] {error_string} — "
-                f"no fill occurred; holdings unchanged, manual reconciliation "
-                f"may be needed",
+                f"no fill occurred; unsold shares remain in holdings, "
+                f"{holding}",
                 order_id=req_id, action=action,
                 error_code=error_code, error_string=error_string,
             )

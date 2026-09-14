@@ -12,6 +12,7 @@ Covers:
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -44,6 +45,160 @@ def _order(order_id: int, action: str, status: OrderStatus,
 
 def _saved_state(tmp_path: Path) -> dict:
     return json.loads((tmp_path / "state.json").read_text())["state"]
+
+
+# ---------------------------------------------------------------------------
+# Failed orders: clear the tracker, keep the shares, resync the flag
+# ---------------------------------------------------------------------------
+
+def _with_holdings(p, gld_shares: float = 0.0, cash: float = 10_000.0):
+    """Give a plugin a real Holdings ledger. Without one every share accessor
+    reports 0, which is 'unreadable', not 'flat'."""
+    from plugins.base import Holdings
+    p._holdings = Holdings(plugin_name=p.name, current_cash=cash)
+    if gld_shares:
+        p._holdings.add_position("GLD", gld_shares,
+                                 cost_basis=390.0, current_price=393.0)
+    return p
+
+
+class TestResyncHoldingFlag:
+    def test_shares_present_means_holding(self, tmp_path):
+        p = _with_holdings(_make_plugin(tmp_path), gld_shares=50)
+        p._holding_gld = False
+        p._resync_holding_flag()
+        assert p._holding_gld is True
+
+    def test_no_shares_means_flat(self, tmp_path):
+        """The 2026-09-14 case: a rejected BUY had left the flag True with an
+        empty ledger, which would have made the next close skip its entry."""
+        p = _with_holdings(_make_plugin(tmp_path), gld_shares=0)
+        p._holding_gld = True
+        p._resync_holding_flag()
+        assert p._holding_gld is False
+
+    def test_unreadable_ledger_never_flips_the_flag(self, tmp_path):
+        """Holdings unloaded reports 0 shares; treating that as flat would
+        place a duplicate entry at the next close."""
+        p = _make_plugin(tmp_path)
+        assert p.holdings is None
+        p._holding_gld = True
+        p._resync_holding_flag()
+        assert p._holding_gld is True
+
+
+class TestFailedSellKeepsShares:
+    def test_rejected_sell_clears_tracker_and_keeps_holding(self, tmp_path):
+        p = _with_holdings(_make_plugin(tmp_path), gld_shares=50)
+        p._holding_gld = True
+        p._pending_order_actions[7] = "SELL"
+        p._pending_order_placed_at[7] = 0.0
+        p._pending_order_types[7] = "MKT"
+
+        p.on_ib_error(7, 10052, "Invalid time in force:Empty")
+
+        assert 7 not in p._pending_order_actions
+        assert 7 not in p._pending_order_types
+        assert p._holding_gld is True
+        assert p._current_gld_shares() == 50     # unsold shares still held
+
+    def test_rejected_buy_leaves_the_plugin_flat(self, tmp_path):
+        p = _with_holdings(_make_plugin(tmp_path), gld_shares=0)
+        p._holding_gld = True                    # as the restore path had left it
+        p._pending_order_actions[8] = "BUY"
+        p._pending_order_placed_at[8] = 0.0
+        p._pending_order_types[8] = "MOC"
+
+        p.on_ib_error(8, 10052, "Invalid time in force:Empty")
+
+        assert 8 not in p._pending_order_actions
+        assert p._holding_gld is False
+
+    def test_next_sell_is_sized_from_the_remaining_shares(self, tmp_path):
+        """A sell that failed leaves the shares in holdings, and the next sell
+        sizes off holdings — so the remainder is what goes out."""
+        p = _with_holdings(_make_plugin(tmp_path), gld_shares=50)
+        p.portfolio = _CapturingPortfolio()
+        p._gld_price = 393.0
+        p._emit_sell(p._current_gld_shares(), "retry after a failed sell")
+        assert p.portfolio.orders[-1].totalQuantity == 50
+
+    def test_partial_fill_leaves_only_the_remainder_to_sell(self, tmp_path):
+        p = _with_holdings(_make_plugin(tmp_path), gld_shares=50)
+        p._holdings.remove_position("GLD", 42)   # 42 of 50 filled
+        assert p._current_gld_shares() == 8
+
+
+class TestPendingOrderExpiry:
+    """A dead order has to leave the tracker, but only once it genuinely
+    cannot fill — and IB has to be told before the plugin forgets it."""
+
+    def _pending(self, tmp_path, order_type, placed_et, action="SELL"):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        p = _with_holdings(_make_plugin(tmp_path), gld_shares=50)
+        p._holding_gld = True
+        p.portfolio = MagicMock()
+        p.portfolio.cancel_order.return_value = True
+        p._pending_order_actions[9] = action
+        p._pending_order_types[9] = order_type
+        p._pending_order_placed_at[9] = placed_et.timestamp()
+        return p
+
+    def _at(self, hh, mm):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime(2026, 9, 14, hh, mm, tzinfo=ZoneInfo("America/New_York"))
+
+    def _run_at(self, p, hh, mm):
+        """Run the sweep as if the ET wall clock read hh:mm. Only now() is
+        stubbed; fromtimestamp passes through to the real datetime."""
+        import plugins.gld_usd_swap.plugin as mod
+        real_datetime = mod.datetime
+        with patch.object(mod, "datetime", wraps=real_datetime) as dt:
+            dt.now.return_value = self._at(hh, mm)
+            p._expire_stale_pending_orders()
+
+    def test_mkt_sell_survives_inside_its_window(self, tmp_path):
+        p = self._pending(tmp_path, "MKT", self._at(9, 31))
+        self._run_at(p, 9, 40)
+        assert 9 in p._pending_order_actions
+        p.portfolio.cancel_order.assert_not_called()
+
+    def test_mkt_sell_expires_once_the_window_has_passed(self, tmp_path):
+        p = self._pending(tmp_path, "MKT", self._at(9, 31))
+        self._run_at(p, 10, 5)
+        assert 9 not in p._pending_order_actions
+        assert 9 not in p._pending_order_types
+        p.portfolio.cancel_order.assert_called_once_with(9)
+
+    def test_expiry_keeps_the_unsold_shares_and_the_hold_flag(self, tmp_path):
+        p = self._pending(tmp_path, "MKT", self._at(9, 31))
+        self._run_at(p, 10, 5)
+        assert p._current_gld_shares() == 50
+        assert p._holding_gld is True
+
+    def test_moc_is_not_expired_before_the_closing_auction(self, tmp_path):
+        """The auction prints at 16:00 — expiring at 15:55 would cancel a
+        live, working order."""
+        p = self._pending(tmp_path, "MOC", self._at(15, 45), action="BUY")
+        self._run_at(p, 15, 58)
+        assert 9 in p._pending_order_actions
+        p.portfolio.cancel_order.assert_not_called()
+
+    def test_moc_expires_after_the_auction_has_printed(self, tmp_path):
+        p = self._pending(tmp_path, "MOC", self._at(15, 45), action="BUY")
+        self._run_at(p, 16, 20)
+        assert 9 not in p._pending_order_actions
+        p.portfolio.cancel_order.assert_called_once_with(9)
+
+    def test_unknown_order_type_takes_the_later_deadline(self, tmp_path):
+        """State files written before order types were tracked have none;
+        an unknown type must never expire an order that might still work."""
+        p = self._pending(tmp_path, "MKT", self._at(15, 45))
+        del p._pending_order_types[9]
+        self._run_at(p, 15, 58)
+        assert 9 in p._pending_order_actions
 
 
 # ---------------------------------------------------------------------------
