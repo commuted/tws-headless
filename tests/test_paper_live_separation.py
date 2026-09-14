@@ -166,6 +166,44 @@ class TestRequireLiveConfirmation:
 
 
 # ---------------------------------------------------------------------------
+# resolve_account — never pick the traded account positionally
+# ---------------------------------------------------------------------------
+
+class TestResolveAccount:
+    def test_sole_account_needs_no_flag(self):
+        acct, err = env.resolve_account(None, ["U9876543"])
+        assert (acct, err) == ("U9876543", None)
+
+    def test_several_accounts_without_flag_is_refused(self):
+        """The bug this guards: managed_accounts[0] is whichever account IB
+        listed first, so a reordering silently routes live orders elsewhere."""
+        acct, err = env.resolve_account(None, ["U9876543", "U8765432"])
+        assert acct is None
+        assert err is not None
+        assert "U9876543" in err and "U8765432" in err
+        assert "--account" in err
+
+    def test_explicit_account_is_honoured(self):
+        acct, err = env.resolve_account("U8765432", ["U9876543", "U8765432"])
+        assert (acct, err) == ("U8765432", None)
+
+    def test_explicit_account_not_on_the_login_is_refused(self):
+        acct, err = env.resolve_account("U9999999", ["U9876543", "U8765432"])
+        assert acct is None
+        assert err is not None and "U9999999" in err
+
+    def test_no_accounts_at_all_is_refused(self):
+        acct, err = env.resolve_account(None, [])
+        assert acct is None and err is not None
+        acct, err = env.resolve_account("U9876543", [])
+        assert acct is None and err is not None
+
+    def test_whitespace_and_blanks_are_tolerated(self):
+        acct, err = env.resolve_account(" U9876543 ", ["", "U9876543 "])
+        assert (acct, err) == ("U9876543", None)
+
+
+# ---------------------------------------------------------------------------
 # configure_execution_db — per-account singleton rebinding
 # ---------------------------------------------------------------------------
 

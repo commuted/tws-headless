@@ -11,6 +11,7 @@ import pytest
 from unittest.mock import MagicMock, patch, PropertyMock, AsyncMock
 from threading import Lock
 from datetime import datetime
+from types import SimpleNamespace
 
 
 # Mock ibapi before importing portfolio
@@ -120,6 +121,9 @@ def portfolio_instance(mock_ibapi):
         portfolio._connected = asyncio.Event()
         portfolio._callbacks = {}
         portfolio.managed_accounts = ["DU123456"]
+        portfolio.trading_account = None
+        portfolio._historical_requests = {}
+        portfolio._contract_details_requests = {}
         portfolio._shutting_down = False
 
         # Forex and execution tracking (added in newer portfolio.py)
@@ -1144,6 +1148,117 @@ class TestOrderPlacement:
 # =============================================================================
 # Dry-Run Gate Tests
 # =============================================================================
+
+class TestOrderFieldStamping:
+    """placeOrder must fill the fields Gateway rejects an order for.
+
+    Both were live incidents on the gld_usd_swap plugin: a missing account tag
+    drew IB error 435 ("You must specify an account"), and an empty time in
+    force drew 10052 ("Invalid time in force:Empty"). Both are rejected at
+    local Gateway validation, so no orderStatus callback ever follows and the
+    order looks pending forever.
+    """
+
+    def _order(self, **kw):
+        o = SimpleNamespace(action="BUY", totalQuantity=25, orderType="MOC",
+                            account="", tif="", transmit=True)
+        for k, v in kw.items():
+            setattr(o, k, v)
+        return o
+
+    def _place(self, portfolio, order):
+        contract = MagicMock()
+        contract.symbol = "GLD"
+        sent = []
+        with patch("portfolio.IBClient.placeOrder",
+                   lambda self, oid, c, o: sent.append(o)):
+            portfolio.placeOrder(8, contract, order)
+        return sent
+
+    def test_empty_account_is_stamped_from_sole_managed_account(self, portfolio_instance):
+        order = self._order()
+        assert self._place(portfolio_instance, order)
+        assert order.account == "DU123456"
+
+    def test_empty_tif_defaults_to_day(self, portfolio_instance):
+        order = self._order()
+        assert self._place(portfolio_instance, order)
+        assert order.tif == "DAY"
+
+    def test_explicit_fields_are_left_alone(self, portfolio_instance):
+        order = self._order(account="DU999999", tif="GTC")
+        assert self._place(portfolio_instance, order)
+        assert (order.account, order.tif) == ("DU999999", "GTC")
+
+    def test_resolved_trading_account_wins_over_managed_list(self, portfolio_instance):
+        portfolio_instance.managed_accounts = ["U9876543", "U8765432"]
+        portfolio_instance.trading_account = "U8765432"
+        order = self._order()
+        assert self._place(portfolio_instance, order)
+        assert order.account == "U8765432"
+
+    def test_several_accounts_without_resolution_refuses_to_send(self, portfolio_instance):
+        """Never route positionally: managed_accounts[0] is just whichever
+        account IB listed first."""
+        portfolio_instance.managed_accounts = ["U9876543", "U8765432"]
+        portfolio_instance.trading_account = None
+        assert self._place(portfolio_instance, self._order()) == []
+
+    def test_no_managed_account_refuses_to_send(self, portfolio_instance):
+        portfolio_instance.managed_accounts = []
+        assert self._place(portfolio_instance, self._order()) == []
+
+
+class TestTerminalRejectMarking:
+    """A Gateway-side reject arrives only via error(), never orderStatus, so
+    the order record has to be marked terminal here or it sits in
+    pending_orders forever re-firing stuck-order alerts."""
+
+    def _tracked(self, portfolio, order_id=8):
+        from models import OrderRecord
+        rec = OrderRecord(order_id=order_id, symbol="GLD", action="BUY",
+                          quantity=25, order_type="MOC")
+        portfolio._orders = {order_id: rec}
+        return rec
+
+    def _error(self, portfolio, req_id, code):
+        with patch("portfolio.IBClient.error", lambda *a, **k: None):
+            portfolio.error(req_id, 0, code, "rejected")
+
+    @pytest.mark.parametrize("code", [435, 10052, 201, 10289])
+    def test_reject_marks_order_terminal(self, portfolio_instance, code):
+        from models import OrderStatus
+        rec = self._tracked(portfolio_instance)
+        self._error(portfolio_instance, 8, code)
+        assert rec.status == OrderStatus.ERROR
+        assert str(code) in rec.error_message
+        assert portfolio_instance.pending_orders == []
+
+    def test_advisory_code_leaves_order_pending(self, portfolio_instance):
+        from models import OrderStatus
+        rec = self._tracked(portfolio_instance)
+        self._error(portfolio_instance, 8, 10349)   # order-preset notice
+        assert rec.status == OrderStatus.PENDING
+        assert portfolio_instance.pending_orders != []
+
+    def test_request_id_collision_does_not_touch_the_order(self, portfolio_instance):
+        """_next_req_id and _next_order_id are independent counters, so a
+        market-data reqId can equal a live order id — as happened live with
+        order 8 alongside reqId 8. Code 321 is shared between order and
+        request validation, so it must not be read as an order reject."""
+        from models import OrderStatus
+        rec = self._tracked(portfolio_instance)
+        portfolio_instance._market_data_requests = {8: "SPY"}
+        self._error(portfolio_instance, 8, 321)
+        assert rec.status == OrderStatus.PENDING
+
+    def test_completion_event_is_released(self, portfolio_instance):
+        self._tracked(portfolio_instance)
+        event = asyncio.Event()
+        portfolio_instance._pending_orders = {8: event}
+        self._error(portfolio_instance, 8, 10052)
+        assert event.is_set()
+
 
 class TestDryRunGate:
     """dry_run=True must suppress every order placement path — including

@@ -21,7 +21,7 @@ All functions here are pure so they can be unit-tested without a live connection
 import socket as _socket
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Sequence, Tuple, Union
 
 # Exit code for "another engine already owns this environment". Distinct from
 # the generic failure code so a supervisor can tell a misconfiguration (never
@@ -177,6 +177,54 @@ def check_env_consistency(
         f"account {account_id!r} is a {actual.value.upper()} account. Refusing to "
         "start to avoid comingling paper and live operation. Pass "
         "--allow-env-mismatch to override (not recommended)."
+    )
+
+
+def resolve_account(
+    requested: Optional[str],
+    managed_accounts: Sequence[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Decide which account this engine trades, refusing to guess.
+
+    The engine scopes plugin state, holdings, the execution DB and every order's
+    account tag to a single account. That account used to be managed_accounts[0]
+    — positional luck on a login that reports more than one. IB does not promise
+    an order, so a reordering would silently route live orders to the wrong
+    account with no error anywhere.
+
+    Returns (account_id, None) when resolved, (None, message) when it cannot be
+    resolved without guessing. Mirrors check_env_consistency: an unresolvable
+    account is a misconfiguration, so the caller should treat it as fatal rather
+    than retry.
+    """
+    accounts = [a.strip() for a in (managed_accounts or []) if a and a.strip()]
+    if not accounts:
+        return None, (
+            "No managed account reported by IB — cannot scope state, execution "
+            "logging or order routing."
+        )
+
+    if requested:
+        wanted = requested.strip()
+        if wanted not in accounts:
+            return None, (
+                f"Account {wanted!r} was requested with --account but IB reports "
+                f"{accounts!r} for this login. Refusing to start against an "
+                "account that is not there. Check --account, or the gateway "
+                "login if you expected it to be present."
+            )
+        return wanted, None
+
+    if len(accounts) == 1:
+        return accounts[0], None
+
+    return None, (
+        f"IB reports {len(accounts)} managed accounts ({', '.join(accounts)}) and "
+        "no --account was given. Refusing to guess which one to trade: the "
+        "choice decides plugin state, holdings, execution logging and the "
+        "account tag on every order. Pass --account <id> to name it explicitly, "
+        "or run one engine per account (separate --env/--socket), the way paper "
+        "and live are separated."
     )
 
 

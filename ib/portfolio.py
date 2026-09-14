@@ -29,6 +29,7 @@ from .models import (
     BarSize,
     OrderRecord,
     OrderStatus,
+    TERMINAL_ORDER_REJECT_CODES,
     CommissionAndFeesReport,
     PnLData,
 )
@@ -191,6 +192,12 @@ class Portfolio(IBClient):
 
         # Load persisted forex cost basis
         self._load_forex_cost_basis()
+
+        # The account every order from this engine is tagged with. Set once at
+        # startup from --account (see environment.resolve_account); left None
+        # for callers that never resolved one, in which case placeOrder falls
+        # back to a sole managed account and refuses when there are several.
+        self.trading_account: Optional[str] = None
 
         # Order tracking
         self._orders: Dict[int, OrderRecord] = {}  # orderId -> OrderRecord
@@ -1176,17 +1183,42 @@ class Portfolio(IBClient):
         # Gateway rejects an order with no account with error code 435
         # ("You must specify an account.") at OrderValidationProcessor —
         # locally, so no orderStatus callback ever fires and the caller
-        # thinks the order is still pending. Fill it in from managed_accounts,
-        # unless the caller already picked a specific sub-account.
+        # thinks the order is still pending. A caller that already picked a
+        # specific sub-account is left alone; otherwise use the account this
+        # engine resolved at startup. Never resolve it positionally:
+        # managed_accounts[0] is whichever account IB happened to list first,
+        # and a login with several would route real orders to the wrong one
+        # with no error anywhere.
         if not getattr(order, "account", ""):
-            if self.managed_accounts:
-                order.account = self.managed_accounts[0]
-            else:
+            account = self.trading_account
+            if not account and len(self.managed_accounts) == 1:
+                account = self.managed_accounts[0]
+            if account:
+                order.account = account
+            elif not self.managed_accounts:
                 logger.error(
                     f"Refusing to place order {orderId} for {contract.symbol}: "
                     f"no managed account known yet (IB error 435 would follow)"
                 )
                 return
+            else:
+                logger.error(
+                    f"Refusing to place order {orderId} for {contract.symbol}: "
+                    f"IB reports {len(self.managed_accounts)} accounts "
+                    f"({', '.join(self.managed_accounts)}) and no trading account "
+                    f"was resolved. Start the engine with --account <id>."
+                )
+                return
+        # Same class of defect, different required field: ibapi's Order()
+        # leaves tif empty, and Gateway rejects an empty time-in-force with
+        # error 10052 ("Invalid time in force:Empty") at the same local
+        # validation step — again with no orderStatus callback, so the order
+        # looks pending forever. Seen live 2026-09-14 on a MOC buy that never
+        # reached the closing auction. DAY is the right default for every
+        # order type this system places; a caller wanting GTC/IOC/FOK sets it
+        # explicitly and is left alone.
+        if not getattr(order, "tif", ""):
+            order.tif = "DAY"
         super().placeOrder(orderId, contract, order)
 
     @property
@@ -2023,6 +2055,41 @@ class Portfolio(IBClient):
             whatif_cb = self._whatif_error.pop(reqId)
             self._whatif_open_order.pop(reqId, None)
             whatif_cb(reqId, errorCode, errorString)
+        # An order rejected at Gateway-side validation is reported ONLY here —
+        # no orderStatus callback ever follows — so without this the record
+        # stays PENDING and the order sits in pending_orders indefinitely,
+        # re-triggering stuck-order alerts. For order-attributed errors IB
+        # sends the order id as reqId. Mirrors the terminal-state bookkeeping
+        # in orderStatus() so awaiting callers are released too.
+        # _next_req_id and _next_order_id are independent counters, so a
+        # request id and an order id can collide (order 8 and market-data
+        # reqId 8 coexisted live on 2026-09-14). Codes like 321 are shared
+        # between order validation and request validation, so an error is only
+        # read as an order reject when it names a still-pending order AND its
+        # reqId is not currently claimed by a live non-order request.
+        record = (
+            self._orders.get(reqId)
+            if errorCode in TERMINAL_ORDER_REJECT_CODES
+            else None
+        )
+        if record is not None and not record.is_complete:
+            claimed_by_request = (
+                reqId in self._historical_requests
+                or reqId in self._contract_details_requests
+                or reqId in self._market_data_requests
+                or reqId in self._whatif_error
+            )
+            if not claimed_by_request:
+                record.status = OrderStatus.ERROR
+                record.error_message = f"[{errorCode}] {errorString}"
+                record.filled_time = datetime.now().isoformat()
+                event = self._pending_orders.get(reqId)
+                if event:
+                    event.set()
+                logger.error(
+                    f"Order {reqId} rejected by IB [{errorCode}]: {errorString} "
+                    f"— marked terminal (no orderStatus will follow)"
+                )
 
     def historicalData(self, reqId: int, bar) -> None:
         """IB callback: one bar of historical data has arrived (backfill).

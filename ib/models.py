@@ -354,6 +354,25 @@ class OrderStatus(Enum):
         return mapping.get(status, cls.UNKNOWN)
 
 
+# IB error codes that mean an order was rejected outright, with no orderStatus
+# transition to follow. These arrive only through the error() callback, so
+# anything tracking an order by its status has to treat them as terminal or
+# the order stays "pending" forever. Codes not listed here stay advisory —
+# several IB order-attributed codes are notices, not rejections. Extend only
+# with rejection modes actually observed in practice.
+TERMINAL_ORDER_REJECT_CODES = frozenset({
+    201,    # Order rejected — reason: …
+    202,    # Order cancelled — reason: …
+    203,    # The security is not available or allowed for this account
+    321,    # Server error validating message (malformed order)
+    388,    # Order size does not conform to market rule
+    434,    # Order size does not conform to market rule
+    435,    # You must specify an account
+    10052,  # Invalid time in force
+    10289,  # Short sale not permitted for this security
+})
+
+
 @dataclass
 class OrderRecord:
     """Tracks an order through its lifecycle"""

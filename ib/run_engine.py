@@ -211,6 +211,14 @@ Examples:
         "--live-confirmed", action="store_true",
         help="Required to run immediate/queued (real) order modes against a LIVE account."
     )
+    parser.add_argument(
+        "--account", default=None, metavar="ID",
+        help="IB account to trade (e.g. U1234567). Scopes plugin state, holdings, "
+             "the execution DB and the account tag on every order. Optional when "
+             "the login reports exactly one account; REQUIRED when it reports "
+             "several — the engine refuses to guess rather than routing orders by "
+             "whichever account IB happened to list first."
+    )
 
     parser.add_argument(
         "--plugin-dir",
@@ -525,8 +533,24 @@ def main():
             logger.error(abort["reason"])
             return
 
-        account_id = engine.portfolio.managed_accounts[0]
-        logger.info(f"Active account: {account_id}")
+        # Which account this engine trades. Named explicitly with --account, or
+        # inferred only when the login reports exactly one. A login reporting
+        # several is refused rather than resolved positionally — see
+        # environment.resolve_account.
+        from .environment import resolve_account
+        account_id, acct_err = resolve_account(
+            args.account, engine.portfolio.managed_accounts
+        )
+        if acct_err:
+            abort["reason"] = acct_err
+            abort["fatal"] = True
+            logger.error(acct_err)
+            return
+        logger.info(
+            f"Active account: {account_id}"
+            f"{' (from --account)' if args.account else ''}"
+            f" [login reports: {engine.portfolio.managed_accounts}]"
+        )
 
         # Guardrail: refuse to proceed if the connected account's paper/live
         # nature contradicts the declared environment, or if real orders would
@@ -552,6 +576,9 @@ def main():
         from .execution_db import configure_execution_db
         configure_plugin_store(account_id)
         configure_execution_db(account_id)
+        # Route every order to the resolved account rather than letting
+        # placeOrder fall back to whichever one IB listed first.
+        engine.portfolio.trading_account = account_id
         if engine.plugin_executive:
             engine.plugin_executive.set_account(account_id)
 
