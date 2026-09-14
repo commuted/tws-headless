@@ -66,6 +66,62 @@ class TestLifecycle:
         assert 202 not in plugin2._pending_order_actions
         assert plugin2._pending_order_actions.get(101) == "SELL"
 
+    def test_pending_order_types_survive_restart(self, tmp_path):
+        """The expiry deadline is picked by order type, so the type has to
+        outlive a restart or every restored order takes the MOC deadline."""
+        import time as _time
+
+        plugin = _make_plugin(tmp_path)
+        plugin.start()
+        plugin._pending_order_actions = {301: "SELL", 302: "BUY"}
+        now = _time.time()
+        plugin._pending_order_placed_at = {301: now, 302: now}
+        plugin._pending_order_types = {301: "MKT", 302: "MOC"}
+        plugin.stop()
+
+        plugin2 = _make_plugin(tmp_path)
+        plugin2.start()
+        assert plugin2._pending_order_types == {301: "MKT", 302: "MOC"}
+
+    def test_state_file_without_types_defaults_to_the_later_deadline(self, tmp_path):
+        """State written before types were tracked has none. Defaulting to
+        MOC (the later deadline) is the safe read: it can only delay an
+        expiry, never expire an order that might still be working."""
+        import json, time as _time
+
+        plugin = _make_plugin(tmp_path)
+        plugin.start()
+        plugin._pending_order_actions = {401: "SELL"}
+        plugin._pending_order_placed_at = {401: _time.time()}
+        plugin.stop()
+
+        # Strip the key, as a pre-upgrade state file would have it.
+        state_file = tmp_path / "gld_usd_swap" / "state.json"
+        doc = json.loads(state_file.read_text())
+        doc["state"].pop("pending_order_types", None)
+        state_file.write_text(json.dumps(doc))
+
+        plugin2 = _make_plugin(tmp_path)
+        plugin2.start()
+        assert plugin2._pending_order_types == {401: "MOC"}
+
+    def test_sweep_drops_the_type_entry_too(self, tmp_path):
+        """A swept order must leave nothing behind, or the type dict grows
+        without bound across restarts."""
+        import time as _time
+
+        plugin = _make_plugin(tmp_path)
+        plugin.start()
+        plugin._pending_order_actions = {501: "BUY"}
+        plugin._pending_order_placed_at = {501: _time.time() - 30 * 3600}
+        plugin._pending_order_types = {501: "MOC"}
+        plugin.stop()
+
+        plugin2 = _make_plugin(tmp_path)
+        plugin2.start()
+        assert 501 not in plugin2._pending_order_actions
+        assert 501 not in plugin2._pending_order_types
+
     def test_placed_at_survives_restart(self, tmp_path):
         """The persisted placed_at is what makes the sweep decision correct
         — if it snapped back to "now" on load, no entry would ever age out."""

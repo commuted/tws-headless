@@ -129,6 +129,43 @@ class TestFailedSellKeepsShares:
         assert p._current_gld_shares() == 8
 
 
+class TestPendingTrackerIsFullyCleared:
+    """Every exit from the tracker must drop all three parallel dicts, or the
+    type map leaks entries that outlive their orders and get persisted."""
+
+    def _pending(self, tmp_path, oid=31, action="SELL", order_type="MKT"):
+        p = _with_holdings(_make_plugin(tmp_path), gld_shares=50)
+        p._pending_order_actions[oid] = action
+        p._pending_order_placed_at[oid] = 0.0
+        p._pending_order_types[oid] = order_type
+        return p
+
+    def _assert_gone(self, p, oid=31):
+        assert oid not in p._pending_order_actions
+        assert oid not in p._pending_order_placed_at
+        assert oid not in p._pending_order_types
+        assert oid not in p._pending_alerted
+
+    def test_fill_clears_every_tracker(self, tmp_path):
+        p = self._pending(tmp_path)
+        p.on_order_fill(_order(31, "SELL", OrderStatus.FILLED,
+                               filled_quantity=50.0, avg_fill_price=393.0))
+        self._assert_gone(p)
+
+    @pytest.mark.parametrize(
+        "status", [OrderStatus.CANCELLED, OrderStatus.INACTIVE, OrderStatus.ERROR]
+    )
+    def test_terminal_status_clears_every_tracker(self, tmp_path, status):
+        p = self._pending(tmp_path)
+        p.on_order_status(_order(31, "SELL", status))
+        self._assert_gone(p)
+
+    def test_reject_clears_every_tracker(self, tmp_path):
+        p = self._pending(tmp_path)
+        p.on_ib_error(31, 10052, "Invalid time in force:Empty")
+        self._assert_gone(p)
+
+
 class TestPendingOrderExpiry:
     """A dead order has to leave the tracker, but only once it genuinely
     cannot fill — and IB has to be told before the plugin forgets it."""
@@ -210,10 +247,12 @@ class _CapturingPortfolio:
 
     def __init__(self):
         self.orders = []
+        self.orders_ids = []
 
     def place_order_custom(self, contract, order):
         self.orders.append(order)
-        return 100 + len(self.orders)
+        self.orders_ids.append(100 + len(self.orders))
+        return self.orders_ids[-1]
 
 
 class TestOrderTimeInForce:
@@ -233,26 +272,45 @@ class TestOrderTimeInForce:
         p._gll_price = 40.0
         return p
 
-    def test_moc_buy_has_day_tif(self, tmp_path):
-        p = self._plugin(tmp_path)
-        p._place_moc_buy(25, "test")
-        order = p.portfolio.orders[-1]
-        assert order.orderType == "MOC"
-        assert order.tif == "DAY"
+    # Every order-placing method, with the symbol/type/action it must build.
+    # Enumerated rather than sampled: the live bug was one family of builders
+    # being fixed and the other silently left behind.
+    BUILDERS = [
+        ("_place_moc_buy",   "GLD", "MOC", "BUY",  "BUY"),
+        ("_emit_sell",       "GLD", "MKT", "SELL", "SELL"),
+        ("_place_moc_short", "GLD", "MOC", "SELL", "SHORT_OPEN"),
+        ("_place_cover_buy", "GLD", "MKT", "BUY",  "SHORT_COVER"),
+        ("_place_gll_buy",   "GLL", "MOC", "BUY",  "GLL_OPEN"),
+        ("_place_gll_sell",  "GLL", "MKT", "SELL", "GLL_CLOSE"),
+    ]
 
-    def test_moc_short_has_day_tif(self, tmp_path):
+    @pytest.mark.parametrize(
+        "method,symbol,order_type,action,pending_action", BUILDERS,
+        ids=[b[0] for b in BUILDERS],
+    )
+    def test_every_builder_sets_day_tif(self, tmp_path, method, symbol,
+                                        order_type, action, pending_action):
         p = self._plugin(tmp_path)
-        p._place_moc_short(25, "test")
+        getattr(p, method)(25, "test")
         order = p.portfolio.orders[-1]
-        assert order.orderType == "MOC"
-        assert order.tif == "DAY"
+        assert order.orderType == order_type
+        assert order.action == action
+        assert order.tif == "DAY", f"{method} would be rejected with 10052"
 
-    def test_mkt_sell_has_day_tif(self, tmp_path):
+    @pytest.mark.parametrize(
+        "method,symbol,order_type,action,pending_action", BUILDERS,
+        ids=[b[0] for b in BUILDERS],
+    )
+    def test_every_builder_records_its_order_type(self, tmp_path, method, symbol,
+                                                  order_type, action, pending_action):
+        """The expiry deadline is chosen by order type, so a builder that
+        forgets to record it would get the conservative MOC deadline and
+        linger past its window."""
         p = self._plugin(tmp_path)
-        p._emit_sell(25, "test")
-        order = p.portfolio.orders[-1]
-        assert order.orderType == "MKT"
-        assert order.tif == "DAY"
+        getattr(p, method)(25, "test")
+        oid = p.portfolio.orders_ids[-1]
+        assert p._pending_order_types[oid] == order_type
+        assert p._pending_order_actions[oid] == pending_action
 
 
 class TestTerminalRejectCodes:

@@ -685,6 +685,34 @@ class TestMarketDataProbeCallbacks:
         assert ("error", 500, 10089, "no live data") in seen   # and forwarded it
 
     @pytest.mark.asyncio
+    async def test_prior_market_data_type_handler_is_restored(self, probe_engine):
+        """Same single-slot problem as "error" — the probe displaces this one
+        too, so it has to be put back."""
+        seen = self._prior_handlers(probe_engine)
+        await probe_engine._detect_market_data_type()
+        probe_engine._portfolio._callbacks["marketDataType"](7, 3)
+        assert seen == [("mdt", 7, 3)]
+
+    @pytest.mark.asyncio
+    async def test_prior_market_data_type_handler_sees_the_probe_downgrade(self, probe_engine):
+        seen = self._prior_handlers(probe_engine)
+        task = asyncio.ensure_future(probe_engine._detect_market_data_type())
+        await asyncio.sleep(0)
+        probe_engine._portfolio._callbacks["marketDataType"](500, 3)
+        assert await task == 3
+        assert ("mdt", 500, 3) in seen
+
+    @pytest.mark.asyncio
+    async def test_handlers_are_restored_even_when_the_probe_times_out(self, probe_engine):
+        """The restore lives in a finally block; the timeout path is the one
+        that actually runs in production (no downgrade = live data)."""
+        seen = self._prior_handlers(probe_engine)
+        with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
+            assert await probe_engine._detect_market_data_type() == 1
+        probe_engine._portfolio._callbacks["error"](1, 2, "x")
+        assert seen == [("error", 1, 2, "x")]
+
+    @pytest.mark.asyncio
     async def test_absent_handlers_are_not_invented(self, probe_engine):
         await probe_engine._detect_market_data_type()
         assert "error" not in probe_engine._portfolio._callbacks

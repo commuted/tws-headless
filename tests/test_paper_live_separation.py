@@ -204,6 +204,36 @@ class TestResolveAccount:
 
 
 # ---------------------------------------------------------------------------
+# run_engine --account
+# ---------------------------------------------------------------------------
+
+class TestRunEngineAccountFlag:
+    """The flag that lets resolve_account be given an answer. The resolution
+    logic itself is tested above; this covers the wiring that reaches it."""
+
+    def _parse(self, argv):
+        from unittest.mock import patch
+        from ib.run_engine import parse_args
+        with patch("sys.argv", ["run_engine"] + argv):
+            return parse_args()
+
+    def test_account_defaults_to_none(self):
+        assert self._parse(["--port", "4001"]).account is None
+
+    def test_account_is_parsed(self):
+        args = self._parse(["--port", "4001", "--account", "U9876543"])
+        assert args.account == "U9876543"
+
+    def test_account_coexists_with_the_other_live_guardrails(self):
+        args = self._parse([
+            "--port", "4001", "--env", "live", "--account", "U9876543",
+            "--mode", "immediate", "--live-confirmed",
+        ])
+        assert (args.account, args.env, args.mode, args.live_confirmed) == \
+            ("U9876543", "live", "immediate", True)
+
+
+# ---------------------------------------------------------------------------
 # configure_execution_db — per-account singleton rebinding
 # ---------------------------------------------------------------------------
 
