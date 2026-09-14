@@ -500,6 +500,55 @@ class TestGetStatus:
             assert b._started_at > a._started_at
 
 
+class TestDayOpenNav:
+    """Tests for TradingEngine.get_day_open_nav — the per-ET-day NAV latch."""
+
+    def _engine_with_nav(self, nav):
+        """Build an engine whose portfolio reports the given net_liquidation."""
+        with patch('trading_engine.Portfolio') as MockPortfolio:
+            engine = TradingEngine()
+            summary = Mock()
+            summary.net_liquidation = nav
+            engine._portfolio.get_account_summary = Mock(return_value=summary)
+            return engine
+
+    def test_returns_none_before_account_data(self):
+        engine = self._engine_with_nav(0)   # net_liquidation=0 → treated as absent
+        engine._portfolio.get_account_summary = Mock(return_value=None)
+        assert engine.get_day_open_nav() is None
+        # Not latched yet
+        assert engine._day_open_nav is None
+        assert engine._day_open_date is None
+
+    def test_latches_on_first_valid_read_and_persists(self):
+        engine = self._engine_with_nav(100000.0)
+        first = engine.get_day_open_nav()
+        assert first == 100000.0
+        assert engine._day_open_nav == 100000.0
+        assert engine._day_open_date is not None
+
+        # NAV moves — get_day_open_nav must still return the latched value
+        summary2 = Mock()
+        summary2.net_liquidation = 100500.0
+        engine._portfolio.get_account_summary = Mock(return_value=summary2)
+        second = engine.get_day_open_nav()
+        assert second == 100000.0   # unchanged; stale-day latch holds
+
+    def test_reflatches_when_et_date_rolls_over(self):
+        """Simulate a stored value from yesterday — next call must
+        re-latch off the fresh AccountSummary, not return the stale value."""
+        from datetime import date as _date, timedelta as _td
+        engine = self._engine_with_nav(200000.0)
+        # Pre-seed a stale latch from an earlier date
+        engine._day_open_nav = 100000.0
+        engine._day_open_date = _date.today() - _td(days=1)
+
+        val = engine.get_day_open_nav()
+        assert val == 200000.0   # fresh reading picked up
+        assert engine._day_open_nav == 200000.0
+        assert engine._day_open_date > _date.today() - _td(days=1)
+
+
 class TestDataAccess:
     """Tests for data access methods"""
 

@@ -133,6 +133,15 @@ class TradingEngine:
         # show uptime without shelling out to ps. Naive datetime to match the
         # existing started_at fields on data_feed and plugin_executive stats.
         self._started_at = datetime.now()
+        # Day-open NAV — the account's net liquidation as first observed on
+        # or after today's midnight ET (America/New_York). Latched per ET
+        # calendar day: the stored value is valid only for _day_open_date,
+        # and get_day_open_nav() re-latches the moment it's called on a
+        # later ET date. This lets ibctl activity report today's P&L rather
+        # than "P&L since I started running" — which is what a trader
+        # actually wants when the engine has been up for days.
+        self._day_open_nav: Optional[float] = None
+        self._day_open_date = None    # datetime.date | None
         self._shutdown_event = asyncio.Event()
         # Set only once stop() has fully finished. _shutdown_event fires at the
         # START of stop(), so it says "shutdown was requested", not "shutdown is
@@ -906,6 +915,28 @@ class TradingEngine:
             status["message_bus"] = self._message_bus.get_stats()
 
         return status
+
+    def get_day_open_nav(self) -> Optional[float]:
+        """Account net liquidation as observed at the start of the current
+        ET trading day. Latched on first successful account summary read
+        each ET calendar day; the next call after midnight ET forgets the
+        stored value and re-latches from the next fresh read. Returns None
+        when IB hasn't delivered account data yet for the current day."""
+        try:
+            from zoneinfo import ZoneInfo
+            today_et = datetime.now(ZoneInfo("America/New_York")).date()
+        except Exception:
+            today_et = datetime.now().date()   # zoneinfo missing → system local
+
+        if self._day_open_date == today_et and self._day_open_nav is not None:
+            return self._day_open_nav
+
+        summary = self._portfolio.get_account_summary()
+        if summary and summary.net_liquidation > 0:
+            self._day_open_nav = summary.net_liquidation
+            self._day_open_date = today_et
+            return self._day_open_nav
+        return None
 
     def get_positions(self) -> List[Dict]:
         """Get current portfolio positions"""

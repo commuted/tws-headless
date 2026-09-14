@@ -45,6 +45,7 @@ class MockPortfolio:
         self.total_pnl = 5000.0
         self._account_summary = MockAccountSummary()
         self._last_order_id = 0
+        self.pending_orders: List[Any] = []   # handle_activity iterates this
 
     def get_account_summary(self):
         return self._account_summary
@@ -180,6 +181,11 @@ class MockEngine:
             "portfolio": {"positions": len(self.portfolio.positions)},
         }
 
+    def get_day_open_nav(self):
+        # match real TradingEngine: lazily latch on first read
+        s = self.portfolio.get_account_summary()
+        return s.net_liquidation if s and s.net_liquidation > 0 else None
+
     def pause(self):
         self._paused = True
 
@@ -256,6 +262,113 @@ class TestFormatUptime:
         # Clock skew or fractional seconds mustn't blow up
         assert _format_uptime(-5) == "0s"
         assert _format_uptime(12.9) == "12s"
+
+
+class TestEngineCommandHandlerActivity:
+    """Tests for activity command — completed trades + pending + session P&L."""
+
+    def setup_method(self):
+        self.engine = MockEngine()
+        self.handler = EngineCommandHandler(self.engine)
+
+    def _run(self, execs=(), commissions=None, pending=()):
+        """Run handle_activity with a mocked ExecutionDatabase and pending list."""
+        commissions = commissions or {}
+        mock_db = Mock()
+        mock_db.get_all_executions = Mock(return_value=list(execs))
+        mock_db.get_commission_for_execution = Mock(
+            side_effect=lambda exec_id: commissions.get(exec_id)
+        )
+        self.engine.portfolio.pending_orders = list(pending)
+        with patch("ib.execution_db.get_execution_db", return_value=mock_db):
+            return self.handler.handle_activity([])
+
+    def test_activity_empty(self):
+        """No trades, no pending — still succeeds and reports zero."""
+        result = self._run()
+        assert result.status == CommandStatus.SUCCESS
+        assert "0 completed" in result.message
+        assert "0 pending" in result.message
+        assert result.data["completed_trades"] == []
+        assert result.data["pending_orders"] == []
+        # Day baseline should be captured lazily from account summary
+        assert result.data["day_open_nav"] == 100000.0
+        assert result.data["current_nav"] == 100000.0
+        assert result.data["day_pnl"] == 0.0
+
+    def test_activity_with_completed_and_pending(self):
+        """A filled execution with commission + a working order both surface."""
+        from datetime import datetime as _dt
+        exec_rec = Mock(
+            exec_id="ex-1", order_id=21, symbol="GLD", shares=25.0,
+            avg_price=398.53, side="SLD", timestamp=_dt(2026, 9, 1, 13, 30, 30),
+        )
+        comm_rec = Mock(commission=1.21, realized_pnl=181.05)
+        pending_order = Mock(
+            order_id=99, symbol="SPY", action="BUY", quantity=10,
+            order_type="MKT", status=Mock(value="Submitted"), submitted_time="2026-09-01T14:00:00",
+        )
+
+        result = self._run(
+            execs=[exec_rec],
+            commissions={"ex-1": comm_rec},
+            pending=[pending_order],
+        )
+        assert result.status == CommandStatus.SUCCESS
+        assert "1 completed" in result.message
+        assert "1 pending" in result.message
+
+        # completed record shape
+        c = result.data["completed_trades"][0]
+        assert c["symbol"] == "GLD" and c["side"] == "SLD" and c["quantity"] == 25.0
+        assert c["price"] == 398.53
+        assert c["commission"] == 1.21
+        assert c["realized_pnl"] == 181.05
+
+        # pending record shape
+        p = result.data["pending_orders"][0]
+        assert p["order_id"] == 99 and p["symbol"] == "SPY"
+        assert p["action"] == "BUY" and p["status"] == "Submitted"
+
+        # window aggregates
+        assert result.data["window"]["realized_pnl"] == pytest.approx(181.05)
+        assert result.data["window"]["total_commission"] == pytest.approx(1.21)
+
+    def test_activity_day_pnl_when_nav_moves(self):
+        """Day P&L = current_nav - day_open_nav; open latched once per day."""
+        # Simulate a real engine that latched day_open_nav at 100000 earlier
+        # today, then NAV drifts. Real TradingEngine.get_day_open_nav()
+        # persists across queries same-day; mock the same behavior.
+        self.engine.get_day_open_nav = lambda: 100000.0
+        self.engine.portfolio._account_summary.net_liquidation = 100181.05
+
+        result = self._run()
+        assert result.data["day_pnl"] == pytest.approx(181.05)
+        assert "day P&L $+181.05" in result.message
+
+    def test_activity_day_pnl_none_when_no_account_data(self):
+        """Before IB delivers the first AccountSummary, day_open_nav is None
+        and day_pnl must be None (not 0), so ibctl can show 'waiting…'."""
+        self.engine.get_day_open_nav = lambda: None
+        self.engine.portfolio.get_account_summary = lambda: None
+        result = self._run()
+        assert result.data["day_open_nav"] is None
+        assert result.data["day_pnl"] is None
+        # Message must not claim a P&L we don't know
+        assert "day P&L" not in result.message
+
+    def test_activity_missing_commission_ok(self):
+        """Execution without commission record must render as None, not error."""
+        from datetime import datetime as _dt
+        exec_rec = Mock(
+            exec_id="ex-noc", order_id=1, symbol="TLT", shares=5.0,
+            avg_price=82.0, side="BOT", timestamp=_dt(2026, 9, 1, 14, 0, 0),
+        )
+        result = self._run(execs=[exec_rec], commissions={})   # no commission
+        assert result.status == CommandStatus.SUCCESS
+        c = result.data["completed_trades"][0]
+        assert c["commission"] is None
+        assert c["realized_pnl"] is None
 
 
 class TestEngineCommandHandlerPositions:

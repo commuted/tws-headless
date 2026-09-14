@@ -429,6 +429,65 @@ def format_result(result: CommandResult, verbose: bool = False):
             else:
                 print("\n  Instruments: (none)")
 
+        elif "completed_trades" in result.data and "pending_orders" in result.data:
+            # activity command
+            d = result.data
+            window = d.get("window") or {}
+            print()
+            if d.get("session_started_at"):
+                print(f"  Session started:   {d['session_started_at'][:19]}"
+                      + (f"  (uptime {int(d['uptime_seconds']//3600)}h "
+                         f"{int((d['uptime_seconds']%3600)//60)}m)"
+                         if d.get('uptime_seconds') else ""))
+            if d.get("account_id"):
+                print(f"  Account:           {d['account_id']}")
+            if d.get("day_open_nav") is not None:
+                print(f"  Day open NAV (ET): ${d['day_open_nav']:>14,.2f}")
+            else:
+                print(f"  Day open NAV (ET): (waiting for first account read)")
+            if d.get("current_nav") is not None:
+                print(f"  Current NAV:       ${d['current_nav']:>14,.2f}")
+            if d.get("day_pnl") is not None:
+                sign = "+" if d['day_pnl'] >= 0 else ""
+                print(f"  Day P&L:           ${sign}{d['day_pnl']:>14,.2f}")
+
+            completed = d.get("completed_trades") or []
+            print(f"\n  Completed trades (last {window.get('days_back',1)}d, {len(completed)}):")
+            if completed:
+                print(f"    {'time (ET)':<19}  {'side':<4}  {'qty':>6}  {'sym':<6}  "
+                      f"{'price':>10}  {'comm':>7}  {'realized':>10}")
+                print(f"    {'-'*72}")
+                for t in completed:
+                    ts = (t.get("timestamp") or "")[:19].replace("T", " ")
+                    comm = t.get("commission")
+                    rpnl = t.get("realized_pnl")
+                    print(f"    {ts:<19}  {t.get('side',''):<4}  "
+                          f"{t.get('quantity',0):>6,.0f}  {t.get('symbol',''):<6}  "
+                          f"${t.get('price',0):>8,.2f}  "
+                          f"{('$'+format(comm,',.2f')) if comm is not None else '     -':>7}  "
+                          f"{('$'+format(rpnl,'+,.2f')) if rpnl is not None else '        -':>10}")
+                if window.get("realized_pnl") is not None:
+                    print(f"    {'-'*72}")
+                    print(f"    {'realized total':<54}"
+                          f"  ${window['total_commission']:>5,.2f}  "
+                          f"${window['realized_pnl']:>+9,.2f}")
+            else:
+                print(f"    (none)")
+
+            pending = d.get("pending_orders") or []
+            print(f"\n  Pending orders ({len(pending)}):")
+            if pending:
+                print(f"    {'order_id':>10}  {'sym':<6}  {'action':<6}  {'qty':>6}  "
+                      f"{'type':<6}  {'status':<14}  {'submitted'}")
+                print(f"    {'-'*76}")
+                for o in pending:
+                    submitted = (o.get("submitted_at") or "")[:19].replace("T", " ")
+                    print(f"    {o.get('order_id',''):>10}  {o.get('symbol',''):<6}  "
+                          f"{o.get('action',''):<6}  {o.get('quantity',0):>6,.0f}  "
+                          f"{o.get('order_type',''):<6}  {o.get('status',''):<14}  {submitted}")
+            else:
+                print(f"    (none)")
+
         elif "positions" in result.data:
             positions = result.data["positions"]
             # Only render the portfolio-style table when rows actually carry

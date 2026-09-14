@@ -728,6 +728,131 @@ class EngineCommandHandler:
         server.register_handler("historical", self.handle_historical)
 
         server.register_handler("plugin", self.handle_plugin)
+        server.register_handler("activity", self.handle_activity)
+
+    def handle_activity(self, args: List[str]):
+        """Handle 'activity' — day-anchored account activity summary.
+
+        Args:
+            args: optional [DAYS] — look back this many ET calendar days
+                  for executions (default 1 = today ET). Non-integer ignored.
+        """
+        from .command_server import CommandResult, CommandStatus
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        try:
+            from zoneinfo import ZoneInfo
+            _ET = ZoneInfo("America/New_York")
+        except Exception:
+            _ET = None
+
+        try:
+            days_back = 1
+            if args:
+                try:
+                    days_back = max(1, int(args[0]))
+                except (TypeError, ValueError):
+                    pass
+
+            # Filter window: midnight ET on (today - days_back + 1) → now.
+            # ExecutionDatabase stores naive UTC ISO strings, so convert
+            # the midnight-ET boundary to UTC and strip tzinfo for the
+            # string comparison to be meaningful (this was the tz bug in
+            # the previous cut — .astimezone(None) returned system local,
+            # not UTC).
+            if _ET is not None:
+                now_utc = _dt.now(_tz.utc)
+                now_et = now_utc.astimezone(_ET)
+                start_et = (now_et - _td(days=days_back - 1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                start_utc = start_et.astimezone(_tz.utc).replace(tzinfo=None)
+            else:
+                # No zoneinfo (shouldn't happen on Python 3.9+): fall back
+                # to system local. Fires a hedge message noting the drift.
+                start_utc = (_dt.now() - _td(days=days_back - 1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+
+            # --- completed executions ---
+            from .execution_db import get_execution_db
+            db = get_execution_db()
+            execs = db.get_all_executions(start_date=start_utc)
+            completed = []
+            for e in execs:
+                comm = db.get_commission_for_execution(e.exec_id)
+                completed.append({
+                    "timestamp":    e.timestamp.isoformat(),
+                    "side":         e.side,
+                    "symbol":       e.symbol,
+                    "quantity":     e.shares,
+                    "price":        e.avg_price,
+                    "commission":   comm.commission if comm else None,
+                    "realized_pnl": comm.realized_pnl if comm else None,
+                    "order_id":     e.order_id,
+                    "exec_id":      e.exec_id,
+                })
+
+            # --- pending / working orders ---
+            pending = []
+            portfolio = self.engine.portfolio
+            if portfolio:
+                for o in portfolio.pending_orders:
+                    pending.append({
+                        "order_id":     o.order_id,
+                        "symbol":       o.symbol,
+                        "action":       o.action,
+                        "quantity":     o.quantity,
+                        "order_type":   o.order_type,
+                        "status":       o.status.value if hasattr(o.status, "value") else str(o.status),
+                        "submitted_at": o.submitted_time,
+                    })
+
+            # --- day-anchored NAV / P&L ---
+            engine_status = self.engine.get_status()
+            day_open_nav = self.engine.get_day_open_nav()
+            current_nav = None
+            summary = portfolio.get_account_summary() if portfolio else None
+            if summary and summary.net_liquidation > 0:
+                current_nav = summary.net_liquidation
+            day_pnl = None
+            if day_open_nav is not None and current_nav is not None:
+                day_pnl = current_nav - day_open_nav
+
+            # --- realized P&L in the reported window (sum of commissions) ---
+            realized = sum(t["realized_pnl"] or 0.0 for t in completed)
+            total_commission = sum(t["commission"] or 0.0 for t in completed)
+
+            data = {
+                "session_started_at": engine_status.get("started_at"),
+                "uptime_seconds":     engine_status.get("uptime_seconds"),
+                "account_id":         summary.account_id if summary else None,
+                "day_open_nav":       day_open_nav,
+                "current_nav":        current_nav,
+                "day_pnl":            day_pnl,
+                "window": {
+                    "days_back": days_back,
+                    "start":     start_utc.isoformat() if hasattr(start_utc, "isoformat") else str(start_utc),
+                    "realized_pnl":     realized,
+                    "total_commission": total_commission,
+                },
+                "completed_trades": completed,
+                "pending_orders":   pending,
+            }
+            message = (
+                f"Activity: {len(completed)} completed, {len(pending)} pending"
+                + (f" | day P&L ${day_pnl:+,.2f}" if day_pnl is not None else "")
+                + (f" | realized ${realized:+,.2f}" if completed else "")
+            )
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message=message,
+                data=data,
+            )
+        except Exception as e:
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=f"Failed to get activity: {e}",
+            )
 
     def handle_status(self, args: List[str]):
         """Handle 'status' command"""
