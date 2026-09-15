@@ -376,6 +376,11 @@ class TestSessionDecisions:
     def _loaded(self, tmp_path, **kw):
         plugin = _make_plugin(tmp_path, **kw)
         plugin.load()   # populate self.holdings
+        # Offline (no portfolio) there is no NAV to size from, so the
+        # allocation constant is the only size available and must be given
+        # explicitly — live sizing follows holdings instead. See
+        # _deployable_capital().
+        plugin.allocation_dollars = 10_000.0
         return plugin
 
     def test_close_fires_once_per_day(self, tmp_path):
@@ -484,6 +489,8 @@ class TestFillsUpdateHoldings:
     def _loaded(self, tmp_path):
         plugin = _make_plugin(tmp_path)
         plugin.load()
+        # Offline sizing needs an explicit allocation — see _deployable_capital().
+        plugin.allocation_dollars = 10_000.0
         return plugin
 
     def _fill(self, order_id, action, qty, price):
@@ -893,6 +900,8 @@ class TestResetCadenceTrigger:
         plugin.reset_lookback_days = 5
         plugin.reset_cooldown_days = 3
         plugin.reset_threshold = -0.08
+        # Offline sizing needs an explicit allocation — see _deployable_capital().
+        plugin.allocation_dollars = 10_000.0
         return plugin
 
     def test_no_trigger_before_window_full(self, tmp_path):
@@ -1064,11 +1073,12 @@ class TestResetCadenceSessionFlow:
     def test_disabled_by_default_uses_normal_flow(self, tmp_path):
         """reset_cadence_enabled defaults False — behavior must be identical
         to the pre-existing long-only flow with no code path changes. No
-        portfolio here, so budget isn't cash-clamped (matches pre-existing
-        behavior — see test_close_buy_bounded_by_plugin_cash for the
-        with-portfolio case): allocation_dollars=10,000 / $100 = 100 shares."""
+        portfolio attached, so there is no NAV to size from and the
+        allocation constant is used directly: 10,000 / $100 = 100 shares.
+        See _deployable_capital()."""
         plugin = _make_plugin(tmp_path)
         plugin.load()
+        plugin.allocation_dollars = 10_000.0
         assert plugin.reset_cadence_enabled is False
         plugin._gld_price = 100.0
         plugin.holdings.add_cash(1000.0)
@@ -1090,6 +1100,8 @@ class TestResetCadenceFills:
     def _loaded(self, tmp_path):
         plugin = _make_plugin(tmp_path)
         plugin.load()
+        # Offline sizing needs an explicit allocation — see _deployable_capital().
+        plugin.allocation_dollars = 10_000.0
         return plugin
 
     def _fill(self, order_id, qty, price):
@@ -1264,6 +1276,8 @@ class TestResetCadenceShadowBackfill:
         plugin.portfolio = Mock()   # truthy, so backfill doesn't early-return
         plugin.reset_cadence_enabled = True
         plugin.reset_lookback_days = 2
+        # Offline sizing needs an explicit allocation — see _deployable_capital().
+        plugin.allocation_dollars = 10_000.0
         return plugin
 
     def _stub_bars(self, plugin, gld_day_prices):
@@ -1403,6 +1417,8 @@ class TestShortSellingCapabilityCheck:
         plugin.load()
         plugin.reset_cadence_enabled = True
         plugin._gld_price = 100.0
+        # Offline sizing needs an explicit allocation — see _deployable_capital().
+        plugin.allocation_dollars = 10_000.0
         return plugin
 
     def test_permitted_result_cached(self, tmp_path):
@@ -1463,7 +1479,8 @@ class TestShortSellingCapabilityCheck:
         not an arbitrary token quantity — margin availability can depend on
         size."""
         plugin = self._loaded(tmp_path)
-        plugin.allocation_dollars = 10_000.0
+        plugin.allocation_dollars = 0.0          # uncapped: size follows NAV
+        plugin.holdings.add_cash(10_000.0)       # ...and this is the NAV
         plugin._gld_price = 250.0   # -> 40 target shares
         plugin.portfolio = Mock()
         plugin.portfolio.check_short_selling_permitted.return_value = {

@@ -255,6 +255,72 @@ class _CapturingPortfolio:
         return self.orders_ids[-1]
 
 
+class TestDeployableCapital:
+    """Size follows the capital the plugin holds, not a constant.
+
+    A fixed dollar figure ratchets, and only downward: a losing plugin is
+    held down by its shrunken cash while a winning one has its gains
+    stranded as idle cash. It also ignored funding — transferring shares in
+    raised holdings but not the amount the plugin would trade, which is how
+    a 50-share seed came to re-enter at 25 on 2026-09-14.
+    """
+
+    def _funded(self, tmp_path, cash=0.0, shares=0.0, price=400.0):
+        p = _with_holdings(_make_plugin(tmp_path), gld_shares=shares, cash=cash)
+        p.portfolio = _CapturingPortfolio()
+        p._gld_price = price
+        return p
+
+    def test_uncapped_deploys_everything_it_holds(self, tmp_path):
+        p = self._funded(tmp_path, cash=19_592.27)
+        p.allocation_dollars = 0.0
+        assert p._deployable_capital() == pytest.approx(19_592.27)
+
+    def test_gains_raise_the_size_rather_than_idling(self, tmp_path):
+        """The asymmetry that mattered: profit used to sit as dead cash."""
+        p = self._funded(tmp_path, cash=25_000.0)
+        p.allocation_dollars = 0.0
+        assert p._deployable_capital() == pytest.approx(25_000.0)
+
+    def test_transferred_shares_count_toward_size(self, tmp_path):
+        """Funding a plugin with stock, not cash, must raise what it trades."""
+        p = self._funded(tmp_path, cash=0.0, shares=50, price=400.0)
+        p.allocation_dollars = 0.0
+        assert p._deployable_capital() == pytest.approx(20_000.0)
+
+    def test_positive_allocation_is_only_a_ceiling(self, tmp_path):
+        p = self._funded(tmp_path, cash=19_592.27)
+        p.allocation_dollars = 10_000.0
+        assert p._deployable_capital() == pytest.approx(10_000.0)
+
+    def test_ceiling_does_not_invent_capital_it_lacks(self, tmp_path):
+        p = self._funded(tmp_path, cash=5_000.0)
+        p.allocation_dollars = 50_000.0
+        assert p._deployable_capital() == pytest.approx(5_000.0)
+
+    def test_unfunded_plugin_deploys_nothing(self, tmp_path):
+        p = self._funded(tmp_path, cash=0.0)
+        p.allocation_dollars = 0.0
+        assert p._deployable_capital() == 0.0
+
+    def test_offline_falls_back_to_the_constant(self, tmp_path):
+        """No portfolio means no NAV to read — backtests still need a size."""
+        p = _make_plugin(tmp_path)
+        p.allocation_dollars = 10_000.0
+        assert p.portfolio is None
+        assert p._deployable_capital() == pytest.approx(10_000.0)
+
+    def test_default_is_uncapped(self, tmp_path):
+        assert _make_plugin(tmp_path).allocation_dollars == 0.0
+
+    def test_moc_entry_sizes_off_holdings(self, tmp_path):
+        """End to end: the cash a sale realised is what the re-entry spends."""
+        p = self._funded(tmp_path, cash=19_592.27, price=393.43)
+        p.allocation_dollars = 0.0
+        p._place_moc_buy(int(p._deployable_capital() / p._gld_price), "test")
+        assert p.portfolio.orders[-1].totalQuantity == 49
+
+
 class TestOrderTimeInForce:
     """Every order this plugin builds must carry a time in force.
 

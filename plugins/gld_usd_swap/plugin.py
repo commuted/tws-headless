@@ -65,7 +65,7 @@ Default parameters (tunable at runtime):
   meta_slow_bars         = 60    GLD trend slow SMA
   vol_window             = 20    rolling window for derivative estimation
   derivative_percentile  = 50    p50 of recent |Δclose| sets slope limit
-  allocation_dollars     = 10 000 USD
+  allocation_dollars     = 0 (uncapped; a positive value caps deployment)
 
 ─────────────────────────────────────────────────────────────────────────────
 RESET-CADENCE OVERLAY (opt-in, disabled by default)
@@ -431,7 +431,10 @@ class GldUsdSwapPlugin(PluginBase):
         self.meta_slow_bars:        int   = 60   # GLD trend slow SMA
         self.vol_window:            int   = 20
         self.derivative_percentile: int   = 50
-        self.allocation_dollars:    float = 10_000.0
+        # 0 = uncapped: deploy whatever this plugin holds. A positive value
+        # is an explicit ceiling. See _deployable_capital() for why the
+        # constant is no longer the size itself.
+        self.allocation_dollars:    float = 0.0
         # Minimum fractional gap fast/slow must show for a per-ETF gold/cash
         # vote to count.  Prevents float64 summation associativity (fast=
         # sum(buf[-5:])/5 vs slow=sum(buf)/20) from choosing the tie-break
@@ -669,7 +672,7 @@ class GldUsdSwapPlugin(PluginBase):
             f"Started GLD/USD swap v{self.VERSION}: "
             f"fast={self.fast_bars} slow={self.slow_bars}, "
             f"meta={self.meta_fast_bars}/{self.meta_slow_bars}, "
-            f"alloc=${self.allocation_dollars:,.0f}, "
+            f"alloc={'uncapped' if self.allocation_dollars <= 0 else f'${self.allocation_dollars:,.0f} cap'}, "
             f"holding={self._holding_gld}, prior_regime={self._regime_at_prior_close}"
         )
         return True
@@ -1140,7 +1143,7 @@ class GldUsdSwapPlugin(PluginBase):
             return
 
         target_shares = (
-            max(1, int(self.allocation_dollars / self._gld_price))
+            max(1, int(self._deployable_capital() / self._gld_price))
             if self._gld_price > 0 else 1
         )
         logger.info(
@@ -1495,7 +1498,7 @@ class GldUsdSwapPlugin(PluginBase):
                 # through zero in a single fill (see
                 # _apply_signed_fill_to_holdings).
                 target_short = (
-                    int(self.allocation_dollars / self._gld_price)
+                    int(self._deployable_capital() / self._gld_price)
                     if self._gld_price > 0 else 0
                 )
                 current_signed = self._current_gld_shares_signed()
@@ -1533,7 +1536,7 @@ class GldUsdSwapPlugin(PluginBase):
                         ),
                     )
                 gll_shares = (
-                    int(_GLL_WEIGHT * self.allocation_dollars / self._gll_price)
+                    int(_GLL_WEIGHT * self._deployable_capital() / self._gll_price)
                     if self._gll_price > 0 else 0
                 )
                 if gll_shares > 0:
@@ -1555,13 +1558,12 @@ class GldUsdSwapPlugin(PluginBase):
             return
 
         if not self._holding_gld:
-            budget = self.allocation_dollars
-            if self.portfolio:
-                # Real trading: never spend beyond the cash actually funded to
-                # this plugin (via ibctl transfer). An unfunded plugin places
-                # no orders instead of drawing on account-wide capital.
-                cash = self.holdings.current_cash if self.holdings else 0.0
-                budget = min(budget, cash)
+            # Never spends beyond what this plugin actually holds — an
+            # unfunded plugin places no orders rather than drawing on
+            # account-wide capital — but it now deploys ALL of it rather than
+            # whatever a constant permitted. Flat here by definition, so this
+            # is cash.
+            budget = self._deployable_capital()
             shares = int(budget / self._gld_price) if self._gld_price > 0 else 0
             if shares > 0:
                 self._place_moc_buy(
@@ -2018,6 +2020,35 @@ class GldUsdSwapPlugin(PluginBase):
             if pos:
                 return pos.quantity
         return 0.0
+
+    def _deployable_capital(self) -> float:
+        """What this plugin may put to work: its own NAV, optionally capped.
+
+        Size follows the capital the plugin actually holds rather than a fixed
+        dollar figure. A fixed figure ratchets, and only downward: a losing
+        plugin is held down by its shrunken cash, while a winning one has its
+        gains stranded as idle cash it may never redeploy. Position size can
+        decay but never grow.
+
+        It also silently ignored funding. Transferring shares in raises
+        holdings but not the amount the plugin would trade, which is how a
+        50-share seed came to re-enter at 25 on 2026-09-14 — the plugin sold
+        what it had been given and bought back what the constant allowed.
+
+        Cash is exact; a position is mark-to-market and only as good as the
+        last print. That distinction does not bite here: entries are placed
+        when flat, where NAV is simply cash.
+
+        allocation_dollars is now an optional CEILING rather than the size
+        itself — 0 means uncapped, use what it has. Offline (a backtest, or
+        no portfolio attached) there is no NAV to read and the constant is
+        the only size available, so it is used directly and must be set.
+        """
+        if self.portfolio is None or self.holdings is None:
+            return self.allocation_dollars
+        nav = max(0.0, self._current_nav())
+        cap = self.allocation_dollars
+        return min(nav, cap) if cap > 0 else nav
 
     def _current_nav(self) -> float:
         """Mark-to-market NAV: cash + signed shares * current price.
