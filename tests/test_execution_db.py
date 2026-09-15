@@ -556,6 +556,115 @@ class TestExecutionDatabaseCommissions:
 # ExecutionDatabase Position Summary Tests
 # =============================================================================
 
+class TestCostReport:
+    """Cost broken into its parts.
+
+    get_commission_report answers "what were the fees" and sits realized P&L
+    beside them — which is not a cost at all, and on a seeded position dwarfs
+    the fees by three orders of magnitude. This report separates commission
+    (knowable from the fill) from slippage (fill vs the decision price, the
+    usually-larger half that needs the decision price carried from placement).
+    """
+
+    def _fill(self, db, exec_id, order_id, side, shares, price,
+              decision=None, commission=None, symbol="GLD", when=None):
+        from execution_db import ExecutionRecord, CommissionRecord
+        db.insert_execution(ExecutionRecord(
+            exec_id=exec_id, order_id=order_id, symbol=symbol, sec_type="STK",
+            exchange="SMART", currency="USD", shares=shares, cum_qty=shares,
+            avg_price=price, side=side, timestamp=when or datetime.now(),
+            decision_price=decision))
+        if commission is not None:
+            db.insert_commission(CommissionRecord(
+                exec_id=exec_id, commission=commission, currency="USD",
+                realized_pnl=None, timestamp=when or datetime.now()))
+
+    def test_commission_is_normalised_to_bp(self, execution_db):
+        """The dollar figure hides that a per-order minimum makes a small
+        fill several times dearer than a large one."""
+        self._fill(execution_db, "e1", 1, "BOT", 100, 400.0, commission=1.00)
+        o = execution_db.get_cost_report()["orders"][0]
+        assert o["commission"] == pytest.approx(1.00)
+        assert o["commission_bp"] == pytest.approx(0.25)     # 1 / 40,000
+
+    def test_buy_above_the_decision_price_is_a_cost(self, execution_db):
+        self._fill(execution_db, "e1", 1, "BOT", 100, 401.0, decision=400.0)
+        assert execution_db.get_cost_report()["orders"][0]["slippage_bp"] \
+            == pytest.approx(25.0)
+
+    def test_sell_below_the_decision_price_is_a_cost(self, execution_db):
+        """Sign convention: positive always means it cost money."""
+        self._fill(execution_db, "e1", 1, "SLD", 100, 399.0, decision=400.0)
+        assert execution_db.get_cost_report()["orders"][0]["slippage_bp"] \
+            == pytest.approx(25.0)
+
+    def test_favourable_fill_is_negative_cost(self, execution_db):
+        self._fill(execution_db, "e1", 1, "BOT", 100, 399.0, decision=400.0)
+        assert execution_db.get_cost_report()["orders"][0]["slippage_bp"] \
+            == pytest.approx(-25.0)
+
+    def test_missing_decision_price_reports_unknown_not_zero(self, execution_db):
+        """Unknown and free are different claims."""
+        self._fill(execution_db, "e1", 1, "BOT", 100, 400.0, commission=1.0)
+        o = execution_db.get_cost_report()["orders"][0]
+        assert o["slippage_bp"] is None
+        assert o["total_cost_bp"] is None
+
+    def test_partial_fills_aggregate_into_one_order(self, execution_db):
+        """One order, two executions, one per-order commission minimum split
+        across them — exactly the shape of the 2026-09-14 GLD sell."""
+        self._fill(execution_db, "e1", 7, "SLD", 42, 391.85, decision=392.0,
+                   commission=1.35)
+        self._fill(execution_db, "e2", 7, "SLD", 8, 391.8454, decision=392.0,
+                   commission=0.07)
+        orders = execution_db.get_cost_report()["orders"]
+        assert len(orders) == 1
+        assert orders[0]["shares"] == 50
+        assert orders[0]["fills"] == 2
+        assert orders[0]["commission"] == pytest.approx(1.42)
+
+    def test_totals_weight_slippage_by_notional(self, execution_db):
+        self._fill(execution_db, "e1", 1, "BOT", 900, 400.0, decision=400.0)
+        self._fill(execution_db, "e2", 2, "BOT", 100, 404.0, decision=400.0)
+        t = execution_db.get_cost_report()["totals"]
+        # 0 bp on 360k, 100 bp on 40.4k
+        assert t["slippage_bp"] == pytest.approx(100 * 40400 / 400400, rel=1e-3)
+
+    def test_coverage_reports_how_much_is_measurable(self, execution_db):
+        self._fill(execution_db, "e1", 1, "BOT", 100, 400.0, decision=400.0)
+        self._fill(execution_db, "e2", 2, "BOT", 100, 400.0)      # no decision
+        assert execution_db.get_cost_report()["totals"]["slippage_coverage"] \
+            == pytest.approx(0.5)
+
+    def test_round_trip_pairs_close_against_open(self, execution_db):
+        self._fill(execution_db, "e1", 1, "BOT", 50, 390.0, commission=1.0,
+                   when=datetime(2026, 9, 14, 10, 0))
+        self._fill(execution_db, "e2", 2, "SLD", 50, 394.0, commission=1.0,
+                   when=datetime(2026, 9, 15, 10, 0))
+        trips = execution_db.get_cost_report()["round_trips"]
+        assert len(trips) == 1
+        assert trips[0]["gross_pnl"] == pytest.approx(200.0)
+        assert trips[0]["commission"] == pytest.approx(2.0)
+        assert trips[0]["net_pnl"] == pytest.approx(198.0)
+
+    def test_unmatched_close_is_not_invented_into_a_trip(self, execution_db):
+        """A position transferred in has no opening fill — that is the
+        2026-08-11 seed, and pairing it against nothing would fabricate P&L."""
+        self._fill(execution_db, "e1", 1, "SLD", 50, 391.85,
+                   when=datetime(2026, 9, 14, 10, 0))
+        assert execution_db.get_cost_report()["round_trips"] == []
+
+    def test_symbol_filter(self, execution_db):
+        self._fill(execution_db, "e1", 1, "BOT", 10, 400.0, symbol="GLD")
+        self._fill(execution_db, "e2", 2, "BOT", 10, 40.0, symbol="GLL")
+        assert len(execution_db.get_cost_report(symbol="GLD")["orders"]) == 1
+
+    def test_empty_database_is_safe(self, execution_db):
+        r = execution_db.get_cost_report()
+        assert r["orders"] == [] and r["round_trips"] == []
+        assert r["totals"]["order_count"] == 0
+
+
 class TestExecutionDatabasePositionSummary:
     """Tests for position summary"""
 

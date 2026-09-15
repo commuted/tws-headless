@@ -248,9 +248,11 @@ class _CapturingPortfolio:
     def __init__(self):
         self.orders = []
         self.orders_ids = []
+        self.decision_prices = []
 
-    def place_order_custom(self, contract, order):
+    def place_order_custom(self, contract, order, decision_price=None):
         self.orders.append(order)
+        self.decision_prices.append(decision_price)
         self.orders_ids.append(100 + len(self.orders))
         return self.orders_ids[-1]
 
@@ -377,6 +379,39 @@ class TestOrderTimeInForce:
         oid = p.portfolio.orders_ids[-1]
         assert p._pending_order_types[oid] == order_type
         assert p._pending_order_actions[oid] == pending_action
+
+
+class TestDecisionPriceIsRecorded:
+    """Slippage is fill vs the price the strategy decided at, and the
+    decision price is gone by the time IB's execution report arrives — so it
+    has to be captured at placement or the fill can only be compared with
+    itself. Commission is the half of cost knowable from the fill alone."""
+
+    def _plugin(self, tmp_path):
+        p = _make_plugin(tmp_path)
+        p.portfolio = _CapturingPortfolio()
+        p._gld_price = 393.43
+        p._gll_price = 41.17
+        return p
+
+    @pytest.mark.parametrize("method,expected", [
+        ("_place_moc_buy",   "gld"), ("_emit_sell",      "gld"),
+        ("_place_moc_short", "gld"), ("_place_cover_buy", "gld"),
+        ("_place_gll_buy",   "gll"), ("_place_gll_sell",  "gll"),
+    ])
+    def test_every_builder_passes_its_decision_price(self, tmp_path, method, expected):
+        p = self._plugin(tmp_path)
+        getattr(p, method)(10, "test")
+        want = p._gld_price if expected == "gld" else p._gll_price
+        assert p.portfolio.decision_prices[-1] == want
+
+    def test_gll_builders_do_not_report_the_gld_price(self, tmp_path):
+        """The two instruments trade at very different prices; crossing them
+        would make slippage nonsense rather than merely absent."""
+        p = self._plugin(tmp_path)
+        p._place_gll_buy(10, "test")
+        assert p.portfolio.decision_prices[-1] == 41.17
+        assert p.portfolio.decision_prices[-1] != p._gld_price
 
 
 class TestTerminalRejectCodes:

@@ -741,6 +741,7 @@ class EngineCommandHandler:
         server.register_handler("summary", self.handle_summary)
         server.register_handler("account", self.handle_account)
         server.register_handler("commissions", self.handle_commissions)
+        server.register_handler("costs", self.handle_costs)
         server.register_handler("liquidate", self.handle_liquidate)
         server.register_handler("stop", self.handle_stop)
         server.register_handler("shutdown", self.handle_stop)
@@ -1075,6 +1076,95 @@ class EngineCommandHandler:
                 status=CommandStatus.ERROR,
                 message=f"Failed to get account summary: {e}\n{traceback.format_exc()}",
             )
+
+    def handle_costs(self, args: List[str]):
+        """Handle 'costs' - trading cost broken into commission and slippage.
+
+        Usage:
+            costs [--symbol SYM] [--days N]
+
+        Reads the local execution database only; unlike `commissions` it does
+        not round-trip to IB, because everything it reports was recorded at
+        fill time. Commission is normalised to bp of notional so it can be
+        compared against an edge, and slippage is measured against the price
+        the strategy decided at. Orders placed before decision_price was
+        recorded report slippage as unknown rather than zero.
+        """
+        from .command_server import CommandResult, CommandStatus
+        from .execution_db import get_execution_db
+        from datetime import datetime, timedelta
+
+        symbol, days = None, 30
+        i = 0
+        while i < len(args):
+            if args[i] == "--symbol" and i + 1 < len(args):
+                symbol = args[i + 1].upper(); i += 2
+            elif args[i] == "--days" and i + 1 < len(args):
+                try:
+                    days = max(1, int(args[i + 1]))
+                except ValueError:
+                    return CommandResult(status=CommandStatus.ERROR,
+                                         message=f"Invalid --days: {args[i+1]}")
+                i += 2
+            else:
+                i += 1
+        try:
+            report = get_execution_db().get_cost_report(
+                symbol=symbol, start_date=datetime.now() - timedelta(days=days))
+            report["days"] = days
+            t = report["totals"]
+            bar = "=" * 86
+
+            def bp(v, w=9):
+                return f"{v:>{w}.2f}" if v is not None else f"{'n/a':>{w}}"
+
+            lines = [bar, f"TRADING COST over the last {days}d"
+                     + (f"  [{symbol}]" if symbol else ""), bar]
+            if not report["orders"]:
+                lines += ["", "  No executions in this window."]
+            else:
+                lines.append(
+                    f"  {'when':<17}{'ord':>4}{'sym':>6}{'side':>5}{'qty':>7}"
+                    f"{'fill':>10}{'decided':>10}{'slip bp':>9}{'comm bp':>9}{'cost bp':>9}")
+                lines.append("-" * 86)
+                for o in report["orders"]:
+                    dp = (f"{o['decision_price']:.4f}"
+                          if o["decision_price"] else "n/a")
+                    lines.append(
+                        f"  {o['timestamp'][:16]:<17}{o['order_id']:>4}"
+                        f"{o['symbol']:>6}{o['side']:>5}{o['shares']:>7.0f}"
+                        f"{o['avg_price']:>10.4f}{dp:>10}"
+                        f"{bp(o['slippage_bp'])}{bp(o['commission_bp'])}"
+                        f"{bp(o['total_cost_bp'])}")
+                lines += ["-" * 86,
+                          f"  {report['totals']['order_count']} orders, "
+                          f"notional ${t['notional']:,.0f}",
+                          f"  commission ${t['commission']:,.2f} = "
+                          f"{bp(t['commission_bp'], 0)} bp",
+                          f"  slippage   {bp(t['slippage_bp'], 0)} bp "
+                          f"(notional-weighted, {t['slippage_coverage']*100:.0f}% of "
+                          f"notional has a recorded decision price)",
+                          f"  TOTAL      {bp(t['total_cost_bp'], 0)} bp"]
+                if report["round_trips"]:
+                    lines += ["", "ROUND TRIPS:", "-" * 86,
+                              f"  {'sym':<6}{'qty':>7}{'buy':>11}{'sell':>11}"
+                              f"{'gross':>12}{'comm':>9}{'net':>12}"]
+                    for r in report["round_trips"]:
+                        lines.append(
+                            f"  {r['symbol']:<6}{r['qty']:>7.0f}"
+                            f"{r['buy_price']:>11.4f}{r['sell_price']:>11.4f}"
+                            f"{r['gross_pnl']:>12,.2f}{r['commission']:>9,.2f}"
+                            f"{r['net_pnl']:>12,.2f}")
+            lines.append(bar)
+            return CommandResult(
+                status=CommandStatus.SUCCESS,
+                message="\n".join(lines),
+                data=report,
+            )
+        except Exception as e:
+            logger.error(f"costs command failed: {e}")
+            return CommandResult(status=CommandStatus.ERROR,
+                                 message=f"Cost report failed: {e}")
 
     def handle_commissions(self, args: List[str]):
         """Handle 'commissions' command - request FRESH commission data from IB.

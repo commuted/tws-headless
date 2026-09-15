@@ -390,6 +390,12 @@ class OrderRecord:
     filled_time: str = ""
     error_message: str = ""
     why_held: str = ""  # populated from IB orderStatus whyHeld field
+    # Price the strategy saw when it decided to trade. Set at placement and
+    # carried to the execution record, because IB's fill report has no notion
+    # of why we traded and the decision price is gone by the time it arrives.
+    # Slippage (fill vs decision) is usually the larger half of trading cost;
+    # commission is the half that is knowable from the fill alone.
+    decision_price: Optional[float] = None
 
     @property
     def is_complete(self) -> bool:

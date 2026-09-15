@@ -35,6 +35,11 @@ class ExecutionRecord:
     timestamp: datetime
     account: str = ""
     local_symbol: str = ""
+    # Price the strategy saw when it decided to trade, captured at placement.
+    # Without it a fill can only be compared to itself: commission is knowable
+    # from the fill alone, but slippage — usually the larger cost — needs the
+    # decision price, and it is gone by the time the execution arrives.
+    decision_price: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -51,6 +56,7 @@ class ExecutionRecord:
             "timestamp": self.timestamp.isoformat(),
             "account": self.account,
             "local_symbol": self.local_symbol,
+            "decision_price": self.decision_price,
         }
 
 
@@ -120,9 +126,18 @@ class ExecutionDatabase:
                     side TEXT NOT NULL,
                     account TEXT,
                     timestamp TEXT NOT NULL,
+                    decision_price REAL,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            # Migration for databases created before decision_price existed.
+            # ADD COLUMN is cheap and non-rewriting in SQLite; existing rows
+            # read NULL, which the report renders as "unknown" rather than
+            # pretending the slippage was zero.
+            cols = {r[1] for r in cursor.execute("PRAGMA table_info(executions)")}
+            if "decision_price" not in cols:
+                cursor.execute("ALTER TABLE executions ADD COLUMN decision_price REAL")
 
             # Commissions table
             cursor.execute("""
@@ -183,8 +198,9 @@ class ExecutionDatabase:
                 cursor.execute("""
                     INSERT OR IGNORE INTO executions
                     (exec_id, order_id, symbol, sec_type, exchange, currency,
-                     local_symbol, shares, cum_qty, avg_price, side, account, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     local_symbol, shares, cum_qty, avg_price, side, account,
+                     timestamp, decision_price)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     execution.exec_id,
                     execution.order_id,
@@ -199,6 +215,7 @@ class ExecutionDatabase:
                     execution.side,
                     execution.account,
                     execution.timestamp.isoformat(),
+                    execution.decision_price,
                 ))
                 conn.commit()
 
@@ -454,6 +471,148 @@ class ExecutionDatabase:
         except Exception as e:
             logger.error(f"Failed to get total commission: {e}")
             return 0.0
+
+    def get_cost_report(
+        self,
+        symbol: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Trading cost broken into its parts, per order and in aggregate.
+
+        get_commission_report answers "what were the fees". That is only half
+        the cost and usually the smaller half, and it sits next to realized
+        P&L — which is not a cost at all, and on a seeded position dwarfs the
+        fees by three orders of magnitude. Read for cost signal, that report
+        misleads.
+
+        This separates:
+
+          commission  knowable from the fill alone, normalised to bp of
+                      notional so it can be compared against an edge. The raw
+                      dollar figure hides that a per-order minimum makes a
+                      small fill several times more expensive than a large one.
+          slippage    fill against the price the strategy decided at, signed
+                      so positive always means it cost money: a buy filled
+                      above the decision price, or a sell filled below.
+
+        Orders placed before decision_price was recorded report slippage as
+        None rather than zero — unknown and free are different claims.
+
+        Round trips pair each closing fill against the open it closes, FIFO
+        per symbol, so gross P&L can be stated next to the cost of achieving
+        it. A position transferred in rather than bought has no opening fill
+        and is reported as an unmatched close.
+        """
+        rows = self._cost_rows(symbol, start_date, end_date)
+        orders: Dict[int, Dict[str, Any]] = {}
+        for r in rows:
+            o = orders.setdefault(r["order_id"], {
+                "order_id": r["order_id"], "symbol": r["symbol"],
+                "side": r["side"], "timestamp": r["timestamp"],
+                "shares": 0.0, "notional": 0.0, "commission": 0.0,
+                "decision_price": r["decision_price"], "fills": 0,
+            })
+            o["shares"] += r["shares"]
+            o["notional"] += r["shares"] * r["avg_price"]
+            o["commission"] += r["commission"] or 0.0
+            o["fills"] += 1
+            if o["decision_price"] is None:
+                o["decision_price"] = r["decision_price"]
+
+        out: List[Dict[str, Any]] = []
+        for o in sorted(orders.values(), key=lambda x: x["timestamp"]):
+            n = o["notional"]
+            o["avg_price"] = n / o["shares"] if o["shares"] else 0.0
+            o["commission_bp"] = (o["commission"] / n * 1e4) if n else None
+            dp = o["decision_price"]
+            if dp:
+                sign = 1.0 if o["side"] == "BOT" else -1.0
+                o["slippage_bp"] = sign * (o["avg_price"] - dp) / dp * 1e4
+            else:
+                o["slippage_bp"] = None
+            o["total_cost_bp"] = (
+                (o["commission_bp"] or 0.0) + o["slippage_bp"]
+                if o["slippage_bp"] is not None else None)
+            out.append(o)
+
+        tot_n = sum(o["notional"] for o in out)
+        tot_c = sum(o["commission"] for o in out)
+        known = [o for o in out if o["slippage_bp"] is not None]
+        slip_n = sum(o["notional"] for o in known)
+        slip_bp = (sum(o["slippage_bp"] * o["notional"] for o in known) / slip_n
+                   if slip_n else None)
+        return {
+            "orders": out,
+            "round_trips": self._round_trips(out),
+            "totals": {
+                "notional": tot_n,
+                "commission": tot_c,
+                "commission_bp": (tot_c / tot_n * 1e4) if tot_n else None,
+                "slippage_bp": slip_bp,
+                "slippage_coverage": (slip_n / tot_n) if tot_n else 0.0,
+                "total_cost_bp": ((tot_c / tot_n * 1e4) + slip_bp)
+                                 if (tot_n and slip_bp is not None) else None,
+                "order_count": len(out),
+            },
+        }
+
+    def _cost_rows(self, symbol, start_date, end_date) -> List[Dict[str, Any]]:
+        where, params = ["1=1"], []
+        if symbol:
+            where.append("(e.symbol = ? OR e.local_symbol = ?)")
+            params.extend([symbol, symbol])
+        if start_date:
+            where.append("e.timestamp >= ?")
+            params.append(start_date.isoformat())
+        if end_date:
+            where.append("e.timestamp <= ?")
+            params.append(end_date.isoformat())
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute(
+                f"""select e.order_id, e.symbol, e.side, e.shares, e.avg_price,
+                           e.timestamp, e.decision_price, c.commission
+                    from executions e
+                    left join commissions c on c.exec_id = e.exec_id
+                    where {' and '.join(where)}
+                    order by e.timestamp""", params)]
+
+    @staticmethod
+    def _round_trips(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """FIFO-match closes against opens, per symbol."""
+        books: Dict[str, List[Dict[str, Any]]] = {}
+        trips: List[Dict[str, Any]] = []
+        for o in orders:
+            book = books.setdefault(o["symbol"], [])
+            opposite = [x for x in book if x["side"] != o["side"]]
+            qty = o["shares"]
+            if not opposite:
+                book.append(dict(o, remaining=qty))
+                continue
+            while qty > 0 and opposite:
+                open_o = opposite[0]
+                take = min(qty, open_o["remaining"])
+                buy, sell = ((open_o, o) if open_o["side"] == "BOT"
+                             else (o, open_o))
+                gross = (sell["avg_price"] - buy["avg_price"]) * take
+                comm = (open_o["commission"] * take / open_o["shares"]
+                        + o["commission"] * take / o["shares"])
+                trips.append({
+                    "symbol": o["symbol"], "qty": take,
+                    "opened": open_o["timestamp"], "closed": o["timestamp"],
+                    "buy_price": buy["avg_price"], "sell_price": sell["avg_price"],
+                    "gross_pnl": gross, "commission": comm,
+                    "net_pnl": gross - comm,
+                })
+                qty -= take
+                open_o["remaining"] -= take
+                if open_o["remaining"] <= 0:
+                    book.remove(open_o)
+                    opposite.pop(0)
+            if qty > 0:
+                book.append(dict(o, remaining=qty))
+        return trips
 
     def get_commission_report(
         self,

@@ -22,6 +22,8 @@ Usage:
     ./ibctl.py account --json                  # ...as JSON
     ./ibctl.py commissions                     # Commission and fee report
     ./ibctl.py commissions --symbol GLD --days 30 --json
+    ./ibctl.py costs                           # Cost broken into slippage + commission
+    ./ibctl.py costs --symbol GLD --days 30 --json
     ./ibctl.py reconcile                       # Sync plugin holdings with IB account
 
     # Simple orders (market only)
@@ -1077,6 +1079,10 @@ Commands:
   Account-level (the IB account itself, not plugin ledgers):
   account [--json]     IB account values, including every raw tag IB sent
   commissions [--symbol SYM] [--days N] [--json]
+  costs [--symbol SYM] [--days N] [--json]
+                       Trading cost per order: slippage vs the decision price
+                       and commission, both in bp of notional, plus FIFO round
+                       trips. Local database only — no round trip to IB.
                        Commission and fee report, with a per-symbol breakdown
 
   STATE snapshots (local — no running engine required):

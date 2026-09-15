@@ -1381,7 +1381,8 @@ class Portfolio(IBClient):
         self._next_order_id += count
         return list(range(start_id, start_id + count))
 
-    def place_order_raw(self, order_id: int, contract: Contract, order: Order) -> bool:
+    def place_order_raw(self, order_id: int, contract: Contract, order: Order,
+                        decision_price: Optional[float] = None) -> bool:
         """
         Place a pre-allocated order, registering it for status tracking.
 
@@ -1414,6 +1415,7 @@ class Portfolio(IBClient):
             quantity=float(order.totalQuantity),
             order_type=order.orderType,
             submitted_time=datetime.now().isoformat(),
+            decision_price=decision_price,
         )
         completion_event = asyncio.Event()
         self._orders[order_id] = record
@@ -1433,7 +1435,8 @@ class Portfolio(IBClient):
             completion_event.set()
             return False
 
-    def place_order_custom(self, contract: Contract, order: Order) -> Optional[int]:
+    def place_order_custom(self, contract: Contract, order: Order,
+                           decision_price: Optional[float] = None) -> Optional[int]:
         """
         Place an arbitrary Order object, allocating the next order ID.
 
@@ -1453,7 +1456,8 @@ class Portfolio(IBClient):
             return None
         order_id = ids[0]
         order.orderId = order_id
-        return order_id if self.place_order_raw(order_id, contract, order) else None
+        return order_id if self.place_order_raw(
+            order_id, contract, order, decision_price) else None
 
     def check_short_selling_permitted(
         self, contract: Contract, quantity: int, timeout: float = 15.0
@@ -2518,6 +2522,12 @@ class Portfolio(IBClient):
                 side=execution.side,  # BOT or SLD
                 account=execution.acctNumber or "",
                 timestamp=_parse_ib_exec_time(execution.time),
+                # Recovered from the order this fill belongs to. IB's
+                # execution report has no notion of why we traded, so the
+                # decision price has to be carried forward from placement or
+                # the fill can only ever be compared with itself.
+                decision_price=getattr(
+                    self._orders.get(execution.orderId), "decision_price", None),
             )
 
             db = get_execution_db()

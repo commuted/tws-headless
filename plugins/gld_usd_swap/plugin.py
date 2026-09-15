@@ -1645,7 +1645,8 @@ class GldUsdSwapPlugin(PluginBase):
         order.tif              = "DAY"
         order.transmit         = True
 
-        oid = self.portfolio.place_order_custom(contract, order)
+        oid = self.portfolio.place_order_custom(
+            contract, order, decision_price=self._gld_price)
         if oid is not None:
             self._record_trade(now)
             self._pending_order_actions[oid] = "BUY"
@@ -1686,7 +1687,8 @@ class GldUsdSwapPlugin(PluginBase):
         order.tif           = "DAY"
         order.transmit      = True
 
-        oid = self.portfolio.place_order_custom(contract, order)
+        oid = self.portfolio.place_order_custom(
+            contract, order, decision_price=self._gld_price)
         if oid is not None:
             self._record_trade(now)
             self._pending_order_actions[oid] = "SELL"
@@ -1733,7 +1735,8 @@ class GldUsdSwapPlugin(PluginBase):
         order.tif              = "DAY"
         order.transmit         = True
 
-        oid = self.portfolio.place_order_custom(contract, order)
+        oid = self.portfolio.place_order_custom(
+            contract, order, decision_price=self._gld_price)
         if oid is not None:
             self._record_trade(now)
             self._pending_order_actions[oid] = "SHORT_OPEN"
@@ -1776,7 +1779,8 @@ class GldUsdSwapPlugin(PluginBase):
         order.tif           = "DAY"
         order.transmit      = True
 
-        oid = self.portfolio.place_order_custom(contract, order)
+        oid = self.portfolio.place_order_custom(
+            contract, order, decision_price=self._gld_price)
         if oid is not None:
             self._record_trade(now)
             self._pending_order_actions[oid] = "SHORT_COVER"
@@ -1822,7 +1826,8 @@ class GldUsdSwapPlugin(PluginBase):
         order.tif              = "DAY"
         order.transmit         = True
 
-        oid = self.portfolio.place_order_custom(contract, order)
+        oid = self.portfolio.place_order_custom(
+            contract, order, decision_price=self._gll_price)
         if oid is not None:
             self._record_trade(now)
             self._pending_order_actions[oid] = "GLL_OPEN"
@@ -1866,7 +1871,8 @@ class GldUsdSwapPlugin(PluginBase):
         order.tif           = "DAY"
         order.transmit      = True
 
-        oid = self.portfolio.place_order_custom(contract, order)
+        oid = self.portfolio.place_order_custom(
+            contract, order, decision_price=self._gll_price)
         if oid is not None:
             self._record_trade(now)
             self._pending_order_actions[oid] = "GLL_CLOSE"
