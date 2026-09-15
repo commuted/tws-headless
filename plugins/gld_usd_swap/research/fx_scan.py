@@ -20,6 +20,12 @@ The two cost models differ by execution, and the answer flips between them:
           model for a system that already trades MOC. It does NOT include
           auction imbalance slippage, which is not measured here.
 
+REFUTED by long_history.py — read that before acting on anything here.
+On 1,766 sessions from 2016 and 2,533 from 2007 the effect is absent:
+six of seven legs turn negative and Westfall-Young gives adjusted
+p = 0.55 and 0.88. The result below lives almost entirely in 2024,
+which is the only period 5-minute bars reach.
+
 First run (347 no-hold days, 2024-08-23 .. 2026-09-11): all eight legs positive,
 UUP t=2.01 and FXY t=2.12, neither surviving Bonferroni across six currency
 legs. Negative under CROSS, positive under AUCTION.

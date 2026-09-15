@@ -34,6 +34,12 @@ round-trip floor at $100k. That makes the edge an increasing function of
 size — the opposite of the ETF, where cost was size-independent and the
 trade never cleared its spread.
 
+REFUTED by long_history.py — read that before acting on anything here.
+On 1,766 sessions from 2016 and 2,533 from 2007 the effect is absent:
+six of seven legs turn negative and Westfall-Young gives adjusted
+p = 0.55 and 0.88. The result below lives almost entirely in 2024,
+which is the only period 5-minute bars reach.
+
 CAVEATS. t=2.38 does not survive Bonferroni across the six currency legs
 already searched. Two years, one pair, one regime — USDJPY spent much of
 this sample in a persistent carry environment. Cost precision does not fix
