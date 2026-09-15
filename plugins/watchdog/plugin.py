@@ -112,6 +112,26 @@ class WatchdogPlugin(PluginBase):
         self.auto_remediate_stale_feeds:  bool  = True
         self.remediation_cooldown_seconds: float = 900.0  # min gap between nudges
 
+        # Pre-open feed refresh. A subscription created while the market is
+        # shut can stay silent until something re-creates it: on 2026-09-15
+        # the IB Gateway nightly restart (02:45 ET) dropped the connection,
+        # the engine reconnected within 15s and re-subscribed — and those
+        # subscriptions delivered nothing for 405 minutes. rth_only kept the
+        # staleness check quiet until 09:30, so the repair landed in the same
+        # second as the open decision. Nothing was lost only because the
+        # plugin happened to be flat; holding GLD, the open sell would have
+        # been skipped, since the 09:30 bar arrives as backfill during a
+        # resubscribe and backfill can never trigger a session decision.
+        #
+        # So refresh once per session, shortly BEFORE the declared window
+        # opens, rather than waiting for staleness to be provable. It is one
+        # cheap resubscribe a day against losing a session's first decision.
+        # Deliberately unconditional: pre-market silence is indistinguishable
+        # from a dead feed by bar arrival alone, so testing for staleness
+        # first would either miss the fault or fire every morning anyway.
+        self.preopen_refresh_enabled:      bool  = True
+        self.preopen_refresh_lead_minutes: float = 15.0
+
         # Escalation past resubscription, in two further tiers of
         # increasing cost. Both off by default: each bounces something live
         # unattended and should be turned on deliberately, not inherited
@@ -165,6 +185,7 @@ class WatchdogPlugin(PluginBase):
         self._last_reconcile: float = 0.0
         self._last_check_at: Optional[str] = None
         self._last_remediation: float = 0.0
+        self._preopen_refresh_date: Optional[str] = None
         self._remediations: int = 0
         self._stale_since: Optional[float] = None   # epoch; None = currently healthy
         self._last_reconnect: float = 0.0
@@ -198,6 +219,8 @@ class WatchdogPlugin(PluginBase):
             self.rth_only                   = saved.get("rth_only",                   self.rth_only)
             self.webhook_url                = saved.get("webhook_url",                self.webhook_url)
             self.auto_remediate_stale_feeds  = saved.get("auto_remediate_stale_feeds",  self.auto_remediate_stale_feeds)
+            self.preopen_refresh_enabled      = saved.get("preopen_refresh_enabled",      self.preopen_refresh_enabled)
+            self.preopen_refresh_lead_minutes = saved.get("preopen_refresh_lead_minutes", self.preopen_refresh_lead_minutes)
             self.remediation_cooldown_seconds = saved.get("remediation_cooldown_seconds", self.remediation_cooldown_seconds)
             self.auto_reconnect_on_stale    = saved.get("auto_reconnect_on_stale",    self.auto_reconnect_on_stale)
             self.reconnect_in_session_timeout_seconds = saved.get(
@@ -255,6 +278,8 @@ class WatchdogPlugin(PluginBase):
             "webhook_url":                self.webhook_url,
             "auto_remediate_stale_feeds":  self.auto_remediate_stale_feeds,
             "remediation_cooldown_seconds": self.remediation_cooldown_seconds,
+            "preopen_refresh_enabled":      self.preopen_refresh_enabled,
+            "preopen_refresh_lead_minutes": self.preopen_refresh_lead_minutes,
             "auto_reconnect_on_stale":     self.auto_reconnect_on_stale,
             "reconnect_in_session_timeout_seconds": self.reconnect_in_session_timeout_seconds,
             "reconnect_off_hours_timeout_seconds":  self.reconnect_off_hours_timeout_seconds,
@@ -310,11 +335,71 @@ class WatchdogPlugin(PluginBase):
             "reconciled":    self._maybe_reconcile(),
             "checked_at":    self._last_check_at,
         }
-        # Independent of rth_only: escalation needs to keep evaluating
-        # around the clock (with its own, separate off-hours timeout) even
-        # when the ordinary alert/remediation path above is RTH-gated.
+        # Both of these run regardless of rth_only. Escalation needs to keep
+        # evaluating around the clock (with its own off-hours timeout), and
+        # the pre-open refresh exists precisely because rth_only hides the
+        # window it covers.
         self._check_stale_feed_escalation()
+        summary["preopen_refresh"] = self._maybe_preopen_refresh()
         return summary
+
+    def _session_start(self, now: Optional[datetime] = None) -> Optional[dt_time]:
+        """Earliest declared session start for today, or the RTH fallback.
+
+        Uses the same PluginBase.trading_hours() union as _in_session, so a
+        plugin that wants its feeds warm earlier says so once, in its own
+        declaration, rather than the watchdog hardcoding a second calendar.
+        gld_usd_swap declares 09:15, ahead of its 09:30 open decision.
+        """
+        windows = None
+        if self._executive:
+            try:
+                windows = self._executive.aggregate_trading_windows()
+            except Exception as e:
+                logger.error(f"Watchdog: aggregate_trading_windows() failed: {e}")
+        if not windows:
+            windows = _DEFAULT_SESSION_WINDOW
+        return min(start for start, _ in windows) if windows else None
+
+    def _maybe_preopen_refresh(self, now: Optional[datetime] = None) -> Optional[Dict]:
+        """Once per session, just before the declared window, ask plugins to
+        re-create their live-bar subscriptions so they are warm at the open.
+
+        Returns a summary dict when it fires, else None."""
+        if not self.preopen_refresh_enabled or not self._executive:
+            return None
+        now = now or datetime.now(_NY)
+        if now.weekday() >= 5:
+            return None
+        start = self._session_start(now)
+        if start is None:
+            return None
+
+        today = now.date().isoformat()
+        if self._preopen_refresh_date == today:
+            return None
+
+        start_min = start.hour * 60 + start.minute
+        fire_at = start_min - self.preopen_refresh_lead_minutes
+        cur = now.hour * 60 + now.minute
+        # Only in the lead-in window. Past the session start the ordinary
+        # staleness path owns the problem, and firing then would cancel
+        # subscriptions that are legitimately mid-session.
+        if not (fire_at <= cur < start_min):
+            return None
+
+        self._preopen_refresh_date = today
+        try:
+            notified = self._executive.request_feed_resubscription(
+                "watchdog: pre-open refresh")
+            logger.info(
+                f"Watchdog pre-open refresh at {now:%H:%M} ET "
+                f"({self.preopen_refresh_lead_minutes:.0f} min before "
+                f"{start:%H:%M}): resubscription requested from {notified}")
+            return {"at": now.isoformat(), "notified": notified}
+        except Exception as e:
+            logger.error(f"Watchdog pre-open refresh failed: {e}")
+            return None
 
     def _check_feed_staleness(self) -> List[Dict]:
         """Alert once per keepUpToDate feed that has gone silent during RTH."""
@@ -807,6 +892,11 @@ class WatchdogPlugin(PluginBase):
                     else value.strip().lower() in ("1", "true", "yes", "on")
             elif key == "remediation_cooldown_seconds":
                 self.remediation_cooldown_seconds = max(60.0, float(value))
+            elif key == "preopen_refresh_enabled":
+                self.preopen_refresh_enabled = bool(value) if not isinstance(value, str) \
+                    else value.strip().lower() in ("1", "true", "yes", "on")
+            elif key == "preopen_refresh_lead_minutes":
+                self.preopen_refresh_lead_minutes = max(0.0, min(120.0, float(value)))
             elif key == "webhook_url":
                 url = str(value).strip()
                 if url and not url.startswith(("http://", "https://")):

@@ -3,7 +3,7 @@ Unit tests for plugins/watchdog/plugin.py
 """
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
@@ -246,6 +246,122 @@ def _order(order_id, minutes_old, symbol="GLD", action="BUY"):
         quantity=40.0, order_type="MOC",
         submitted_time=(datetime.now() - timedelta(minutes=minutes_old)).isoformat(),
     )
+
+
+class TestPreOpenRefresh:
+    """Once-per-session refresh ahead of the declared window.
+
+    The incident: on 2026-09-15 the IB Gateway nightly restart at 02:45 ET
+    dropped the connection, the engine re-subscribed within 15s, and those
+    subscriptions delivered nothing for 405 minutes. rth_only kept the
+    staleness check silent until 09:30, so the repair landed in the same
+    second as the open decision — and a resubscribe delivers backfill, which
+    can never trigger a session decision. Flat that day, so nothing was lost;
+    holding GLD, the open sell would have been skipped.
+    """
+
+    def _plugin(self, tmp_path, window=(dt_time(9, 15), dt_time(16, 0))):
+        plugin = _make_plugin(tmp_path)
+        ex = Mock()
+        ex.aggregate_trading_windows.return_value = [window]
+        ex.request_feed_resubscription.return_value = ["gld_usd_swap"]
+        plugin.set_executive(ex)
+        return plugin, ex
+
+    def test_fires_in_the_lead_window(self, tmp_path):
+        plugin, ex = self._plugin(tmp_path)          # 09:15 start, 15 min lead
+        out = plugin._maybe_preopen_refresh(datetime(2026, 9, 15, 9, 5, tzinfo=_NY))
+        assert out is not None
+        ex.request_feed_resubscription.assert_called_once()
+
+    def test_silent_before_the_lead_window(self, tmp_path):
+        plugin, ex = self._plugin(tmp_path)
+        assert plugin._maybe_preopen_refresh(
+            datetime(2026, 9, 15, 8, 30, tzinfo=_NY)) is None
+        ex.request_feed_resubscription.assert_not_called()
+
+    def test_silent_once_the_session_has_opened(self, tmp_path):
+        """Past the window start the staleness path owns it; firing here
+        would cancel subscriptions that are legitimately mid-session."""
+        plugin, ex = self._plugin(tmp_path)
+        assert plugin._maybe_preopen_refresh(
+            datetime(2026, 9, 15, 10, 0, tzinfo=_NY)) is None
+        ex.request_feed_resubscription.assert_not_called()
+
+    def test_fires_only_once_per_session(self, tmp_path):
+        plugin, ex = self._plugin(tmp_path)
+        t = datetime(2026, 9, 15, 9, 5, tzinfo=_NY)
+        assert plugin._maybe_preopen_refresh(t) is not None
+        assert plugin._maybe_preopen_refresh(t) is None
+        assert plugin._maybe_preopen_refresh(
+            t.replace(minute=10)) is None
+        assert ex.request_feed_resubscription.call_count == 1
+
+    def test_fires_again_the_next_day(self, tmp_path):
+        plugin, ex = self._plugin(tmp_path)
+        assert plugin._maybe_preopen_refresh(
+            datetime(2026, 9, 15, 9, 5, tzinfo=_NY)) is not None
+        assert plugin._maybe_preopen_refresh(
+            datetime(2026, 9, 16, 9, 5, tzinfo=_NY)) is not None
+        assert ex.request_feed_resubscription.call_count == 2
+
+    def test_not_on_weekends(self, tmp_path):
+        plugin, ex = self._plugin(tmp_path)
+        assert plugin._maybe_preopen_refresh(
+            datetime(2026, 9, 19, 9, 5, tzinfo=_NY)) is None   # Saturday
+        ex.request_feed_resubscription.assert_not_called()
+
+    def test_tracks_the_declared_window_not_a_hardcoded_clock(self, tmp_path):
+        """A plugin that wants its feeds warm earlier says so in its own
+        trading_hours(); the watchdog must not carry a second calendar."""
+        plugin, ex = self._plugin(tmp_path, window=(dt_time(8, 0), dt_time(16, 0)))
+        assert plugin._maybe_preopen_refresh(
+            datetime(2026, 9, 15, 9, 5, tzinfo=_NY)) is None   # session already open
+        assert plugin._maybe_preopen_refresh(
+            datetime(2026, 9, 15, 7, 50, tzinfo=_NY)) is not None
+
+    def test_falls_back_to_rth_when_nothing_declares(self, tmp_path):
+        plugin, ex = self._plugin(tmp_path)
+        ex.aggregate_trading_windows.return_value = None       # nobody declared
+        assert plugin._maybe_preopen_refresh(
+            datetime(2026, 9, 15, 9, 20, tzinfo=_NY)) is not None   # 09:30 - 15
+
+    def test_disabled_does_nothing(self, tmp_path):
+        plugin, ex = self._plugin(tmp_path)
+        plugin.preopen_refresh_enabled = False
+        assert plugin._maybe_preopen_refresh(
+            datetime(2026, 9, 15, 9, 5, tzinfo=_NY)) is None
+        ex.request_feed_resubscription.assert_not_called()
+
+    def test_no_executive_is_safe(self, tmp_path):
+        plugin = _make_plugin(tmp_path)
+        plugin._executive = None
+        assert plugin._maybe_preopen_refresh(
+            datetime(2026, 9, 15, 9, 5, tzinfo=_NY)) is None
+
+    def test_resubscription_failure_is_contained(self, tmp_path):
+        plugin, ex = self._plugin(tmp_path)
+        ex.request_feed_resubscription.side_effect = RuntimeError("boom")
+        assert plugin._maybe_preopen_refresh(
+            datetime(2026, 9, 15, 9, 5, tzinfo=_NY)) is None
+
+    def test_lead_minutes_is_configurable(self, tmp_path):
+        plugin, ex = self._plugin(tmp_path)
+        plugin.preopen_refresh_lead_minutes = 45
+        assert plugin._maybe_preopen_refresh(
+            datetime(2026, 9, 15, 8, 40, tzinfo=_NY)) is not None
+
+    def test_settings_survive_a_restart(self, tmp_path):
+        plugin, _ = self._plugin(tmp_path)
+        plugin.start()
+        plugin.preopen_refresh_enabled = False
+        plugin.preopen_refresh_lead_minutes = 30
+        plugin.stop()
+        again = _make_plugin(tmp_path)
+        again.start()
+        assert again.preopen_refresh_enabled is False
+        assert again.preopen_refresh_lead_minutes == 30
+        again.stop()
 
 
 class TestStuckOrders:
