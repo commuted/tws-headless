@@ -2194,7 +2194,15 @@ class EngineCommandHandler:
         if contract_type == "stock":
             contract = ContractBuilder.us_stock(symbol)
         elif contract_type == "forex":
-            contract = ContractBuilder.forex(symbol)
+            # SYMBOL is a pair: "EUR.USD", "USD.JPY", or bare "EUR" meaning
+            # EUR.USD. This used to pass the bare symbol straight through as
+            # the only argument, which raised TypeError for every forex fetch
+            # ever attempted (quote_currency has no default) — and even had it
+            # worked, there would have been no way to name USD.JPY, where USD
+            # is the base. The full pair is what reaches BarStore as the series
+            # symbol, so EUR.USD and USD.JPY cannot collide.
+            base, _, quote = symbol.partition(".")
+            contract = ContractBuilder.forex(base, quote or "USD")
         else:
             contract = ContractBuilder.etf(symbol)
 

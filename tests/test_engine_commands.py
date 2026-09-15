@@ -1146,3 +1146,43 @@ class TestEnginePluginDump:
         assert "#101" in result.message
         assert "BUY" in result.message
         assert "QQQ" in result.message
+
+
+# ---------------------------------------------------------------------------
+# historical fetch --type forex: pair parsing
+# ---------------------------------------------------------------------------
+
+class TestForexPairParsing:
+    """`historical fetch X --type forex` raised TypeError for every call it
+    ever received: ContractBuilder.forex has no default quote_currency and
+    run_engine passed only the symbol. The example in ibctl's own help text
+    had never worked. A bare symbol now means <SYM>.USD, and an explicit pair
+    is honoured — which is the only way to name USD.JPY, where USD is base."""
+
+    from ib.contract_builder import ContractBuilder
+
+    def _contract(self, symbol):
+        from ib.contract_builder import ContractBuilder
+        base, _, quote = symbol.partition(".")
+        return ContractBuilder.forex(base, quote or "USD")
+
+    def test_bare_symbol_means_versus_usd(self):
+        c = self._contract("EUR")
+        assert (c.symbol, c.currency, c.secType) == ("EUR", "USD", "CASH")
+
+    def test_explicit_pair_is_honoured(self):
+        c = self._contract("EUR.USD")
+        assert (c.symbol, c.currency) == ("EUR", "USD")
+
+    def test_usd_as_base_is_expressible(self):
+        """USD.JPY is the IDEALPRO convention; a base-only API cannot say it."""
+        c = self._contract("USD.JPY")
+        assert (c.symbol, c.currency) == ("USD", "JPY")
+
+    def test_builder_still_requires_both_legs(self):
+        """The bug was the caller, not the signature — keep it explicit so a
+        one-argument call stays a loud error rather than a silent USD guess."""
+        import pytest
+        from ib.contract_builder import ContractBuilder
+        with pytest.raises(TypeError):
+            ContractBuilder.forex("EUR")
