@@ -1,6 +1,8 @@
 
 # TWS Headless
 
+I made the repo private for a day and lost all my stars :(
+
 A headless, plugin-based algorithmic trading engine for Interactive Brokers. Connects to TWS or IB Gateway over the IB API, streams real-time market data, routes it to plugins, executes trade signals, and exposes a Unix socket command interface for external control.
 
 📖 **[Wiki](https://github.com/commuted/tws-headless/wiki)** — [Theory of Operation](https://github.com/commuted/tws-headless/wiki/Theory-of-Operation) · [CLI Task Guide](https://github.com/commuted/tws-headless/wiki/CLI) · [Plugin Design](https://github.com/commuted/tws-headless/wiki/Plugin-Design) · [Plugin Manual](https://github.com/commuted/tws-headless/wiki/Plugin-Manual) · [Bar Store](https://github.com/commuted/tws-headless/wiki/Bar-Store)
