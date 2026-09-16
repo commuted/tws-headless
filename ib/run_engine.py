@@ -212,6 +212,22 @@ Examples:
         help="Required to run immediate/queued (real) order modes against a LIVE account."
     )
     parser.add_argument(
+        "--operator-id", default=os.environ.get("IB_OPERATOR_ID"), metavar="ID",
+        help="IB operator ID stamped on every order this system places on its "
+             "own (Order.extOperator). IB requires every order message from an "
+             "automated system — placements, revisions, cancellations — to "
+             "identify the team or individual operating it. Defaults to "
+             "$IB_OPERATOR_ID. Never hardcode it: it identifies real people, "
+             "like the account id."
+    )
+    parser.add_argument(
+        "--manual-operator-id", default=os.environ.get("IB_MANUAL_OPERATOR_ID"),
+        metavar="ID",
+        help="Operator ID for orders a person initiates through ibctl (buy, "
+             "sell, trade, order, liquidate), as distinct from the automated "
+             "id above. Defaults to $IB_MANUAL_OPERATOR_ID."
+    )
+    parser.add_argument(
         "--account", default=None, metavar="ID",
         help="IB account to trade (e.g. U1234567). Scopes plugin state, holdings, "
              "the execution DB and the account tag on every order. Optional when "
@@ -579,6 +595,29 @@ def main():
         # Route every order to the resolved account rather than letting
         # placeOrder fall back to whichever one IB listed first.
         engine.portfolio.trading_account = account_id
+
+        # Operator identity. Stamped on every order message; see
+        # Portfolio.operator_id. Not fatal when absent — refusing to trade
+        # would be a new way for a misconfiguration to halt a working system —
+        # but loud, because an order message missing it is non-compliant and
+        # IB may reject it outright.
+        engine.portfolio.operator_id = args.operator_id
+        engine.portfolio.manual_operator_id = args.manual_operator_id
+        if args.operator_id:
+            logger.info(
+                f"Operator ID: automated={args.operator_id}, "
+                f"manual={args.manual_operator_id or 'UNSET'}")
+        else:
+            logger.critical(
+                "No operator ID configured (--operator-id / $IB_OPERATOR_ID). "
+                "IB requires every order message from an automated system to "
+                "carry one; orders will be sent without it and may be rejected."
+            )
+        if not args.manual_operator_id:
+            logger.warning(
+                "No manual operator ID (--manual-operator-id / "
+                "$IB_MANUAL_OPERATOR_ID) — orders placed through ibctl will "
+                "carry the automated id instead of identifying the person.")
         if engine.plugin_executive:
             engine.plugin_executive.set_account(account_id)
 
@@ -1466,6 +1505,7 @@ class EngineCommandHandler:
                         contract=pos.contract,
                         action="SELL",
                         quantity=pos.quantity,
+                        operator_id=portfolio.manual_operator_id,
                     )
                     if order_id:
                         order_ids.append(order_id)
@@ -1539,6 +1579,7 @@ class EngineCommandHandler:
             contract=pos.contract,
             action="SELL",
             quantity=quantity,
+            operator_id=portfolio.manual_operator_id,
         )
 
         if order_id:
@@ -1598,6 +1639,7 @@ class EngineCommandHandler:
             contract=contract,
             action="BUY",
             quantity=quantity,
+            operator_id=portfolio.manual_operator_id,
         )
 
         if order_id:
@@ -1669,6 +1711,7 @@ class EngineCommandHandler:
                 quantity=quantity,
                 reason=reason,
                 dry_run=dry_run,
+                operator_id=self.engine.portfolio.manual_operator_id,
             )
 
             if success:

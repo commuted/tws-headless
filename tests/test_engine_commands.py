@@ -40,6 +40,9 @@ class MockPortfolio:
     """Mock portfolio for testing"""
 
     def __init__(self):
+        # Operator identity, stamped on every order message.
+        self.operator_id = "AUTO-TEST"
+        self.manual_operator_id = "MANUAL-TEST"
         self.positions: List[MockPosition] = []
         self.total_value = 100000.0
         self.total_pnl = 5000.0
@@ -56,8 +59,10 @@ class MockPortfolio:
                 return p
         return None
 
-    def place_market_order(self, contract, action: str, quantity: float) -> Optional[int]:
+    def place_market_order(self, contract, action: str, quantity: float,
+                           operator_id: Optional[str] = None) -> Optional[int]:
         self._last_order_id += 1
+        self.last_operator_id = operator_id
         return self._last_order_id
 
 
@@ -144,6 +149,7 @@ class MockPluginExecutive:
         quantity: int,
         reason: str = "manual_trade",
         dry_run: bool = True,
+        operator_id: Optional[str] = None,
     ):
         self.execute_manual_trade_calls.append({
             "plugin_name": plugin_name,
@@ -152,6 +158,7 @@ class MockPluginExecutive:
             "quantity": quantity,
             "reason": reason,
             "dry_run": dry_run,
+            "operator_id": operator_id,
         })
 
         if plugin_name not in self._plugins:

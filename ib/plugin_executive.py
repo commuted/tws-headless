@@ -4079,6 +4079,7 @@ class PluginExecutive:
         quantity: int,
         reason: str = "manual_trade",
         dry_run: bool = True,
+        operator_id: Optional[str] = None,
     ) -> Tuple[bool, Optional[int], str]:
         """
         Execute a manual trade attributed to a specific plugin.
@@ -4185,6 +4186,9 @@ class PluginExecutive:
                     reconciled.action,
                     reconciled.net_quantity,
                     order_type="MKT",
+                    # Set only on the manual path; automated trades leave it
+                    # None and placeOrder fills in the system's own id.
+                    operator_id=operator_id,
                 )
 
                 if order_id:

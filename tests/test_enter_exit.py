@@ -1298,7 +1298,10 @@ class TestEnterExitCancelBracket:
 
         assert success is True
         assert oca_group not in ee._active_brackets
-        assert portfolio.cancelOrder.call_count == 3
+        # cancel_order, not the raw cancelOrder: it builds the OrderCancel
+        # that ibapi 10.37 requires and stamps the operator id on it. The old
+        # call passed a bare "" and would have raised.
+        assert portfolio.cancel_order.call_count == 3
 
     def test_cancel_bracket_unknown_group_fails(self):
         portfolio = make_mock_portfolio()

@@ -207,6 +207,38 @@ class TestResolveAccount:
 # run_engine --account
 # ---------------------------------------------------------------------------
 
+class TestRunEngineOperatorIdFlags:
+    """Operator IDs come from startup configuration, never from constants in
+    the tree — they identify real people and belong outside the repository,
+    like the account id."""
+
+    def _parse(self, argv, env=None):
+        import os
+        from unittest.mock import patch
+        from ib.run_engine import parse_args
+        with patch("sys.argv", ["run_engine"] + argv), \
+             patch.dict(os.environ, env or {}, clear=False):
+            return parse_args()
+
+    def test_flags_are_parsed(self):
+        args = self._parse(["--operator-id", "A1", "--manual-operator-id", "M1"])
+        assert (args.operator_id, args.manual_operator_id) == ("A1", "M1")
+
+    def test_absent_is_none_not_a_default(self):
+        """A baked-in fallback would put a real identifier in the tree, and
+        would also quietly mis-attribute orders to whoever it named."""
+        import os
+        from unittest.mock import patch
+        from ib.run_engine import parse_args
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("IB_OPERATOR_ID", "IB_MANUAL_OPERATOR_ID")}
+        with patch("sys.argv", ["run_engine", "--port", "4001"]), \
+             patch.dict(os.environ, clean, clear=True):
+            args = parse_args()
+        assert args.operator_id is None
+        assert args.manual_operator_id is None
+
+
 class TestRunEngineAccountFlag:
     """The flag that lets resolve_account be given an answer. The resolution
     logic itself is tested above; this covers the wiring that reaches it."""

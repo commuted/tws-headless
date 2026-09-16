@@ -122,6 +122,8 @@ def portfolio_instance(mock_ibapi):
         portfolio._callbacks = {}
         portfolio.managed_accounts = ["DU123456"]
         portfolio.trading_account = None
+        portfolio.operator_id = None
+        portfolio.manual_operator_id = None
         portfolio._historical_requests = {}
         portfolio._contract_details_requests = {}
         portfolio._shutting_down = False
@@ -1161,7 +1163,7 @@ class TestOrderFieldStamping:
 
     def _order(self, **kw):
         o = SimpleNamespace(action="BUY", totalQuantity=25, orderType="MOC",
-                            account="", tif="", transmit=True)
+                            account="", tif="", extOperator="", transmit=True)
         for k, v in kw.items():
             setattr(o, k, v)
         return o
@@ -1207,6 +1209,91 @@ class TestOrderFieldStamping:
     def test_no_managed_account_refuses_to_send(self, portfolio_instance):
         portfolio_instance.managed_accounts = []
         assert self._place(portfolio_instance, self._order()) == []
+
+
+class TestOperatorId:
+    """IB requires every order message from an automated trading system —
+    placements, revisions and cancellations — to carry the ID of the team or
+    individual operating it at the time. The field is Order.extOperator and
+    OrderCancel.extOperator (ibapi, MIN_SERVER_VER_EXT_OPERATOR = 105).
+
+    Two identities: anything the strategies place on their own is automated;
+    anything a person initiates through ibctl is manual. Both come from
+    startup configuration, never from constants in the tree — they identify
+    real people and belong with the account id, outside the repository.
+    """
+
+    AUTO, MANUAL = "AUTO-TEST", "MANUAL-TEST"
+
+    def _order(self, **kw):
+        o = SimpleNamespace(action="BUY", totalQuantity=10, orderType="MKT",
+                            account="ACCT", tif="DAY", extOperator="",
+                            transmit=True)
+        for k, v in kw.items():
+            setattr(o, k, v)
+        return o
+
+    def _sent(self, portfolio, order):
+        contract = MagicMock()
+        contract.symbol = "GLD"
+        out = []
+        with patch("portfolio.IBClient.placeOrder",
+                   lambda self, oid, c, o: out.append(o)):
+            portfolio.placeOrder(1, contract, order)
+        return out
+
+    def test_automated_orders_are_stamped(self, portfolio_instance):
+        portfolio_instance.operator_id = self.AUTO
+        order = self._order()
+        assert self._sent(portfolio_instance, order)
+        assert order.extOperator == self.AUTO
+
+    def test_a_caller_that_set_one_is_never_overwritten(self, portfolio_instance):
+        """The manual path identifies its own operator; the automated default
+        must not clobber a human's identity."""
+        portfolio_instance.operator_id = self.AUTO
+        order = self._order(extOperator=self.MANUAL)
+        assert self._sent(portfolio_instance, order)
+        assert order.extOperator == self.MANUAL
+
+    def test_unset_operator_leaves_the_field_empty(self, portfolio_instance):
+        """Absent configuration must not invent an identity."""
+        portfolio_instance.operator_id = None
+        order = self._order()
+        assert self._sent(portfolio_instance, order)
+        assert order.extOperator == ""
+
+    def test_place_order_passes_the_manual_id_through(self, portfolio_instance):
+        portfolio_instance.operator_id = self.AUTO
+        portfolio_instance._connected.set()
+        portfolio_instance._next_order_id = 100
+        portfolio_instance._lock = Lock()
+        sent = []
+        contract = MagicMock()
+        contract.symbol = "GLD"
+        with patch.object(portfolio_instance, "placeOrder",
+                          lambda oid, c, o: sent.append(o)):
+            portfolio_instance.place_order(contract, "BUY", 10,
+                                           operator_id=self.MANUAL)
+        assert sent and sent[0].extOperator == self.MANUAL
+
+    def test_cancellations_carry_the_operator_id(self, portfolio_instance):
+        portfolio_instance.operator_id = self.AUTO
+        portfolio_instance._connected.set()
+        cancels = []
+        with patch.object(portfolio_instance, "cancelOrder",
+                          lambda oid, c: cancels.append(c)):
+            portfolio_instance.cancel_order(7)
+        assert cancels and cancels[0].extOperator == self.AUTO
+
+    def test_manual_cancellation_uses_the_manual_id(self, portfolio_instance):
+        portfolio_instance.operator_id = self.AUTO
+        portfolio_instance._connected.set()
+        cancels = []
+        with patch.object(portfolio_instance, "cancelOrder",
+                          lambda oid, c: cancels.append(c)):
+            portfolio_instance.cancel_order(7, operator_id=self.MANUAL)
+        assert cancels and cancels[0].extOperator == self.MANUAL
 
 
 class TestTerminalRejectMarking:

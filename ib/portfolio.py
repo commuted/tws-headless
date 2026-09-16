@@ -199,6 +199,21 @@ class Portfolio(IBClient):
         # back to a sole managed account and refuses when there are several.
         self.trading_account: Optional[str] = None
 
+        # IB requires every order message from an automated trading system —
+        # placements, revisions and cancellations alike — to carry the ID of
+        # the team or individual operating the system at the time. The field
+        # is Order.extOperator / OrderCancel.extOperator (ibapi, gated by
+        # MIN_SERVER_VER_EXT_OPERATOR = 105).
+        #
+        # Two identities, because IB distinguishes who is at the controls:
+        # anything the strategies place on their own is automated; anything a
+        # person initiates through ibctl is manual. Both are set at startup
+        # from configuration and are deliberately NOT defaults in code — they
+        # identify real people and belong with the account id, outside the
+        # repository.
+        self.operator_id: Optional[str] = None          # automated
+        self.manual_operator_id: Optional[str] = None   # human via ibctl
+
         # Order tracking
         self._orders: Dict[int, OrderRecord] = {}  # orderId -> OrderRecord
         self._pending_orders: Dict[int, asyncio.Event] = {}  # orderId -> completion event
@@ -1219,6 +1234,12 @@ class Portfolio(IBClient):
         # explicitly and is left alone.
         if not getattr(order, "tif", ""):
             order.tif = "DAY"
+        # Operator ID. A caller that already set one has said which human or
+        # team is responsible — a manual order from ibctl does exactly that —
+        # so it is never overwritten here; everything else is the automated
+        # system acting on its own.
+        if not getattr(order, "extOperator", "") and self.operator_id:
+            order.extOperator = self.operator_id
         super().placeOrder(orderId, contract, order)
 
     @property
@@ -1244,6 +1265,7 @@ class Portfolio(IBClient):
         limit_price: float = 0.0,
         stop_price: float = 0.0,
         tif: str = "DAY",
+        operator_id: Optional[str] = None,
     ) -> Optional[int]:
         """
         Place an order through IB.
@@ -1290,6 +1312,10 @@ class Portfolio(IBClient):
             order.lmtPrice = limit_price
         if order_type in ("STP", "STP LMT"):
             order.auxPrice = stop_price
+        # Identifies a human-initiated order; placeOrder leaves it alone and
+        # only fills in the automated id when this is empty.
+        if operator_id:
+            order.extOperator = operator_id
 
         # Create order record for tracking
         order_record = OrderRecord(
@@ -1324,9 +1350,11 @@ class Portfolio(IBClient):
         contract: Contract,
         action: str,
         quantity: float,
+        operator_id: Optional[str] = None,
     ) -> Optional[int]:
         """Place a market order (convenience method)"""
-        return self.place_order(contract, action, quantity, order_type="MKT")
+        return self.place_order(contract, action, quantity, order_type="MKT",
+                                operator_id=operator_id)
 
     def place_limit_order(
         self,
@@ -1341,7 +1369,8 @@ class Portfolio(IBClient):
             order_type="LMT", limit_price=limit_price
         )
 
-    def cancel_order(self, order_id: int) -> bool:
+    def cancel_order(self, order_id: int,
+                     operator_id: Optional[str] = None) -> bool:
         """
         Cancel an order.
 
@@ -1356,7 +1385,11 @@ class Portfolio(IBClient):
 
         try:
             from ibapi.order_cancel import OrderCancel
-            self.cancelOrder(order_id, OrderCancel())
+            cancel = OrderCancel()
+            # A cancellation is an order message like any other and carries
+            # the same operator identity — see the note on self.operator_id.
+            cancel.extOperator = operator_id or self.operator_id or ""
+            self.cancelOrder(order_id, cancel)
             logger.info(f"Sent cancel request for order {order_id}")
             return True
         except Exception as e:
@@ -1382,7 +1415,8 @@ class Portfolio(IBClient):
         return list(range(start_id, start_id + count))
 
     def place_order_raw(self, order_id: int, contract: Contract, order: Order,
-                        decision_price: Optional[float] = None) -> bool:
+                        decision_price: Optional[float] = None,
+                        operator_id: Optional[str] = None) -> bool:
         """
         Place a pre-allocated order, registering it for status tracking.
 
@@ -1417,6 +1451,8 @@ class Portfolio(IBClient):
             submitted_time=datetime.now().isoformat(),
             decision_price=decision_price,
         )
+        if operator_id:
+            order.extOperator = operator_id
         completion_event = asyncio.Event()
         self._orders[order_id] = record
         self._pending_orders[order_id] = completion_event
@@ -1436,7 +1472,8 @@ class Portfolio(IBClient):
             return False
 
     def place_order_custom(self, contract: Contract, order: Order,
-                           decision_price: Optional[float] = None) -> Optional[int]:
+                           decision_price: Optional[float] = None,
+                           operator_id: Optional[str] = None) -> Optional[int]:
         """
         Place an arbitrary Order object, allocating the next order ID.
 
@@ -1457,7 +1494,7 @@ class Portfolio(IBClient):
         order_id = ids[0]
         order.orderId = order_id
         return order_id if self.place_order_raw(
-            order_id, contract, order, decision_price) else None
+            order_id, contract, order, decision_price, operator_id) else None
 
     def check_short_selling_permitted(
         self, contract: Contract, quantity: int, timeout: float = 15.0

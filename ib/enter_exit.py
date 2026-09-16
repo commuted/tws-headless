@@ -1011,7 +1011,11 @@ class EnterExit:
         for order_id in [bracket.get("parent_id"), bracket.get("profit_id"), bracket.get("stop_id")]:
             if order_id:
                 try:
-                    self.portfolio.cancelOrder(order_id, "")
+                    # cancel_order builds the OrderCancel and stamps the
+                    # operator id on it. This used to call cancelOrder with a
+                    # bare "" where ibapi 10.37 expects an OrderCancel, which
+                    # would raise on any attempt to cancel a bracket.
+                    self.portfolio.cancel_order(order_id)
                 except Exception as e:
                     logger.error(f"Failed to cancel order {order_id}: {e}")
                     success = False
