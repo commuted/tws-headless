@@ -66,6 +66,7 @@ Schema
 """
 
 import logging
+import re
 import sqlite3
 import threading
 from collections import namedtuple
@@ -132,20 +133,61 @@ _BAR_SECONDS = {
 # Helpers: bar date parsing
 # ---------------------------------------------------------------------------
 
+# "YYYYMMDD HH:MM:SS Area/Location" — separator is a space (legacy IB format)
+# or a hyphen (current). The timezone label is optional and may contain
+# underscores ("America/Los_Angeles") or three components ("America/
+# Argentina/Buenos_Aires").
+_BAR_DT_RE = re.compile(
+    r"^(\d{8})[ \-](\d{2}:\d{2}:\d{2})(?:\s+([A-Za-z_]+(?:/[A-Za-z_]+)+|UTC|GMT))?$"
+)
+
+# IB sends the legacy "US/*" spellings, which are backward-compatibility links
+# in tzdata and absent from slim installs — ZoneInfo("US/Eastern") raises on a
+# machine that has America/New_York perfectly well. Mapping them ourselves
+# keeps the commonest label off the unrecognised-zone warning path, which
+# would otherwise fire on the large majority of all bars.
+_TZ_ALIASES = {
+    "US/Eastern": "America/New_York",
+    "US/Central": "America/Chicago",
+    "US/Mountain": "America/Denver",
+    "US/Pacific": "America/Los_Angeles",
+    "GMT": "UTC",
+    "Etc/UTC": "UTC",
+    "Etc/GMT": "UTC",
+    "Africa/Abidjan": "UTC",   # IB's canonical spelling of UTC+0
+}
+
 def _parse_bar_dt(date_str: str) -> datetime:
     """
     Parse an IB bar date string to a UTC-aware datetime.
 
     Handles:
       "20240115"              daily bar   → midnight UTC that day
-      "20240115 09:30:00"     intraday, ET (legacy space separator)
-      "20240115-09:30:00"     intraday, ET (new hyphen separator)
-      "20240115 09:30:00 US/Eastern"  (suffix stripped)
+      "20240115 09:30:00"     intraday, no label (legacy space separator)
+      "20240115-09:30:00"     intraday, no label (new hyphen separator)
+      "20240115 09:30:00 US/Eastern"       labelled, and the label is USED
+      "20240115 13:30:00 Africa/Abidjan"   IB's spelling of UTC
+      "20240115 06:30:00 America/Los_Angeles"
 
-    Intraday bars from IB carry exchange-local time (US/Eastern).  The
-    conversion uses zoneinfo when available; falls back to a fixed UTC-5
-    offset when zoneinfo is absent (acceptable for backtesting, wrong for
-    DST boundary bars — install tzdata for full accuracy).
+    THE LABEL IS NOT DECORATION. This function used to strip the timezone
+    suffix and assume US/Eastern unconditionally, which is right only while
+    IB happens to send Eastern. It does not always: the zone IB stamps on a
+    bar follows the Gateway's configured timezone, so the same code on a
+    UTC host gets "Africa/Abidjan" and on a Pacific host "America/
+    Los_Angeles". Read as Eastern, those land 4 and 3 hours off, and a
+    misplaced 5-minute bar silently corrupts every moving average computed
+    over it.
+
+    This was found after migrating to a UTC host, with 1,081 Los_Angeles
+    and 312 Abidjan rows already in the cache, against 753,421 correct
+    Eastern ones — rare enough to hide for months, and concentrated in
+    exactly the symbols the strategies trade.
+
+    An unlabelled bar keeps the historical assumption of Eastern, which is
+    what IB's older format meant. An unrecognised label also falls back to
+    Eastern rather than failing, because refusing to parse a bar is worse
+    than placing one imperfectly, but it is logged: a new label appearing
+    is a thing worth knowing about.
     """
     s = date_str.strip()
 
@@ -153,9 +195,13 @@ def _parse_bar_dt(date_str: str) -> datetime:
     if len(s) == 8 and s.isdigit():
         return datetime(int(s[:4]), int(s[4:6]), int(s[6:8]), tzinfo=UTC)
 
-    # Intraday: extract "YYYYMMDD" and "HH:MM:SS" regardless of separator
-    date_part = s[:8]
-    time_part = s[9:17]
+    # "YYYYMMDD<sep>HH:MM:SS[ Area/Location]" — the separator is a space in
+    # IB's legacy format and a hyphen in the current one.
+    m = _BAR_DT_RE.match(s)
+    if m is None:
+        raise ValueError(f"unparseable IB bar date: {date_str!r}")
+    date_part, time_part, label = m.group(1), m.group(2), m.group(3)
+
     naive = datetime(
         int(date_part[:4]), int(date_part[4:6]), int(date_part[6:8]),
         int(time_part[:2]), int(time_part[3:5]), int(time_part[6:8]),
@@ -163,11 +209,26 @@ def _parse_bar_dt(date_str: str) -> datetime:
 
     try:
         from zoneinfo import ZoneInfo
-        et = ZoneInfo("America/New_York")
-        return naive.replace(tzinfo=et).astimezone(UTC)
+        if label:
+            try:
+                zone = ZoneInfo(_TZ_ALIASES.get(label, label))
+            except Exception:
+                logger.warning(
+                    "unrecognised timezone %r on IB bar %r — reading it as "
+                    "US/Eastern; if this repeats, the zone is real and needs "
+                    "handling", label, date_str,
+                )
+                zone = ZoneInfo("America/New_York")
+        else:
+            zone = ZoneInfo("America/New_York")
+        return naive.replace(tzinfo=zone).astimezone(UTC)
     except Exception:
-        # Fallback: treat as EST (UTC-5); off by 1 h during EDT
-        return naive.replace(tzinfo=timezone(timedelta(hours=-5))).astimezone(UTC)
+        # zoneinfo itself unavailable (no tzdata). Only the fixed offsets we
+        # can name without a database; anything else keeps the old EST guess.
+        fixed = {"Africa/Abidjan": 0, "UTC": 0, "Etc/UTC": 0}
+        hours = fixed.get(label, -5)
+        return naive.replace(
+            tzinfo=timezone(timedelta(hours=hours))).astimezone(UTC)
 
 
 def _dt_to_iso(dt: datetime) -> str:

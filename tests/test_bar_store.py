@@ -84,7 +84,6 @@ class TestParseBarDt:
         assert dt.minute == 30
 
     def test_intraday_with_timezone_suffix(self):
-        # Old format with trailing timezone — suffix stripped by positional slice
         dt = _parse_bar_dt("20240115 09:30:00 US/Eastern")
         assert dt.hour == 14
 
@@ -92,6 +91,65 @@ class TestParseBarDt:
         a = _parse_bar_dt("20240115 09:30:00")
         b = _parse_bar_dt("20240115-09:30:00")
         assert a == b
+
+    # -- the timezone label is data, not decoration --------------------------
+    # IB stamps each bar with the Gateway's configured zone, so the same code
+    # gets US/Eastern on one host and Africa/Abidjan (its spelling of UTC) or
+    # America/Los_Angeles on another. Reading those as Eastern puts the bar
+    # 4 or 3 hours from where it belongs, which silently corrupts every
+    # average computed over it. Found live after a host move, with 1,081
+    # Los_Angeles and 312 Abidjan rows already cached.
+
+    def test_utc_label_is_not_read_as_eastern(self):
+        # 13:30 UTC IS 13:30 UTC. Read as ET it would become 17:30.
+        dt = _parse_bar_dt("20240115 13:30:00 Africa/Abidjan")
+        assert (dt.hour, dt.minute) == (13, 30)
+
+    def test_pacific_label_is_not_read_as_eastern(self):
+        # 06:30 PST == 14:30 UTC. Read as ET it would become 11:30.
+        dt = _parse_bar_dt("20240115 06:30:00 America/Los_Angeles")
+        assert (dt.hour, dt.minute) == (14, 30)
+
+    def test_all_labels_for_one_instant_agree(self):
+        """The same moment, however IB chooses to spell it, is one instant."""
+        same = [
+            "20240115 09:30:00 US/Eastern",
+            "20240115 09:30:00 America/New_York",
+            "20240115 14:30:00 Africa/Abidjan",
+            "20240115 14:30:00 UTC",
+            "20240115 06:30:00 America/Los_Angeles",
+        ]
+        assert len({_parse_bar_dt(s) for s in same}) == 1
+
+    def test_legacy_us_alias_resolves_without_falling_back(self):
+        """US/Eastern is a tzdata compatibility link absent from slim installs.
+
+        It must resolve to the same instant as the canonical name rather than
+        reaching the unknown-zone fallback, which would be correct here only
+        by coincidence and would warn on the majority of all bars.
+        """
+        assert (_parse_bar_dt("20240715 09:30:00 US/Eastern")
+                == _parse_bar_dt("20240715 09:30:00 America/New_York"))
+
+    def test_unlabelled_still_means_eastern(self):
+        """IB's older format carried no zone and meant exchange-local."""
+        assert (_parse_bar_dt("20240115 09:30:00")
+                == _parse_bar_dt("20240115 09:30:00 US/Eastern"))
+
+    def test_dst_is_honoured_per_label(self):
+        # July is EDT (UTC-4); January is EST (UTC-5).
+        assert _parse_bar_dt("20240715 09:30:00 US/Eastern").hour == 13
+        assert _parse_bar_dt("20240115 09:30:00 US/Eastern").hour == 14
+
+    def test_unknown_zone_falls_back_rather_than_losing_the_bar(self):
+        dt = _parse_bar_dt("20240115 09:30:00 Mars/Olympus")
+        assert dt.hour == 14          # treated as Eastern
+
+    def test_unparseable_raises(self):
+        """Both call sites catch, so raising skips one bar instead of
+        storing it at a fabricated time."""
+        with pytest.raises(ValueError):
+            _parse_bar_dt("not a date at all")
 
 
 # ---------------------------------------------------------------------------
