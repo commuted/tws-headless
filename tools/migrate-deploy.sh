@@ -239,8 +239,12 @@ if [ "$CONFIRM" -eq 0 ]; then
     echo "=== dry run — nothing written. Re-run with --confirm to apply. ==="
     echo "Would place:"
     echo "  STATE.json          -> $REPO/STATE.json   (then: start_trading.sh --restore-state)"
-    [ -d "$STAGE/host" ]     && ls -1 "$STAGE/host"     2>/dev/null | sed "s|^|  host config      -> $HOME or $REPO: |"
-    [ -d "$STAGE/systemd" ]  && ls -1 "$STAGE/systemd"  2>/dev/null | sed "s|^|  systemd unit     -> /etc/systemd/system/ (needs sudo): |"
+    # -A, not plain -1: half of what we carry in host/ is dotfiles
+    # (.ib_forex_cost_basis.json, .vnc/config). Without it the dry run stays
+    # silent about files the apply path then writes, which is the one thing a
+    # preview must never do.
+    [ -d "$STAGE/host" ]     && ls -1A "$STAGE/host"    2>/dev/null | sed "s|^|  host config      -> $HOME or $REPO: |"
+    [ -d "$STAGE/systemd" ]  && ls -1A "$STAGE/systemd" 2>/dev/null | sed "s|^|  systemd unit     -> /etc/systemd/system/ (needs sudo): |"
     [ -f "$STAGE/historical/bars.db" ] && echo "  historical/bars.db -> $REPO/historical/"
     exit 0
 fi
