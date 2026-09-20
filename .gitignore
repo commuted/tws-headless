@@ -65,3 +65,15 @@ historical/config.json
 # repo, never committed)
 STATE.json
 STATE.json.tmp
+
+# Filled-in launch scripts. start-live.sh.example is tracked and carries the
+# shape of a correct launch; the copies carry the account and operator ids,
+# which name a real brokerage account and real people. Only the template
+# belongs in a public repository.
+start-live.sh
+start-real.sh
+start-paper.sh
+
+# Migration bundles built by tools/migrate-collect.sh — they contain a STATE
+# snapshot (live positions) and host configuration.
+tws-migrate-*.tar.gz

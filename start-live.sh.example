@@ -1,0 +1,76 @@
+#!/bin/bash
+#
+# start-live.sh.example — template for the live engine launch script.
+#
+# Copy to start-live.sh (or start-real.sh), fill in the identifiers, and keep
+# the copy OUT of git. It is gitignored for that reason: the account and
+# operator ids name a real brokerage account and real people, and belong with
+# credentials rather than in a public repository.
+#
+#     cp start-live.sh.example start-live.sh
+#     chmod +x start-live.sh
+#     # edit the three <PLACEHOLDER> values
+#
+# WHY THIS FILE IS TRACKED AND ITS COPY IS NOT
+#
+# Three of the flags below are operationally mandatory, and that fact used to
+# live only in one shell script on one machine. Losing that machine meant
+# losing the knowledge that --account is required at all. This template
+# carries the SHAPE of a correct launch into the repo; the filled-in copy
+# carries the values, and only the values, outside it.
+#
+# --account            REQUIRED when the IB login reports more than one
+#                      account. The engine refuses to start rather than
+#                      guess, because the choice decides plugin state,
+#                      holdings, execution logging, and the account tag on
+#                      every order. With exactly one account it may be
+#                      omitted. See environment.resolve_account().
+#
+# --operator-id        REQUIRED by IB: every order message from an automated
+#                      trading system (placements, revisions, cancellations)
+#                      must carry the id of the team or individual operating
+#                      the system. Stamped on Order.extOperator. Missing it
+#                      is loud at startup but not fatal — orders go out
+#                      unstamped and IB may reject them.
+#
+# --manual-operator-id The same, for orders a person initiates through ibctl
+#                      (buy, sell, trade, order, liquidate), as distinct from
+#                      what the strategies place on their own.
+#
+# --live-confirmed     REQUIRED for immediate/queued order modes against a
+#                      LIVE account. Without it the engine refuses to start.
+#
+# Both ids may instead come from the environment ($IB_OPERATOR_ID and
+# $IB_MANUAL_OPERATOR_ID), which is the better option if you would rather
+# keep them in a secrets manager than a file on disk.
+
+cd ~/tws-headless || exit 1
+
+# The engine's virtualenv. Adjust if yours lives elsewhere.
+source ../env-ib/bin/activate
+
+./start_trading.sh \
+    --port 4001 \
+    --env live \
+    --account <ACCOUNT_ID> \
+    --operator-id <OPERATOR_ID> \
+    --manual-operator-id <MANUAL_OPERATOR_ID> \
+    --mode immediate \
+    --live-confirmed
+
+# Paper equivalent — note the different port, and that --live-confirmed is
+# neither needed nor accepted:
+#
+# ./start_trading.sh \
+#     --port 4002 \
+#     --env paper \
+#     --account <PAPER_ACCOUNT_ID> \
+#     --operator-id <OPERATOR_ID> \
+#     --manual-operator-id <MANUAL_OPERATOR_ID> \
+#     --client-id 2 \
+#     --mode immediate
+#
+# --client-id defaults to 1 everywhere. Give each engine that may reach the
+# same gateway a distinct one: IB silently ignores the second connection to
+# use an id, and the failure surfaces only as a connection that never
+# completes.
