@@ -77,3 +77,7 @@ start-paper.sh
 # Migration bundles built by tools/migrate-collect.sh — they contain a STATE
 # snapshot (live positions) and host configuration.
 tws-migrate-*.tar.gz
+
+# Working scratch notes kept at the repo root. Untracked and not ignored, it
+# was one 'git add -A' away from being committed.
+INFO

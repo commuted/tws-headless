@@ -95,16 +95,43 @@ def iso(s):
 
 # --- 1. existing install -------------------------------------------------
 found = []
-# Matched on the python invocation, not a loose substring: a bare pattern also
-# matches any shell whose command line happens to contain it.
+# A command-line match alone is not enough: the string also appears in the
+# command line of anything that merely mentions the engine, including this
+# script's own caller. Require a real python interpreter, and skip ourselves
+# and our ancestors. Same filter as migrate-collect.sh.
+def ancestry(pid):
+    seen = []
+    while pid and pid != 1 and pid not in seen:
+        seen.append(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat[stat.rindex(")") + 1:].split()[1])
+        except (OSError, ValueError):
+            break
+    return set(seen)
+
+mine = ancestry(os.getpid())
 running = ""
 try:
     ps = subprocess.run(["ps", "-eo", "pid,cmd", "--no-headers"],
                         capture_output=True, text=True).stdout
     for line in ps.splitlines():
-        if re.search(r"python3? -m ib\.run_engine", line):
-            running = line.split()[0]
-            break
+        if not re.search(r"python3? -m ib\.run_engine", line):
+            continue
+        try:
+            pid = int(line.split()[0])
+        except ValueError:
+            continue
+        if pid in mine:
+            continue
+        try:
+            exe = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+        except OSError:
+            exe = ""
+        if exe and not exe.startswith("python"):
+            continue
+        running = str(pid)
+        break
 except FileNotFoundError:
     pass
 if running:
