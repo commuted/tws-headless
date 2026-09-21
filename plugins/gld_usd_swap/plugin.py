@@ -346,6 +346,12 @@ def _bar_when(bar) -> str:
 # to no trading at all.
 _REGULAR_CLOSE = dt_time(16, 0)
 
+# Deliberately short. This runs on the live-bar callback thread, so the whole
+# timeout is time the strategy is not processing bars. The calendar only moves
+# the close decision on early-close days; missing it costs one half day a year,
+# while blocking the bar thread costs the session.
+_CALENDAR_FETCH_TIMEOUT = 5.0
+
 _NY_TZ = ZoneInfo("America/New_York")
 
 # Declared to PluginExecutive.aggregate_trading_windows() via trading_hours()
@@ -1719,22 +1725,36 @@ class GldUsdSwapPlugin(PluginBase):
         is what the fixed constants always assumed.
         """
         today = self._now_ny().date()
-        if self._calendar is not None and self._calendar_day == today:
+        # Latch on the ATTEMPT, not on success. Latching only on success means
+        # a failing fetch is retried on every live bar, and this call blocks
+        # for its whole timeout inside the bar callback — so a broker that
+        # stops answering reqContractDetails does not degrade the calendar,
+        # it starves the bar thread and stops the strategy trading entirely.
+        # Observed live on 2026-09-21: the ET date rolled at midnight, the
+        # guard expired, contract details began timing out at 20s, and the
+        # engine spent market hours in a 20-second retry loop with zero bars
+        # processed and the 09:30 decision never firing.
+        if self._calendar_day == today:
             return
         if not self.portfolio:
             return
+        self._calendar_day = today
+
         try:
             cal = fetch_market_calendar(
-                self.portfolio, ContractBuilder.etf("GLD"), timeout=20.0)
+                self.portfolio, ContractBuilder.etf("GLD"),
+                timeout=_CALENDAR_FETCH_TIMEOUT)
         except Exception as exc:
-            logger.warning(f"Trading calendar fetch failed ({exc}) — "
-                           f"assuming a regular {_REGULAR_CLOSE:%H:%M} close")
+            logger.warning(f"Trading calendar fetch failed ({exc}) — assuming "
+                           f"a regular {_REGULAR_CLOSE:%H:%M} close for today")
             return
         if cal is None:
             logger.warning("Trading calendar unavailable — assuming a regular "
-                           f"{_REGULAR_CLOSE:%H:%M} close")
+                           f"{_REGULAR_CLOSE:%H:%M} close for today. The close "
+                           "decision stays at the fixed bar; an early close "
+                           "today would be missed.")
             return
-        self._calendar, self._calendar_day = cal, today
+        self._calendar = cal
         close = self._session_close_et(today)
         h, m = self._close_decision_hm(today)
         if close != _REGULAR_CLOSE:
