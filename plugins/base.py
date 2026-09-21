@@ -17,7 +17,7 @@ import threading
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -670,10 +670,24 @@ class PluginBase(ABC):
             self._base_path.mkdir(parents=True, exist_ok=True)
             data = {
                 "plugin_version": self.VERSION,
+                # UTC, and explicitly marked. This used to be a naive local
+                # datetime.now(), which reads as one wall clock on a Pacific
+                # host and another on a UTC one — so a state file moved
+                # between machines compared against the wrong instant.
+                "saved_at": datetime.now(timezone.utc).isoformat(),
                 "state": state,
-                "saved_at": datetime.now().isoformat(),
             }
-            self._state_file.write_text(json.dumps(data, default=str))
+            # Atomic: write a sibling temp file, then rename over the target.
+            # A bare write_text() truncates the real file first, so a process
+            # killed mid-write (a reboot, an OOM, a SIGKILL after the systemd
+            # stop timeout) leaves truncated JSON where the record of what
+            # this plugin owns used to be. rename(2) within a directory is
+            # atomic, so a reader sees either the old file or the new one and
+            # never a half-written one. ib/state_file.py has always done this
+            # for STATE.json; plugin state was the inconsistency.
+            tmp = self._state_file.with_suffix(self._state_file.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, default=str))
+            tmp.replace(self._state_file)
             return True
         except Exception as e:
             logger.error(f"Failed to save state for '{self.slot}': {e}")

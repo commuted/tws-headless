@@ -560,6 +560,7 @@ from datetime import date as _date, datetime as _datetime, time as _time
 from zoneinfo import ZoneInfo as _ZoneInfo
 
 from ib.bar_store import parse_ib_bar_dt
+from plugins.gld_usd_swap.plugin import _as_date, _as_aware_dt
 from ib.market_calendar import Session as _Session
 
 _NY = _ZoneInfo("America/New_York")
@@ -680,3 +681,93 @@ class TestBarTimestampIsAnInstant:
         """The specific regression: 19:45 UTC is 15:45 ET, not 19:45 ET."""
         ts = self._ts("20260328 19:45:00 Africa/Abidjan")
         assert (ts.hour, ts.minute) == (15, 45)
+
+
+# ---------------------------------------------------------------------------
+# Crash durability: what survives an ungraceful death
+# ---------------------------------------------------------------------------
+
+class TestSessionGuardsSurviveRestart:
+    """A restart inside a decision window must not re-run that decision.
+
+    The guards were memory-only, so a restart at 15:47 gave: _hwm_ts None (a
+    re-delivered 15:45 bar reads as new — IB does re-deliver it on an
+    after-hours resubscribe), wall clock still inside 15:45-15:55, and no
+    fired-date to refuse. A second MOC, with the first one's record lost to
+    the 5-minute auto-save gap.
+    """
+
+    def test_fired_dates_and_hwm_round_trip(self, tmp_path):
+        p = _make_plugin(tmp_path)
+        p._open_fired_date = _date(2026, 9, 21)
+        p._close_fired_date = _date(2026, 9, 21)
+        p._hwm_ts = _datetime(2026, 9, 21, 15, 45, tzinfo=_NY)
+        p._save_state()
+
+        q = _make_plugin(tmp_path)
+        saved = q.load_state()
+        assert saved["open_fired_date"] == "2026-09-21"
+        assert saved["close_fired_date"] == "2026-09-21"
+        assert saved["hwm_ts"].startswith("2026-09-21T15:45")
+
+    def test_restored_hwm_is_aware_and_comparable(self, tmp_path):
+        """It is compared with > against aware bar timestamps; a naive value
+        would raise on the first comparison instead of failing safe."""
+        p = _make_plugin(tmp_path)
+        p._hwm_ts = _datetime(2026, 9, 21, 15, 45, tzinfo=_NY)
+        p._save_state()
+        restored = _as_aware_dt(_make_plugin(tmp_path).load_state()["hwm_ts"])
+        assert restored.tzinfo is not None
+        assert restored < _datetime(2026, 9, 21, 15, 50, tzinfo=_NY)
+
+    def test_unparseable_guard_degrades_to_none_not_an_exception(self):
+        """Restoring a guard may refuse a decision that already ran; it must
+        never permit one that has not, nor blow up the restore path."""
+        for junk in (None, "", "not-a-date", 12345, []):
+            assert _as_date(junk) is None
+            assert _as_aware_dt(junk) is None
+
+    def test_naive_hwm_is_localised_rather_than_rejected(self):
+        got = _as_aware_dt("2026-09-21T15:45:00")
+        assert got is not None and got.tzinfo is not None
+
+
+class TestStateWriteIsAtomic:
+    def test_save_leaves_no_partial_file_and_no_tmp(self, tmp_path):
+        p = _make_plugin(tmp_path)
+        p._holding_gld = True
+        p._save_state()
+        state_file = p._state_file
+        assert state_file.exists()
+        json.loads(state_file.read_text())           # parses => not truncated
+        assert not list(state_file.parent.glob("*.tmp")), "temp file left behind"
+
+    def test_existing_state_survives_a_failed_write(self, tmp_path):
+        """A bare write_text() truncates the target first, so a crash mid-write
+        destroys the previous state. Writing to a temp file and renaming means
+        a failure leaves the last good file untouched."""
+        p = _make_plugin(tmp_path)
+        p._holding_gld = True
+        p._save_state()
+        before = p._state_file.read_text()
+
+        with patch.object(Path, "write_text", side_effect=OSError("disk full")):
+            p._save_state()          # swallowed and logged, must not raise
+
+        assert p._state_file.read_text() == before
+        json.loads(p._state_file.read_text())
+
+
+class TestOrderPlacementIsDurable:
+    def test_every_placement_path_persists_before_returning(self):
+        """The pending tracker, trade_count and last_trade_time were memory-only
+        until the 5-minute auto-save. An ungraceful death inside that window
+        left a live order at IB that the restarted plugin had no record of —
+        and _restored_pending_buy needs that entry to fire at all."""
+        src = Path("plugins/gld_usd_swap/plugin.py").read_text().splitlines()
+        sites = [i for i, l in enumerate(src) if l.strip() == "self.register_order(oid)"]
+        assert len(sites) == 6, f"expected 6 placement sites, found {len(sites)}"
+        for i in sites:
+            window = "\n".join(src[i:i + 8])
+            assert "self._save_state()" in window, (
+                f"placement at line {i+1} does not persist before returning")

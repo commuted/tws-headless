@@ -218,6 +218,37 @@ _CLOSE_HOUR, _CLOSE_MIN = 15, 45   # bar completes 15:50 — inside NYSE ARCA MO
 _CLOSE_LEAD = timedelta(minutes=15)
 
 
+def _as_date(raw):
+    """An ISO date string back to a date, or None.
+
+    Restoring a guard must never be able to *enable* a decision, so anything
+    unparseable degrades to None — the pre-persistence behaviour.
+    """
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw)).date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _as_aware_dt(raw):
+    """An ISO datetime back to a New-York-aware datetime, or None.
+
+    The high-water-mark is compared with `>` against freshly parsed bar
+    timestamps, which are aware; a naive value here would raise on the first
+    comparison rather than fail safe, so anything without a timezone is
+    localised to New York, the zone the bar path works in.
+    """
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw))
+    except (ValueError, TypeError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=_NY_TZ)
+
+
 def _bar_when(bar) -> str:
     """A bar's timestamp as readable ET, for logs.
 
@@ -599,6 +630,12 @@ class GldUsdSwapPlugin(PluginBase):
             self._uup.restore(saved.get("uup",  {}), _INIT_DERIV_UUP)
             self._tlt.restore(saved.get("tlt",  {}), _INIT_DERIV_TLT)
             self._rinf.restore(saved.get("rinf", {}), _INIT_DERIV_RINF)
+            # Session guards. A malformed or absent value restores as None,
+            # i.e. exactly the old behaviour — this can only ever refuse a
+            # decision that already ran, never permit one that has not.
+            self._open_fired_date  = _as_date(saved.get("open_fired_date"))
+            self._close_fired_date = _as_date(saved.get("close_fired_date"))
+            self._hwm_ts           = _as_aware_dt(saved.get("hwm_ts"))
             self._pending_order_actions = {
                 int(oid): action
                 for oid, action in saved.get("pending_orders", {}).items()
@@ -837,6 +874,21 @@ class GldUsdSwapPlugin(PluginBase):
                                          in self._pending_order_placed_at.items()},
             "pending_order_types":   {str(oid): t for oid, t
                                       in self._pending_order_types.items()},
+            # Once-per-session guards and the bar high-water-mark. These were
+            # memory-only, which made a restart inside a decision window able
+            # to run that session's decision a SECOND time: _hwm_ts back to
+            # None means a re-delivered bar reads as new (IB does re-deliver
+            # the day's 15:45 bar on an after-hours resubscribe — see
+            # _is_live_bar), the wall-clock check still passes because 15:47
+            # is inside 15:45–15:55, and the fired-date guard that would have
+            # refused is gone. The wall-clock window bounds LATE firing; it
+            # was never a defence against firing twice inside it.
+            "open_fired_date":  (self._open_fired_date.isoformat()
+                                 if self._open_fired_date else None),
+            "close_fired_date": (self._close_fired_date.isoformat()
+                                 if self._close_fired_date else None),
+            "hwm_ts":           (self._hwm_ts.isoformat()
+                                 if self._hwm_ts else None),
         }
 
     def _save_state(self) -> None:
@@ -1800,6 +1852,12 @@ class GldUsdSwapPlugin(PluginBase):
             self._pending_order_placed_at[oid] = time.time()
             self._pending_order_types[oid] = order.orderType
             self.register_order(oid)
+            # Durable BEFORE we return: the pending-order tracker, trade_count
+            # and last_trade_time were memory-only until the 5-minute auto-save,
+            # so an ungraceful death inside that window left a live order at IB
+            # that the restarted plugin had no record of — and the
+            # _restored_pending_buy safety net needs exactly this entry to fire.
+            self._save_state()
             logger.info(f"MOC BUY {shares} GLD (order_id={oid}) — {reason}")
         else:
             logger.error(f"Failed to place MOC BUY {shares} GLD — {reason}")
@@ -1842,6 +1900,12 @@ class GldUsdSwapPlugin(PluginBase):
             self._pending_order_placed_at[oid] = time.time()
             self._pending_order_types[oid] = order.orderType
             self.register_order(oid)
+            # Durable BEFORE we return: the pending-order tracker, trade_count
+            # and last_trade_time were memory-only until the 5-minute auto-save,
+            # so an ungraceful death inside that window left a live order at IB
+            # that the restarted plugin had no record of — and the
+            # _restored_pending_buy safety net needs exactly this entry to fire.
+            self._save_state()
             logger.info(f"MKT SELL {qty} GLD (order_id={oid}) — {reason}")
         else:
             logger.error(f"Failed to place MKT SELL {qty} GLD — {reason}")
@@ -1890,6 +1954,12 @@ class GldUsdSwapPlugin(PluginBase):
             self._pending_order_placed_at[oid] = time.time()
             self._pending_order_types[oid] = order.orderType
             self.register_order(oid)
+            # Durable BEFORE we return: the pending-order tracker, trade_count
+            # and last_trade_time were memory-only until the 5-minute auto-save,
+            # so an ungraceful death inside that window left a live order at IB
+            # that the restarted plugin had no record of — and the
+            # _restored_pending_buy safety net needs exactly this entry to fire.
+            self._save_state()
             logger.info(f"MOC SHORT SELL {shares} GLD (order_id={oid}) — {reason}")
         else:
             logger.error(f"Failed to place MOC SHORT SELL {shares} GLD — {reason}")
@@ -1934,6 +2004,12 @@ class GldUsdSwapPlugin(PluginBase):
             self._pending_order_placed_at[oid] = time.time()
             self._pending_order_types[oid] = order.orderType
             self.register_order(oid)
+            # Durable BEFORE we return: the pending-order tracker, trade_count
+            # and last_trade_time were memory-only until the 5-minute auto-save,
+            # so an ungraceful death inside that window left a live order at IB
+            # that the restarted plugin had no record of — and the
+            # _restored_pending_buy safety net needs exactly this entry to fire.
+            self._save_state()
             logger.info(f"MKT COVER BUY {shares} GLD (order_id={oid}) — {reason}")
         else:
             logger.error(f"Failed to place MKT COVER BUY {shares} GLD — {reason}")
@@ -1981,6 +2057,12 @@ class GldUsdSwapPlugin(PluginBase):
             self._pending_order_placed_at[oid] = time.time()
             self._pending_order_types[oid] = order.orderType
             self.register_order(oid)
+            # Durable BEFORE we return: the pending-order tracker, trade_count
+            # and last_trade_time were memory-only until the 5-minute auto-save,
+            # so an ungraceful death inside that window left a live order at IB
+            # that the restarted plugin had no record of — and the
+            # _restored_pending_buy safety net needs exactly this entry to fire.
+            self._save_state()
             logger.info(f"MOC BUY {shares} GLL (order_id={oid}) — {reason}")
         else:
             logger.error(f"Failed to place MOC BUY {shares} GLL — {reason}")
@@ -2026,6 +2108,12 @@ class GldUsdSwapPlugin(PluginBase):
             self._pending_order_placed_at[oid] = time.time()
             self._pending_order_types[oid] = order.orderType
             self.register_order(oid)
+            # Durable BEFORE we return: the pending-order tracker, trade_count
+            # and last_trade_time were memory-only until the 5-minute auto-save,
+            # so an ungraceful death inside that window left a live order at IB
+            # that the restarted plugin had no record of — and the
+            # _restored_pending_buy safety net needs exactly this entry to fire.
+            self._save_state()
             logger.info(f"MKT SELL {shares} GLL (order_id={oid}) — {reason}")
         else:
             logger.error(f"Failed to place MKT SELL {shares} GLL — {reason}")
