@@ -550,3 +550,133 @@ class TestOnOrderStatus:
         p._holding_gld = True
         p.on_order_status(_order(999, "BUY", OrderStatus.CANCELLED))
         assert p._holding_gld is True
+
+
+# ---------------------------------------------------------------------------
+# Session clock: early closes, and the timezone of a bar
+# ---------------------------------------------------------------------------
+
+from datetime import date as _date, datetime as _datetime, time as _time
+from zoneinfo import ZoneInfo as _ZoneInfo
+
+from ib.bar_store import parse_ib_bar_dt
+from ib.market_calendar import Session as _Session
+
+_NY = _ZoneInfo("America/New_York")
+
+
+class _FakeSessions:
+    """Minimal stand-in for SessionSet.sessions_on()."""
+
+    def __init__(self, closes):
+        self._closes = closes                       # {date: time or None}
+
+    def sessions_on(self, day):
+        close = self._closes.get(day)
+        if close is None:
+            return []
+        start = _datetime.combine(day, _time(9, 30), tzinfo=_NY)
+        return [_Session(start=start,
+                         end=_datetime.combine(day, close, tzinfo=_NY))]
+
+
+class _FakeCalendar:
+    def __init__(self, closes):
+        self._s = _FakeSessions(closes)
+
+    def sessions(self, rth=True):
+        return self._s
+
+
+class TestSessionClock:
+    """The close decision must follow the bell, not a hardcoded 15:45.
+
+    On an early close (13:00 on the day after Thanksgiving, Christmas Eve)
+    the 15:45 bar never exists, so a fixed constant means the MOC entry
+    silently never fires and the strategy sits out a session it meant to
+    trade. Nothing errors — the only trace is a missing order.
+    """
+
+    def test_regular_day_keeps_the_historical_1545(self, tmp_path):
+        p = _make_plugin(tmp_path)
+        p._calendar = _FakeCalendar({_date(2026, 3, 3): _time(16, 0)})
+        assert p._close_decision_hm(_date(2026, 3, 3)) == (15, 45)
+
+    def test_early_close_moves_the_decision_bar(self, tmp_path):
+        p = _make_plugin(tmp_path)
+        p._calendar = _FakeCalendar({_date(2026, 11, 27): _time(13, 0)})
+        assert p._close_decision_hm(_date(2026, 11, 27)) == (12, 45)
+
+    def test_is_close_bar_follows_the_early_close(self, tmp_path):
+        p = _make_plugin(tmp_path)
+        half = _date(2026, 11, 27)
+        p._calendar = _FakeCalendar({half: _time(13, 0)})
+        assert p._is_close_bar(_datetime.combine(half, _time(12, 45), tzinfo=_NY))
+        # The old hardcoded bar is not a close bar on a half day — and on a
+        # 13:00 close it does not exist at all.
+        assert not p._is_close_bar(_datetime.combine(half, _time(15, 45), tzinfo=_NY))
+
+    def test_validity_window_tracks_the_early_close(self, tmp_path):
+        p = _make_plugin(tmp_path)
+        half = _date(2026, 11, 27)
+        p._calendar = _FakeCalendar({half: _time(13, 0)})
+        assert p._close_window_et(half) == ((12, 45), (12, 55))
+        p._calendar = _FakeCalendar({half: _time(16, 0)})
+        assert p._close_window_et(half) == ((15, 45), (15, 55))
+
+    def test_no_calendar_degrades_to_the_old_behaviour(self, tmp_path):
+        """A calendar outage must not stop trading — it should look exactly
+        like the fixed-constant code that ran before."""
+        p = _make_plugin(tmp_path)
+        p._calendar = None
+        assert p._close_decision_hm(_date(2026, 3, 3)) == (15, 45)
+        assert p._session_close_et(_date(2026, 3, 3)) == _time(16, 0)
+
+    def test_unknown_day_degrades_to_the_old_behaviour(self, tmp_path):
+        p = _make_plugin(tmp_path)
+        p._calendar = _FakeCalendar({})          # covers no days
+        assert p._close_decision_hm(_date(2026, 3, 3)) == (15, 45)
+
+    def test_open_decision_is_unaffected(self, tmp_path):
+        """Early closes move the bell, never the opening auction."""
+        p = _make_plugin(tmp_path)
+        half = _date(2026, 11, 27)
+        p._calendar = _FakeCalendar({half: _time(13, 0)})
+        assert p._is_open_bar(_datetime.combine(half, _time(9, 30), tzinfo=_NY))
+
+
+class TestBarTimestampIsAnInstant:
+    """A bar's session meaning must not depend on how IB spelled its time.
+
+    The live handler used to slice chars 0-7 and 9-16 out of the raw string
+    and compare the result against ET constants. That is correct only while
+    IB formats in Eastern, which follows the Gateway's timezone rather than
+    the exchange's: the same request returns "US/Eastern" on a Pacific host
+    and "Africa/Abidjan" on a UTC one. The UTC form slices perfectly well —
+    it just describes a moment four hours away, so 15:45 matches at the
+    wrong time and the day's MOC never fires. No parse error, no alert.
+    """
+
+    ONE_INSTANT = [
+        "1774727100",                             # epoch, what IB sends now
+        "20260328 15:45:00 US/Eastern",           # Eastern-labelled
+        "20260328 19:45:00 Africa/Abidjan",       # the same moment in UTC
+        "20260328 12:45:00 America/Los_Angeles",  # and in Pacific
+    ]
+
+    def _ts(self, raw):
+        return parse_ib_bar_dt(raw).astimezone(_NY)
+
+    def test_every_encoding_gives_the_same_new_york_clock(self):
+        clocks = {(self._ts(r).hour, self._ts(r).minute) for r in self.ONE_INSTANT}
+        assert clocks == {(15, 45)}
+
+    def test_every_encoding_triggers_the_close_decision(self, tmp_path):
+        p = _make_plugin(tmp_path)
+        p._calendar = _FakeCalendar({_date(2026, 3, 28): _time(16, 0)})
+        assert all(p._is_close_bar(self._ts(r)) for r in self.ONE_INSTANT)
+
+    def test_utc_labelled_bar_is_not_read_four_hours_early(self):
+        """The specific regression: 19:45 UTC is 15:45 ET, not 19:45 ET."""
+        ts = self._ts("20260328 19:45:00 Africa/Abidjan")
+        assert (ts.hour, ts.minute) == (15, 45)

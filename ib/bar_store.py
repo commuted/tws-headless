@@ -162,12 +162,19 @@ def _parse_bar_dt(date_str: str) -> datetime:
     Parse an IB bar date string to a UTC-aware datetime.
 
     Handles:
+      "1705329000"            epoch seconds (formatDate=2) — preferred
       "20240115"              daily bar   → midnight UTC that day
       "20240115 09:30:00"     intraday, no label (legacy space separator)
       "20240115-09:30:00"     intraday, no label (new hyphen separator)
       "20240115 09:30:00 US/Eastern"       labelled, and the label is USED
       "20240115 13:30:00 Africa/Abidjan"   IB's spelling of UTC
       "20240115 06:30:00 America/Los_Angeles"
+
+    We now ask IB for epoch (see Portfolio.request_historical_data), so the
+    labelled forms are what already sits in the cache and what a downgraded
+    or third-party caller may still produce. Both are supported
+    indefinitely: bars.db holds years of the string form, and re-fetching it
+    to change a format would cost thousands of paced IB requests for no gain.
 
     THE LABEL IS NOT DECORATION. This function used to strip the timezone
     suffix and assume US/Eastern unconditionally, which is right only while
@@ -190,6 +197,13 @@ def _parse_bar_dt(date_str: str) -> datetime:
     is a thing worth knowing about.
     """
     s = date_str.strip()
+
+    # Epoch seconds (formatDate=2). An instant, with no zone to get wrong —
+    # which is the point of asking IB for this format. Distinguishable from
+    # the 8-digit "YYYYMMDD" daily bar by length: epoch seconds have been 10
+    # digits since 2001 and stay 10 until 2286.
+    if s.isdigit() and len(s) >= 9:
+        return datetime.fromtimestamp(int(s), UTC)
 
     # Daily bar: date only
     if len(s) == 8 and s.isdigit():
@@ -229,6 +243,13 @@ def _parse_bar_dt(date_str: str) -> datetime:
         hours = fixed.get(label, -5)
         return naive.replace(
             tzinfo=timezone(timedelta(hours=hours))).astimezone(UTC)
+
+
+# Public alias. Anything that receives a raw IB bar date should parse it
+# through here rather than slicing the string: the format now varies by
+# request (epoch vs labelled clock time) and the zone label varies by host,
+# so a positional slice is only ever correct by accident.
+parse_ib_bar_dt = _parse_bar_dt
 
 
 def _dt_to_iso(dt: datetime) -> str:

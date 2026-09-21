@@ -1133,10 +1133,23 @@ class Portfolio(IBClient):
             bar_size_setting,
             what_to_show,
             1 if use_rth else 0,
-            1,      # formatDate=1 → human-readable date strings
+            2,      # formatDate=2 → epoch seconds; see below
             keep_up_to_date,
             [],
         )
+        # Why epoch rather than formatDate=1's "20260917 09:30:00 US/Eastern":
+        # the zone IB stamps on a formatted bar follows the Gateway's
+        # configured timezone, not the exchange's. The same request answered
+        # "US/Eastern" on a Pacific host and "Africa/Abidjan" on a UTC one,
+        # and a reader that assumes Eastern puts those bars 3 and 4 hours
+        # from where they belong. It also differed BETWEEN requests on one
+        # host, which silently breaks the cross-symbol alignment the
+        # strategies do by grouping bars on equal timestamps.
+        #
+        # An epoch second is an instant. There is no label to read, to get
+        # wrong, or to disagree between two requests. Readers must still go
+        # through bar_store.parse_ib_bar_dt, which accepts both this and
+        # every formatted variant already sitting in bars.db.
         return req_id
 
     def cancel_historical_data(self, req_id: int) -> None:

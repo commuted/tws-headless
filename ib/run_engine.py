@@ -741,6 +741,19 @@ def _display_state(raw: str) -> str:
     return _STATE_DISPLAY.get(raw, raw)
 
 
+def _iso_bar_date(raw) -> str:
+    """An IB bar date as ISO-8601 UTC, whatever form it arrived in.
+
+    Imported lazily: run_engine is also the CLI entry point, and bar_store
+    pulls in sqlite machinery that a --help run has no reason to load.
+    """
+    from ib.bar_store import parse_ib_bar_dt
+    try:
+        return parse_ib_bar_dt(str(raw)).isoformat()
+    except (ValueError, TypeError, AttributeError):
+        return str(raw)
+
+
 def _format_uptime(seconds: float) -> str:
     # Compact d/h/m/s uptime — same shape ps(1)'s ELAPSED uses so it lines up
     # with what an operator would see from ps -o etime. Only prints the leading
@@ -2369,7 +2382,11 @@ class EngineCommandHandler:
 
         bar_dicts = [
             {
-                "date":      str(b.date),
+                # ISO-8601 UTC. IB now sends epoch seconds, which would make
+                # this field an opaque integer for every consumer of the
+                # response; parse_ib_bar_dt also accepts the older formatted
+                # strings, so this reads the same either way.
+                "date":      _iso_bar_date(b.date),
                 "open":      float(b.open),
                 "high":      float(b.high),
                 "low":       float(b.low),

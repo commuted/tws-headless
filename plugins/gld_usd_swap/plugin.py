@@ -184,7 +184,9 @@ from typing import Dict, List, Optional, Tuple
 
 from ibapi.order import Order as IbOrder
 
+from ib.bar_store import parse_ib_bar_dt
 from ib.contract_builder import ContractBuilder
+from ib.market_calendar import fetch_market_calendar
 from ib.models import TERMINAL_ORDER_REJECT_CODES
 from plugins.base import PluginBase, PluginState, TradeSignal
 
@@ -208,6 +210,32 @@ _GLL_WEIGHT = 0.5
 
 _OPEN_HOUR,  _OPEN_MIN  = 9,  30
 _CLOSE_HOUR, _CLOSE_MIN = 15, 45   # bar completes 15:50 — inside NYSE ARCA MOC cutoff
+
+# The close decision rides this far ahead of the actual closing bell: the
+# 15:45 bar completes at 15:50 on a 16:00 close, inside NYSE ARCA's MOC
+# cutoff. Expressed as an offset so an early close moves it rather than
+# skipping it — on a 13:00 half day the same arithmetic gives 12:45.
+_CLOSE_LEAD = timedelta(minutes=15)
+
+
+def _bar_when(bar) -> str:
+    """A bar's timestamp as readable ET, for logs.
+
+    Bars now arrive as epoch seconds, so printing bar.date raw turns every
+    log line into an unreadable integer. Falls back to the raw value rather
+    than raising inside a log statement.
+    """
+    try:
+        return parse_ib_bar_dt(str(bar.date)).astimezone(_NY_TZ).strftime(
+            "%Y-%m-%d %H:%M ET")
+    except (ValueError, TypeError, AttributeError):
+        return str(getattr(bar, "date", "?"))
+
+# Regular full-day close, used when the calendar is unavailable. Keeping the
+# historical constants as the fallback means a calendar outage degrades to
+# exactly the behaviour that ran before this was calendar-aware, rather than
+# to no trading at all.
+_REGULAR_CLOSE = dt_time(16, 0)
 
 _NY_TZ = ZoneInfo("America/New_York")
 
@@ -256,6 +284,8 @@ _PENDING_ORDER_ALERT_SECONDS = 1800
 # NOT be expired before it is over and the fill has had time to arrive.
 _MKT_PENDING_EXPIRY_ET = (9, 50)    # just past _OPEN_WINDOW_ET's end
 _MOC_PENDING_EXPIRY_ET = (16, 15)   # just past the 16:00 auction print
+# ...and the same 15-minute grace measured from an early close instead.
+_MOC_EXPIRY_AFTER_CLOSE = timedelta(minutes=15)
 
 # Alert after this many consecutive unparseable bar timestamps — session
 # decisions match on the parsed clock time, so a format/timezone drift would
@@ -495,6 +525,13 @@ class GldUsdSwapPlugin(PluginBase):
         self._open_fired_date:     Optional[object]   = None   # date the open decision ran
         self._close_fired_date:    Optional[object]   = None   # date the close decision ran
 
+        # IB's trading schedule for GLD, so an early close moves the MOC
+        # decision instead of skipping it. Deliberately NOT persisted: a
+        # schedule cached across a restart is a schedule nobody re-checked,
+        # and the whole point is to notice the day the exchange differs.
+        self._calendar = None                                  # MarketCalendar
+        self._calendar_day: Optional[object] = None            # day it was fetched
+
         # True when state restore found orders still in flight from a previous
         # session (e.g. crash between MOC placement and the 16:00 fill).  Makes
         # startup reconciliation conservative so the plugin can never place a
@@ -663,6 +700,7 @@ class GldUsdSwapPlugin(PluginBase):
                 logger.info("Reconcile: no short GLD in portfolio → short_gld=False")
                 self._short_gld = False
 
+        self._refresh_calendar()
         self._warm_up_from_history()
         self._maybe_backfill_reset_cadence()
         self._maybe_check_short_selling_capability()
@@ -847,15 +885,26 @@ class GldUsdSwapPlugin(PluginBase):
             bars_by_symbol[symbol] = bars or []
 
         # --- merge into a single chronological stream ---
+        # Keyed on the PARSED instant, not the raw IB string. The grouping
+        # below aligns the four symbols by equal key, so a string key silently
+        # de-aligns them the moment two requests come back in different
+        # formats or timezones — which IB does do, varying the zone by
+        # Gateway setting and, on one host, between requests. Two spellings
+        # of the same moment would land in separate groups and each symbol
+        # would push into the regime alone.
         merged: List[tuple] = []
         for symbol, bars in bars_by_symbol.items():
             for b in bars:
-                merged.append((b.date, symbol, float(b.close)))
+                try:
+                    when = parse_ib_bar_dt(str(b.date)).astimezone(_NY_TZ)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                merged.append((when, symbol, float(b.close)))
         merged.sort(key=lambda x: x[0])
 
-        # --- replay in time order, capturing regime at each 15:45 bar ---
+        # --- replay in time order, capturing regime at each close bar ---
         last_close_regime = REGIME_UNKNOWN
-        for ts_str, group in groupby(merged, key=lambda x: x[0]):
+        for ts, group in groupby(merged, key=lambda x: x[0]):
             for _, symbol, close in group:
                 if symbol == "UUP":
                     self._uup.push(close, self.vol_window, self.derivative_percentile,
@@ -872,13 +921,8 @@ class GldUsdSwapPlugin(PluginBase):
 
             self._recompute_regime()
 
-            try:
-                ts = datetime.strptime(ts_str[:8] + " " + ts_str[9:17], "%Y%m%d %H:%M:%S")
-                if (ts.hour == _CLOSE_HOUR and ts.minute == _CLOSE_MIN
-                        and self._regime != REGIME_UNKNOWN):
-                    last_close_regime = self._regime
-            except (ValueError, TypeError, AttributeError):
-                pass
+            if (self._is_close_bar(ts) and self._regime != REGIME_UNKNOWN):
+                last_close_regime = self._regime
 
         # --- log per-symbol stats ---
         for symbol, state in signal_configs:
@@ -1005,15 +1049,20 @@ class GldUsdSwapPlugin(PluginBase):
                 return [], False
             logger.info(
                 f"Reset-cadence backfill: {symbol} {len(bars)} bars "
-                f"({bars[0].date} → {bars[-1].date}) in "
+                f"({_bar_when(bars[0])} → {_bar_when(bars[-1])}) in "
                 f"{time.time() - symbol_started:.1f}s"
             )
             bars_by_symbol[symbol] = bars
 
+        # Parsed instant as the key — see the note in the warm-up merge.
         merged: List[tuple] = []
         for symbol, bars in bars_by_symbol.items():
             for b in bars:
-                merged.append((b.date, symbol, float(b.open), float(b.close)))
+                try:
+                    when = parse_ib_bar_dt(str(b.date)).astimezone(_NY_TZ)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                merged.append((when, symbol, float(b.open), float(b.close)))
         merged.sort(key=lambda x: x[0])
 
         # --- shadow state: isolated from self.*, discarded after this call ---
@@ -1045,11 +1094,7 @@ class GldUsdSwapPlugin(PluginBase):
                 gold = uup_gold
             shadow["regime"] = REGIME_GOLD if gold else REGIME_CASH
 
-        for ts_str, group in groupby(merged, key=lambda x: x[0]):
-            try:
-                ts = datetime.strptime(ts_str[:8] + " " + ts_str[9:17], "%Y%m%d %H:%M:%S")
-            except (ValueError, TypeError):
-                continue
+        for ts, group in groupby(merged, key=lambda x: x[0]):
             date = ts.date()
 
             for _, symbol, o, c in group:
@@ -1076,7 +1121,7 @@ class GldUsdSwapPlugin(PluginBase):
                                       self.fast_bars, self.slow_bars)
                     _shadow_recompute_regime()
 
-            if ts.hour == _CLOSE_HOUR and ts.minute == _CLOSE_MIN:
+            if self._is_close_bar(ts):
                 # Session close for `date`: settle the day's realized return
                 # (overnight from the previous close into today's open, plus
                 # intraday conditional on the PRIOR day's close regime —
@@ -1204,9 +1249,24 @@ class GldUsdSwapPlugin(PluginBase):
         (historicalDataUpdate).  All bars feed the signal state; only live
         bars may trigger session decisions.
 
-        IB bar date format for 5-min bars: "20260318 09:30:00" (legacy) or
-        "20260318-09:30:00" (new API, UTC endDateTime).  We parse chars 0-7
-        as date and 9-16 as time, which works for both separators.
+        TIMESTAMPS ARE PARSED, NOT SLICED, AND ts IS NEW-YORK TIME.
+
+        This used to read chars 0-7 and 9-16 of the raw IB string and build
+        a naive datetime from them, then compare that against ET session
+        constants. That is correct only while IB formats bars in Eastern,
+        which is not a property of the exchange but of the Gateway's
+        configured timezone: the same request comes back "US/Eastern" on a
+        Pacific host and "Africa/Abidjan" on a UTC one. A UTC-labelled bar
+        still slices cleanly — it just describes a moment four hours from
+        the one the session checks assume, so 09:30 and 15:45 match at the
+        wrong times and the day's decisions fire early, late, or never.
+        Nothing would have reported it: _bar_parse_failures only counts
+        strings it cannot parse, and that string parses perfectly.
+
+        Bars now arrive as epoch seconds (formatDate=2), and parse_ib_bar_dt
+        also accepts every formatted variant. Whatever the form, the result
+        is an absolute instant, explicitly converted to New York here. The
+        session constants below then compare like against like.
         """
         if self._state == PluginState.FROZEN:
             # Backstop: freeze() cancels subscriptions, but an in-flight
@@ -1216,7 +1276,7 @@ class GldUsdSwapPlugin(PluginBase):
         close = float(bar.close)
 
         try:
-            ts = datetime.strptime(bar.date[:8] + " " + bar.date[9:17], "%Y%m%d %H:%M:%S")
+            ts = parse_ib_bar_dt(str(bar.date)).astimezone(_NY_TZ)
         except (ValueError, TypeError, AttributeError):
             ts = None
 
@@ -1236,6 +1296,10 @@ class GldUsdSwapPlugin(PluginBase):
             self._bar_parse_failures = 0
 
         if is_live:
+            # At most one fetch per calendar day, and it must happen before
+            # any session decision: on an early close the decision bar is
+            # 12:45, so learning about it at 15:45 is learning too late.
+            self._refresh_calendar()
             self._check_pending_order_age()
             self._expire_stale_pending_orders()
 
@@ -1291,12 +1355,95 @@ class GldUsdSwapPlugin(PluginBase):
             self._gld_meta_slow = sum(cl[-self.meta_slow_bars:]) / self.meta_slow_bars
             self._gld_in_uptrend = self._gld_meta_fast > self._gld_meta_slow
 
+    # -- session clock (calendar-aware) ------------------------------------
+    #
+    # The open and close decisions used to match fixed 09:30 and 15:45
+    # constants. 09:30 is right on every day the exchange trades, but 15:45
+    # assumes a 16:00 bell. On an early close — the day after Thanksgiving,
+    # Christmas Eve, a handful of others — NYSE ARCA shuts at 13:00, the
+    # 15:45 bar never exists, and the MOC entry simply never fires. Nothing
+    # errors; the strategy just sits out a session it meant to trade, and the
+    # only trace is a missing order.
+    #
+    # The close is now read from IB's own schedule and the decision placed
+    # _CLOSE_LEAD ahead of it, so a 13:00 close yields 12:45 by the same
+    # arithmetic that yields 15:45 from 16:00.
+
+    def _refresh_calendar(self) -> None:
+        """(Re)fetch GLD's trading schedule, at most once per calendar day.
+
+        A blocking reqContractDetails, so it is called at start and then at
+        most once a day from the bar path — never per bar. Failure is not
+        fatal: _session_close_et falls back to the regular 16:00 close, which
+        is what the fixed constants always assumed.
+        """
+        today = self._now_ny().date()
+        if self._calendar is not None and self._calendar_day == today:
+            return
+        if not self.portfolio:
+            return
+        try:
+            cal = fetch_market_calendar(
+                self.portfolio, ContractBuilder.etf("GLD"), timeout=20.0)
+        except Exception as exc:
+            logger.warning(f"Trading calendar fetch failed ({exc}) — "
+                           f"assuming a regular {_REGULAR_CLOSE:%H:%M} close")
+            return
+        if cal is None:
+            logger.warning("Trading calendar unavailable — assuming a regular "
+                           f"{_REGULAR_CLOSE:%H:%M} close")
+            return
+        self._calendar, self._calendar_day = cal, today
+        close = self._session_close_et(today)
+        h, m = self._close_decision_hm(today)
+        if close != _REGULAR_CLOSE:
+            logger.warning(
+                f"EARLY CLOSE today: exchange shuts {close:%H:%M} ET, so the "
+                f"close decision moves to the {h:02d}:{m:02d} bar (normally "
+                f"{_CLOSE_HOUR:02d}:{_CLOSE_MIN:02d})."
+            )
+        else:
+            logger.info(f"Trading calendar loaded: close {close:%H:%M} ET, "
+                        f"decision bar {h:02d}:{m:02d}")
+
+    def _session_close_et(self, day) -> dt_time:
+        """Exchange close for `day`, from IB's schedule; _REGULAR_CLOSE if unknown."""
+        cal = self._calendar
+        if cal is not None:
+            try:
+                sessions = cal.sessions(rth=True).sessions_on(day)
+                if sessions:
+                    # Last session's end: a split session day still closes once.
+                    return sessions[-1].end.timetz().replace(tzinfo=None)
+            except Exception as exc:                       # pragma: no cover
+                logger.debug(f"calendar lookup failed for {day}: {exc}")
+        return _REGULAR_CLOSE
+
+    def _close_decision_hm(self, day) -> Tuple[int, int]:
+        """(hour, minute) of the bar that triggers the close decision."""
+        close = self._session_close_et(day)
+        anchor = (datetime.combine(day, close) - _CLOSE_LEAD)
+        return anchor.hour, anchor.minute
+
+    def _is_open_bar(self, ts: datetime) -> bool:
+        return ts.hour == _OPEN_HOUR and ts.minute == _OPEN_MIN
+
+    def _is_close_bar(self, ts: datetime) -> bool:
+        return (ts.hour, ts.minute) == self._close_decision_hm(ts.date())
+
+    def _close_window_et(self, day):
+        """Validity window for the close decision, tracking an early close."""
+        h, m = self._close_decision_hm(day)
+        end = (datetime.combine(day, dt_time(h, m)) + timedelta(minutes=10))
+        return ((h, m), (end.hour, end.minute))
+
     def _handle_session_event(self, ts: datetime) -> None:
-        if ts.hour == _OPEN_HOUR  and ts.minute == _OPEN_MIN:
+        if self._is_open_bar(ts):
             if self._session_decision_valid(ts, _OPEN_WINDOW_ET, "Open"):
                 self._on_market_open(ts)
-        elif ts.hour == _CLOSE_HOUR and ts.minute == _CLOSE_MIN:
-            if self._session_decision_valid(ts, _CLOSE_WINDOW_ET, "Close"):
+        elif self._is_close_bar(ts):
+            if self._session_decision_valid(
+                    ts, self._close_window_et(ts.date()), "Close"):
                 self._on_market_close(ts)
 
     def _now_ny(self) -> datetime:
@@ -1948,9 +2095,22 @@ class GldUsdSwapPlugin(PluginBase):
             if placed is None:
                 continue
             order_type = self._pending_order_types.get(oid, "MOC")
-            hh, mm = (_MOC_PENDING_EXPIRY_ET if order_type == "MOC"
-                      else _MKT_PENDING_EXPIRY_ET)
-            deadline = datetime.fromtimestamp(placed, tz=_NY_TZ).replace(
+            placed_et = datetime.fromtimestamp(placed, tz=_NY_TZ)
+            if order_type == "MOC":
+                # A MOC stays live until the closing auction prints, so its
+                # expiry hangs off the real bell: 16:15 on a normal day,
+                # 13:15 when the exchange shuts at 13:00. Expiring at a fixed
+                # 16:15 on a half day would leave a dead order tracked for
+                # three hours after the auction it was meant for.
+                hh, mm = _MOC_PENDING_EXPIRY_ET
+                close = self._session_close_et(placed_et.date())
+                if close != _REGULAR_CLOSE:
+                    after = (datetime.combine(placed_et.date(), close)
+                             + _MOC_EXPIRY_AFTER_CLOSE)
+                    hh, mm = after.hour, after.minute
+            else:
+                hh, mm = _MKT_PENDING_EXPIRY_ET
+            deadline = placed_et.replace(
                 hour=hh, minute=mm, second=0, microsecond=0
             )
             if now_et <= deadline:

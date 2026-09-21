@@ -15,6 +15,7 @@ from decimal import Decimal
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 
+from ib.bar_store import parse_ib_bar_dt
 from ib.contract_builder import ContractBuilder
 from ..base import (
     PluginBase,
@@ -25,6 +26,16 @@ from ..base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _iso_bar_date(raw) -> str:
+    """IB bar date as ISO-8601 UTC. Bars arrive as epoch seconds now, which
+    would otherwise surface here as a bare integer; parse_ib_bar_dt also
+    accepts every older formatted variant."""
+    try:
+        return parse_ib_bar_dt(str(raw)).isoformat()
+    except (ValueError, TypeError, AttributeError):
+        return str(raw)
 
 
 @dataclass
@@ -684,7 +695,7 @@ class Momentum5DayPlugin(PluginBase):
         def on_bar(bar):
             bars = self._bar_cache.setdefault(symbol, [])
             bars.append({
-                "date": bar.date,
+                "date": _iso_bar_date(bar.date),
                 "open": float(bar.open),
                 "high": float(bar.high),
                 "low": float(bar.low),
@@ -871,7 +882,7 @@ class Momentum5DayPlugin(PluginBase):
             return cached
         return [
             {
-                "date": b.date,
+                "date": _iso_bar_date(b.date),
                 "open": float(b.open),
                 "high": float(b.high),
                 "low": float(b.low),

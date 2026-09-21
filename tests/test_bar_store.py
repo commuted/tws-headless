@@ -145,6 +145,33 @@ class TestParseBarDt:
         dt = _parse_bar_dt("20240115 09:30:00 Mars/Olympus")
         assert dt.hour == 14          # treated as Eastern
 
+    # -- epoch (formatDate=2): an instant, with no label to misread -------
+
+    def test_epoch_seconds(self):
+        # 2024-01-15 14:30:00Z
+        assert _parse_bar_dt("1705329000") == _dt(2024, 1, 15, 14, 30)
+
+    def test_epoch_is_not_confused_with_a_daily_bar(self):
+        """"20240115" is a date; "1705329000" is a timestamp. Length tells
+        them apart — epoch seconds have been 10 digits since 2001."""
+        assert _parse_bar_dt("20240115") == _dt(2024, 1, 15, 0, 0)
+        assert _parse_bar_dt("1705329000").year == 2024
+
+    def test_epoch_and_labelled_string_agree_for_one_instant(self):
+        """The whole point of asking IB for epoch: same moment, same answer,
+        with nothing left to infer from the host's timezone."""
+        labelled = _parse_bar_dt("20240115 09:30:00 US/Eastern")
+        epoch = _parse_bar_dt(str(int(labelled.timestamp())))
+        assert epoch == labelled
+
+    def test_epoch_sorts_chronologically_as_a_string(self):
+        """The strategies merge symbols by sorting on this key, so equal
+        instants must compare equal and order must survive."""
+        keys = ["1705329000", "1705329300", "1705329600"]
+        assert sorted(keys) == keys
+        assert [_parse_bar_dt(k) for k in keys] == sorted(
+            _parse_bar_dt(k) for k in keys)
+
     def test_unparseable_raises(self):
         """Both call sites catch, so raising skips one bar instead of
         storing it at a fabricated time."""
