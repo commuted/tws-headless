@@ -175,6 +175,8 @@ long, buy the GLL hedge) rather than one combined order.
 
 import bisect
 import logging
+import threading
+import uuid
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone, time as dt_time
@@ -216,6 +218,82 @@ _CLOSE_HOUR, _CLOSE_MIN = 15, 45   # bar completes 15:50 — inside NYSE ARCA MO
 # cutoff. Expressed as an offset so an early close moves it rather than
 # skipping it — on a 13:00 half day the same arithmetic gives 12:45.
 _CLOSE_LEAD = timedelta(minutes=15)
+
+
+# ---------------------------------------------------------------------------
+# Order tagging — orderRef as the identity of an order
+# ---------------------------------------------------------------------------
+#
+# IB carries a free-form client string on every order and hands it back on
+# both openOrder and execDetails. Documented limit is 64 characters, and it
+# must be unique within a 24-hour window.
+#
+# That makes it the one piece of order identity that survives US dying. Order
+# ids do not: they are allocated per connection and mean nothing to a
+# restarted process. Local state does not either, if we died before writing
+# it. The broker's copy of the ref does, so we make it self-describing and
+# let IB hold the answer to "was this mine, and what was it for?".
+#
+#   gld_usd_swap:20260921:close:BUY:7f3a9c
+#   <---- slot ---->|<-date->|<slot>|<act>|<nonce>
+#
+# Each field earns its place:
+#   slot     which plugin instance placed it — so another plugin's orders,
+#            and manual ibctl orders, are positively excluded
+#   date     the ET session date, so yesterday's orders cannot be mistaken
+#            for today's inside the 24h uniqueness window
+#   session  open / close / intraday — which decision this was, which is what
+#            lets a restart set _open_fired_date and _close_fired_date from
+#            the BROKER rather than from a file we may not have written
+#   action   BUY / SELL / SHORT_OPEN / SHORT_COVER, matching the values in
+#            _pending_order_actions so an adopted order slots straight in
+#   nonce    6 hex chars for the 24h uniqueness requirement; two identical
+#            decisions on one day are still distinct orders
+#
+# The parse side is deliberately strict and total: anything that is not one
+# of ours returns None rather than raising, because this runs over every open
+# order in the account, including ones placed by hand or by other software.
+
+_ORDER_REF_MAX = 64
+_ORDER_REF_SEP = ":"
+_ORDER_REF_FIELDS = 5
+
+
+def build_order_ref(slot: str, session_date, session: str, action: str,
+                    nonce: Optional[str] = None) -> str:
+    """Compose an orderRef, truncating the slot if needed to fit 64 chars.
+
+    The slot is the only unbounded field, so it is the only one truncated —
+    losing part of a plugin name degrades identification, while losing part
+    of the date or action would silently change meaning.
+    """
+    nonce = nonce or uuid.uuid4().hex[:6]
+    day = session_date.strftime("%Y%m%d")
+    fixed = _ORDER_REF_SEP.join(("", day, session, action, nonce))
+    room = _ORDER_REF_MAX - len(fixed)
+    return _ORDER_REF_SEP.join((slot[:room], day, session, action, nonce))
+
+
+def parse_order_ref(ref: Optional[str]) -> Optional[dict]:
+    """Decompose one of our refs, or None if it is not one.
+
+    Total by construction: this is run against every open order in the
+    account, most of which may be nothing to do with us.
+    """
+    if not ref or not isinstance(ref, str):
+        return None
+    parts = ref.split(_ORDER_REF_SEP)
+    if len(parts) != _ORDER_REF_FIELDS:
+        return None
+    slot, day, session, action, nonce = parts
+    try:
+        when = datetime.strptime(day, "%Y%m%d").date()
+    except (ValueError, TypeError):
+        return None
+    if not slot or not session or not action:
+        return None
+    return {"slot": slot, "date": when, "session": session,
+            "action": action, "nonce": nonce}
 
 
 def _as_date(raw):
@@ -738,6 +816,10 @@ class GldUsdSwapPlugin(PluginBase):
                 self._short_gld = False
 
         self._refresh_calendar()
+        # Before warm-up and before any subscription: this can set the
+        # session guards, and a guard learned after the decision bar has
+        # already been replayed is a guard learned too late.
+        self._resync_from_broker()
         self._warm_up_from_history()
         self._maybe_backfill_reset_cadence()
         self._maybe_check_short_selling_capability()
@@ -1421,6 +1503,212 @@ class GldUsdSwapPlugin(PluginBase):
     # _CLOSE_LEAD ahead of it, so a 13:00 close yields 12:45 by the same
     # arithmetic that yields 15:45 from 16:00.
 
+    # -- resynchronise from the broker ------------------------------------
+
+    def _query_broker_orders(self, timeout: float = 20.0):
+        """Open orders at IB that carry one of OUR refs, as {order_id: parsed}.
+
+        reqAllOpenOrders rather than reqOpenOrders: the latter returns only
+        orders bound to this client id, and an engine that reconnected with a
+        different id — or a restart after a crash — would see none of its own
+        work. Completion is openOrderEnd, not a timeout, so "still
+        downloading" is never mistaken for "no open orders"; that distinction
+        is the difference between adopting our order and placing a second.
+        """
+        # A portfolio with no callback registry is a stand-in (tests,
+        # backtests), not a live connection. Return None — "unknown" —
+        # rather than an empty result, so the caller changes nothing.
+        if not isinstance(getattr(self.portfolio, "_callbacks", None), dict):
+            return None
+        found, done = {}, threading.Event()
+
+        def on_open_order(order_id, contract, order, state):
+            parsed = parse_order_ref(getattr(order, "orderRef", ""))
+            if parsed and parsed["slot"] == (self.slot or self.name):
+                found[int(order_id)] = {
+                    **parsed,
+                    "symbol": getattr(contract, "symbol", ""),
+                    "order_type": getattr(order, "orderType", ""),
+                    "qty": float(getattr(order, "totalQuantity", 0) or 0),
+                }
+
+        prev_open = self.portfolio._callbacks.get("openOrder")
+        prev_end = self.portfolio._callbacks.get("openOrderEnd")
+        self.portfolio._callbacks["openOrder"] = on_open_order
+        self.portfolio._callbacks["openOrderEnd"] = lambda: done.set()
+        try:
+            self.portfolio._open_orders_done.clear()
+            self.portfolio.reqAllOpenOrders()
+            if not done.wait(timeout):
+                logger.warning(
+                    "Open-order query timed out after %.0fs — treating the "
+                    "result as UNKNOWN, not empty", timeout)
+                return None
+        except Exception as exc:
+            logger.warning(f"Open-order query failed ({exc}) — result unknown")
+            return None
+        finally:
+            self._restore_cb("openOrder", prev_open)
+            self._restore_cb("openOrderEnd", prev_end)
+        return found
+
+    def _query_broker_executions(self, timeout: float = 20.0):
+        """Today's fills at IB carrying one of our refs, as a list of dicts."""
+        # A portfolio with no callback registry is a stand-in (tests,
+        # backtests), not a live connection. Return None — "unknown" —
+        # rather than an empty result, so the caller changes nothing.
+        if not isinstance(getattr(self.portfolio, "_callbacks", None), dict):
+            return None
+        fills, done = [], threading.Event()
+
+        def on_exec(req_id, contract, execution):
+            parsed = parse_order_ref(getattr(execution, "orderRef", ""))
+            if parsed and parsed["slot"] == (self.slot or self.name):
+                fills.append({
+                    **parsed,
+                    "order_id": int(getattr(execution, "orderId", 0) or 0),
+                    "symbol": getattr(contract, "symbol", ""),
+                    "shares": float(getattr(execution, "shares", 0) or 0),
+                    "side": getattr(execution, "side", ""),
+                    "price": float(getattr(execution, "avgPrice", 0) or 0),
+                })
+
+        prev_exec = self.portfolio._callbacks.get("execDetails")
+        prev_end = self.portfolio._callbacks.get("execDetailsEnd")
+        self.portfolio._callbacks["execDetails"] = on_exec
+        self.portfolio._callbacks["execDetailsEnd"] = lambda rid: done.set()
+        try:
+            from ibapi.execution import ExecutionFilter
+            req_id = self.portfolio.get_next_req_id()
+            # An empty filter is today's executions for this account, which is
+            # the window that matters: the refs carry their own session date,
+            # so anything older is rejected by date on the way in anyway.
+            self.portfolio.reqExecutions(req_id, ExecutionFilter())
+            if not done.wait(timeout):
+                logger.warning(
+                    "Execution query timed out after %.0fs — treating the "
+                    "result as UNKNOWN, not empty", timeout)
+                return None
+        except Exception as exc:
+            logger.warning(f"Execution query failed ({exc}) — result unknown")
+            return None
+        finally:
+            self._restore_cb("execDetails", prev_exec)
+            self._restore_cb("execDetailsEnd", prev_end)
+        return fills
+
+    def _restore_cb(self, name: str, previous) -> None:
+        if previous is not None:
+            self.portfolio._callbacks[name] = previous
+        else:
+            self.portfolio._callbacks.pop(name, None)
+
+    def _resync_from_broker(self) -> None:
+        """Rebuild what we can from IB's record of our own orders.
+
+        This is the answer to the gap that local state cannot close: an order
+        placed and then lost, because we died between IB accepting it and the
+        next write. Order ids are useless for that — they are per-connection
+        — but orderRef is ours and IB keeps it, so its copy is the one thing
+        that survives us.
+
+        Three things are recovered, in increasing order of how much they
+        matter:
+
+          adopted      an open order of ours we had no record of, put back
+                       into the pending tracker so the stale-order expiry and
+                       fill callbacks apply to it again
+          fired guards a fill or an order for today's open/close session
+                       means that decision ALREADY TRADED, so the guard is
+                       set from the broker rather than from a file we may
+                       never have written. This is what stops a restart
+                       inside a decision window trading the session twice.
+          unclaimed    a fill that never reached our holdings, because we
+                       were down when it happened. Reported, not silently
+                       adopted: moving shares between plugins is an
+                       accounting decision with a real position behind it,
+                       and the operator gets the exact command.
+
+        UNKNOWN IS NOT EMPTY. If either query fails or times out we change
+        nothing at all. Acting on a partial answer here means concluding "no
+        open order exists" from a slow response and placing a duplicate,
+        which is the precise failure this exists to prevent.
+        """
+        if not self.portfolio or not getattr(self.portfolio, "connected", False):
+            return
+
+        try:
+            open_orders = self._query_broker_orders()
+            fills = self._query_broker_executions()
+        except Exception as exc:
+            # Nothing this function learns is worth failing to start over.
+            # Without this the plugin does not run at all, which is strictly
+            # worse than running with the state it already had on disk.
+            logger.warning(
+                "Broker resync aborted (%s) — local state unchanged", exc)
+            return
+        if open_orders is None or fills is None:
+            logger.warning(
+                "Broker resync skipped: the account's open orders or fills "
+                "could not be read, and a partial answer is worse than none. "
+                "Local state is unchanged; a live order placed just before a "
+                "restart may be untracked.")
+            return
+
+        today = self._now_ny().date()
+        adopted, guards, unclaimed = [], [], []
+
+        # 1. adopt open orders we have lost track of
+        for oid, info in open_orders.items():
+            if oid in self._pending_order_actions:
+                continue
+            self._pending_order_actions[oid] = info["action"]
+            self._pending_order_placed_at[oid] = time.time()
+            self._pending_order_types[oid] = info["order_type"] or "MOC"
+            self.register_order(oid)
+            adopted.append(f"{oid} {info['action']} {info['order_type']} "
+                           f"{info['qty']:.0f} {info['symbol']} "
+                           f"({info['session']} session {info['date']})")
+
+        # 2. set the session guards from what actually traded today
+        for info in list(open_orders.values()) + list(fills):
+            if info["date"] != today:
+                continue
+            if info["session"] == "open" and self._open_fired_date != today:
+                self._open_fired_date = today
+                guards.append("open")
+            elif info["session"] == "close" and self._close_fired_date != today:
+                self._close_fired_date = today
+                guards.append("close")
+
+        # 3. fills the plugin's holdings never saw
+        held = self._current_gld_shares_signed()
+        bought = sum(f["shares"] for f in fills
+                     if f["symbol"] == "GLD" and f["side"].upper().startswith("B"))
+        if bought and held <= 0:
+            unclaimed.append(
+                f"{bought:.0f} GLD bought today under our ref but not in this "
+                f"plugin's holdings (plugin holds {held:.0f}). The shares are "
+                f"almost certainly in _unassigned; claim them with: "
+                f"ibctl transfer position _unassigned {self.name} GLD {bought:.0f}")
+
+        if adopted:
+            logger.warning("Broker resync ADOPTED %d untracked order(s): %s",
+                           len(adopted), "; ".join(adopted))
+        if guards:
+            logger.warning(
+                "Broker resync: today's %s decision already traded at IB — "
+                "guard set from the broker, so it will not run again",
+                "/".join(sorted(set(guards))))
+        for msg in unclaimed:
+            self._alert("unclaimed_fill", msg)
+        if adopted or guards:
+            self._save_state()
+        if not (adopted or guards or unclaimed):
+            logger.info("Broker resync: IB agrees with local state "
+                        "(%d open order(s), %d fill(s) today)",
+                        len(open_orders), len(fills))
+
     def _refresh_calendar(self) -> None:
         """(Re)fetch GLD's trading schedule, at most once per calendar day.
 
@@ -1501,6 +1789,33 @@ class GldUsdSwapPlugin(PluginBase):
     def _now_ny(self) -> datetime:
         """Current wall-clock time in New York (overridable in tests)."""
         return datetime.now(_NY_TZ)
+
+    def _session_slot_now(self) -> str:
+        """Which session decision the order being placed belongs to.
+
+        Derived from the wall clock rather than threaded through six
+        placement signatures: the placement methods are only ever reached
+        from _on_market_open / _on_market_close (inside their validity
+        windows) or from an operator command, and "intraday" is the honest
+        label for the latter.
+        """
+        now = self._now_ny()
+        minutes = now.hour * 60 + now.minute
+        (osh, osm), (oeh, oem) = _OPEN_WINDOW_ET
+        if osh * 60 + osm <= minutes < oeh * 60 + oem:
+            return "open"
+        (csh, csm), (ceh, cem) = self._close_window_et(now.date())
+        if csh * 60 + csm <= minutes < ceh * 60 + cem:
+            return "close"
+        return "intraday"
+
+    def _next_order_ref(self, action: str) -> str:
+        """orderRef for an order about to be placed, tagged with this plugin,
+        today's ET session, which decision it serves, and the action."""
+        return build_order_ref(
+            self.slot or self.name, self._now_ny().date(),
+            self._session_slot_now(), action,
+        )
 
     def _session_decision_valid(self, ts: datetime, window, label: str) -> bool:
         """A session decision must be for TODAY's bar and executed while it
@@ -1844,6 +2159,7 @@ class GldUsdSwapPlugin(PluginBase):
         order.tif              = "DAY"
         order.transmit         = True
 
+        order.orderRef         = self._next_order_ref("BUY")
         oid = self.portfolio.place_order_custom(
             contract, order, decision_price=self._gld_price)
         if oid is not None:
@@ -1892,6 +2208,7 @@ class GldUsdSwapPlugin(PluginBase):
         order.tif           = "DAY"
         order.transmit      = True
 
+        order.orderRef         = self._next_order_ref("SELL")
         oid = self.portfolio.place_order_custom(
             contract, order, decision_price=self._gld_price)
         if oid is not None:
@@ -1946,6 +2263,7 @@ class GldUsdSwapPlugin(PluginBase):
         order.tif              = "DAY"
         order.transmit         = True
 
+        order.orderRef         = self._next_order_ref("SHORT_OPEN")
         oid = self.portfolio.place_order_custom(
             contract, order, decision_price=self._gld_price)
         if oid is not None:
@@ -1996,6 +2314,7 @@ class GldUsdSwapPlugin(PluginBase):
         order.tif           = "DAY"
         order.transmit      = True
 
+        order.orderRef         = self._next_order_ref("SHORT_COVER")
         oid = self.portfolio.place_order_custom(
             contract, order, decision_price=self._gld_price)
         if oid is not None:
@@ -2049,6 +2368,7 @@ class GldUsdSwapPlugin(PluginBase):
         order.tif              = "DAY"
         order.transmit         = True
 
+        order.orderRef         = self._next_order_ref("GLL_OPEN")
         oid = self.portfolio.place_order_custom(
             contract, order, decision_price=self._gll_price)
         if oid is not None:
@@ -2100,6 +2420,7 @@ class GldUsdSwapPlugin(PluginBase):
         order.tif           = "DAY"
         order.transmit      = True
 
+        order.orderRef         = self._next_order_ref("GLL_CLOSE")
         oid = self.portfolio.place_order_custom(
             contract, order, decision_price=self._gll_price)
         if oid is not None:

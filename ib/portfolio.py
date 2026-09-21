@@ -190,6 +190,12 @@ class Portfolio(IBClient):
         self._executions_done = asyncio.Event()
         self._execution_db: Optional[ExecutionDatabase] = None
 
+        # Open-order download completion. A threading.Event, not asyncio: it
+        # is set from the IB reader thread and waited on by synchronous
+        # callers (plugin start-up resync), where an asyncio.Event would be
+        # signalled off-loop and might not wake the waiter promptly.
+        self._open_orders_done = threading.Event()
+
         # Load persisted forex cost basis
         self._load_forex_cost_basis()
 
@@ -2606,6 +2612,22 @@ class Portfolio(IBClient):
 
         if "execDetailsEnd" in self._callbacks:
             self._callbacks["execDetailsEnd"](reqId)
+
+    def openOrderEnd(self):
+        """Called when the open-order download from reqAllOpenOrders finishes.
+
+        The counterpart to execDetailsEnd, and the only way to know an open
+        order download is COMPLETE rather than merely quiet. Without it a
+        caller has to guess with a timeout, and a slow answer is
+        indistinguishable from "no open orders" — which, for code deciding
+        whether an order it placed is still working, is the difference
+        between adopting it and placing a second one.
+        """
+        logger.debug("Open order download complete")
+        self._open_orders_done.set()
+
+        if "openOrderEnd" in self._callbacks:
+            self._callbacks["openOrderEnd"]()
 
     def commissionReport(self, commissionReport):
         """Legacy callback name - forwards to commissionAndFeesReport"""

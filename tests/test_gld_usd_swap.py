@@ -765,9 +765,144 @@ class TestOrderPlacementIsDurable:
         left a live order at IB that the restarted plugin had no record of —
         and _restored_pending_buy needs that entry to fire at all."""
         src = Path("plugins/gld_usd_swap/plugin.py").read_text().splitlines()
-        sites = [i for i, l in enumerate(src) if l.strip() == "self.register_order(oid)"]
+        # Anchor on the placement call, not on register_order: the broker
+        # resync legitimately registers adopted orders too, and persists once
+        # at the end rather than per order.
+        sites = [i for i, l in enumerate(src) if "place_order_custom(" in l]
         assert len(sites) == 6, f"expected 6 placement sites, found {len(sites)}"
         for i in sites:
-            window = "\n".join(src[i:i + 8])
+            window = "\n".join(src[i:i + 16])
             assert "self._save_state()" in window, (
                 f"placement at line {i+1} does not persist before returning")
+
+    def test_every_placement_path_tags_its_order(self):
+        """An untagged order is one the broker cannot tell us is ours, which
+        is the whole basis of the restart resync."""
+        src = Path("plugins/gld_usd_swap/plugin.py").read_text().splitlines()
+        sites = [i for i, l in enumerate(src) if "place_order_custom(" in l]
+        for i in sites:
+            window = "\n".join(src[max(0, i - 8):i + 1])
+            assert "order.orderRef" in window, (
+                f"placement at line {i+1} sends no orderRef")
+
+
+# ---------------------------------------------------------------------------
+# orderRef: the one piece of order identity that survives us dying
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace as _NS
+from plugins.gld_usd_swap.plugin import build_order_ref, parse_order_ref
+
+
+class TestOrderRef:
+    def test_round_trip(self):
+        ref = build_order_ref("gld_usd_swap", _date(2026, 9, 21), "close", "BUY", "7f3a9c")
+        assert ref == "gld_usd_swap:20260921:close:BUY:7f3a9c"
+        assert parse_order_ref(ref) == {
+            "slot": "gld_usd_swap", "date": _date(2026, 9, 21),
+            "session": "close", "action": "BUY", "nonce": "7f3a9c",
+        }
+
+    def test_fits_ib_64_char_limit_even_with_a_long_slot(self):
+        ref = build_order_ref("a" * 120, _date(2026, 9, 21), "close", "SHORT_COVER")
+        assert len(ref) <= 64
+        p = parse_order_ref(ref)
+        assert p["date"] == _date(2026, 9, 21) and p["action"] == "SHORT_COVER"
+
+    def test_nonce_makes_same_decision_orders_distinct(self):
+        """IB requires uniqueness within 24h; two identical decisions in one
+        day are still two different orders."""
+        a = build_order_ref("s", _date(2026, 9, 21), "close", "BUY")
+        b = build_order_ref("s", _date(2026, 9, 21), "close", "BUY")
+        assert a != b
+
+    def test_rejects_anything_not_ours(self):
+        """Run against every open order in the account, most of which may be
+        manual or from other software — must be total, never raise."""
+        for junk in (None, "", "not-ours", "a:b:c", "too:many:parts:here:x:y",
+                     "slot:NOTADATE:close:BUY:x", ":20260921:close:BUY:x", 42, []):
+            assert parse_order_ref(junk) is None
+
+    def test_reconciler_refs_are_not_mistaken_for_ours(self):
+        """order_reconciler writes 'reconciled:<names>' — different shape."""
+        assert parse_order_ref("reconciled:algo_a,algo_b") is None
+
+
+class TestResyncFromBroker:
+    def _plugin(self, tmp_path, open_orders, fills, held=0):
+        p = _make_plugin(tmp_path)
+        p.portfolio = MagicMock(connected=True)
+        p._query_broker_orders = lambda *a, **k: open_orders
+        p._query_broker_executions = lambda *a, **k: fills
+        p._current_gld_shares_signed = lambda: held
+        p._save_state = lambda: None
+        p._alert = lambda kind, msg, **kw: p._alerts.append((kind, msg))
+        p._alerts = []
+        p._now_ny = lambda: _datetime(2026, 9, 21, 15, 50, tzinfo=_NY)
+        return p
+
+    def test_adopts_an_open_order_we_lost_track_of(self, tmp_path):
+        p = self._plugin(tmp_path, {
+            991: {"slot": "gld_usd_swap", "date": _date(2026, 9, 21),
+                  "session": "close", "action": "BUY", "nonce": "a1",
+                  "symbol": "GLD", "order_type": "MOC", "qty": 50.0},
+        }, [])
+        p._resync_from_broker()
+        assert p._pending_order_actions[991] == "BUY"
+        assert p._pending_order_types[991] == "MOC"
+
+    def test_sets_the_close_guard_from_a_fill(self, tmp_path):
+        """The point of the whole exercise: the broker, not a local file,
+        tells us today's close already traded."""
+        p = self._plugin(tmp_path, {}, [
+            {"slot": "gld_usd_swap", "date": _date(2026, 9, 21),
+             "session": "close", "action": "BUY", "nonce": "a1",
+             "order_id": 7, "symbol": "GLD", "shares": 50.0,
+             "side": "BOT", "price": 401.0},
+        ], held=50)
+        assert p._close_fired_date is None
+        p._resync_from_broker()
+        assert p._close_fired_date == _date(2026, 9, 21)
+
+    def test_yesterdays_order_does_not_set_todays_guard(self, tmp_path):
+        p = self._plugin(tmp_path, {}, [
+            {"slot": "gld_usd_swap", "date": _date(2026, 9, 18),
+             "session": "close", "action": "BUY", "nonce": "a1",
+             "order_id": 7, "symbol": "GLD", "shares": 50.0,
+             "side": "BOT", "price": 401.0},
+        ], held=50)
+        p._resync_from_broker()
+        assert p._close_fired_date is None
+
+    def test_unclaimed_fill_is_reported_not_silently_adopted(self, tmp_path):
+        """Moving shares between plugins is an accounting decision with a real
+        position behind it; the operator gets the exact command instead."""
+        p = self._plugin(tmp_path, {}, [
+            {"slot": "gld_usd_swap", "date": _date(2026, 9, 21),
+             "session": "close", "action": "BUY", "nonce": "a1",
+             "order_id": 7, "symbol": "GLD", "shares": 50.0,
+             "side": "BOT", "price": 401.0},
+        ], held=0)
+        p._resync_from_broker()
+        kinds = [k for k, _ in p._alerts]
+        assert "unclaimed_fill" in kinds
+        assert "ibctl transfer position _unassigned" in p._alerts[0][1]
+
+    def test_a_failed_query_changes_nothing(self, tmp_path):
+        """UNKNOWN IS NOT EMPTY. Concluding 'no open order' from a query that
+        failed is how you place the duplicate this code exists to prevent."""
+        p = self._plugin(tmp_path, None, [])
+        p._pending_order_actions = {}
+        p._resync_from_broker()
+        assert p._pending_order_actions == {}
+        assert p._close_fired_date is None and p._open_fired_date is None
+
+        p2 = self._plugin(tmp_path, {}, None)
+        p2._resync_from_broker()
+        assert p2._close_fired_date is None
+
+    def test_agreement_is_a_no_op(self, tmp_path):
+        p = self._plugin(tmp_path, {}, [], held=50)
+        p._resync_from_broker()
+        assert p._pending_order_actions == {}
+        assert p._alerts == []
