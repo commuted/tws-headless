@@ -1527,6 +1527,7 @@ class GldUsdSwapPlugin(PluginBase):
             if parsed and parsed["slot"] == (self.slot or self.name):
                 found[int(order_id)] = {
                     **parsed,
+                    "ref": getattr(order, "orderRef", ""),
                     "symbol": getattr(contract, "symbol", ""),
                     "order_type": getattr(order, "orderType", ""),
                     "qty": float(getattr(order, "totalQuantity", 0) or 0),
@@ -1668,7 +1669,7 @@ class GldUsdSwapPlugin(PluginBase):
             self.register_order(oid)
             adopted.append(f"{oid} {info['action']} {info['order_type']} "
                            f"{info['qty']:.0f} {info['symbol']} "
-                           f"({info['session']} session {info['date']})")
+                           f"ref={info.get('ref', '?')}")
 
         # 2. set the session guards from what actually traded today
         for info in list(open_orders.values()) + list(fills):
@@ -2174,7 +2175,7 @@ class GldUsdSwapPlugin(PluginBase):
             # that the restarted plugin had no record of — and the
             # _restored_pending_buy safety net needs exactly this entry to fire.
             self._save_state()
-            logger.info(f"MOC BUY {shares} GLD (order_id={oid}) — {reason}")
+            logger.info(f"MOC BUY {shares} GLD (order_id={oid} ref={order.orderRef}) — {reason}")
         else:
             logger.error(f"Failed to place MOC BUY {shares} GLD — {reason}")
 
@@ -2223,7 +2224,7 @@ class GldUsdSwapPlugin(PluginBase):
             # that the restarted plugin had no record of — and the
             # _restored_pending_buy safety net needs exactly this entry to fire.
             self._save_state()
-            logger.info(f"MKT SELL {qty} GLD (order_id={oid}) — {reason}")
+            logger.info(f"MKT SELL {qty} GLD (order_id={oid} ref={order.orderRef}) — {reason}")
         else:
             logger.error(f"Failed to place MKT SELL {qty} GLD — {reason}")
 
@@ -2278,7 +2279,7 @@ class GldUsdSwapPlugin(PluginBase):
             # that the restarted plugin had no record of — and the
             # _restored_pending_buy safety net needs exactly this entry to fire.
             self._save_state()
-            logger.info(f"MOC SHORT SELL {shares} GLD (order_id={oid}) — {reason}")
+            logger.info(f"MOC SHORT SELL {shares} GLD (order_id={oid} ref={order.orderRef}) — {reason}")
         else:
             logger.error(f"Failed to place MOC SHORT SELL {shares} GLD — {reason}")
 
@@ -2329,7 +2330,7 @@ class GldUsdSwapPlugin(PluginBase):
             # that the restarted plugin had no record of — and the
             # _restored_pending_buy safety net needs exactly this entry to fire.
             self._save_state()
-            logger.info(f"MKT COVER BUY {shares} GLD (order_id={oid}) — {reason}")
+            logger.info(f"MKT COVER BUY {shares} GLD (order_id={oid} ref={order.orderRef}) — {reason}")
         else:
             logger.error(f"Failed to place MKT COVER BUY {shares} GLD — {reason}")
 
@@ -2383,7 +2384,7 @@ class GldUsdSwapPlugin(PluginBase):
             # that the restarted plugin had no record of — and the
             # _restored_pending_buy safety net needs exactly this entry to fire.
             self._save_state()
-            logger.info(f"MOC BUY {shares} GLL (order_id={oid}) — {reason}")
+            logger.info(f"MOC BUY {shares} GLL (order_id={oid} ref={order.orderRef}) — {reason}")
         else:
             logger.error(f"Failed to place MOC BUY {shares} GLL — {reason}")
 
@@ -2435,7 +2436,7 @@ class GldUsdSwapPlugin(PluginBase):
             # that the restarted plugin had no record of — and the
             # _restored_pending_buy safety net needs exactly this entry to fire.
             self._save_state()
-            logger.info(f"MKT SELL {shares} GLL (order_id={oid}) — {reason}")
+            logger.info(f"MKT SELL {shares} GLL (order_id={oid} ref={order.orderRef}) — {reason}")
         else:
             logger.error(f"Failed to place MKT SELL {shares} GLL — {reason}")
 

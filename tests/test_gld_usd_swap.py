@@ -775,6 +775,18 @@ class TestOrderPlacementIsDurable:
             assert "self._save_state()" in window, (
                 f"placement at line {i+1} does not persist before returning")
 
+    def test_every_placement_path_logs_the_ref(self):
+        """order_id is per-connection and meaningless after a restart; the ref
+        is the identifier that survives. Logging only the former means the
+        log cannot be tied back to what IB still holds — and after a crash
+        the log is one of the few forensic artifacts left."""
+        src = Path("plugins/gld_usd_swap/plugin.py").read_text().splitlines()
+        placed = [i for i, l in enumerate(src) if "place_order_custom(" in l]
+        for i in placed:
+            window = "\n".join(src[i:i + 16])
+            assert "ref={order.orderRef}" in window, (
+                f"placement at line {i+1} logs no orderRef")
+
     def test_every_placement_path_tags_its_order(self):
         """An untagged order is one the broker cannot tell us is ours, which
         is the whole basis of the restart resync."""
