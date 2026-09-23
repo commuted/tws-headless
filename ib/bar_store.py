@@ -137,8 +137,11 @@ _BAR_SECONDS = {
 # or a hyphen (current). The timezone label is optional and may contain
 # underscores ("America/Los_Angeles") or three components ("America/
 # Argentina/Buenos_Aires").
+# The separator repeats because IB's execution.time uses TWO spaces where its
+# bar dates use one ("20231218  14:35:42"). Same grammar otherwise, so one
+# parser serves both rather than two that can drift apart.
 _BAR_DT_RE = re.compile(
-    r"^(\d{8})[ \-](\d{2}:\d{2}:\d{2})(?:\s+([A-Za-z_]+(?:/[A-Za-z_]+)+|UTC|GMT))?$"
+    r"^(\d{8})[ \-]+(\d{2}:\d{2}:\d{2})(?:\s+([A-Za-z_]+(?:/[A-Za-z_]+)+|UTC|GMT))?$"
 )
 
 # IB sends the legacy "US/*" spellings, which are backward-compatibility links

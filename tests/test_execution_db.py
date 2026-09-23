@@ -932,3 +932,63 @@ class TestCommissionReport:
 
         r = execution_db.get_commission_report()
         assert r["currency"] is None
+
+
+# ---------------------------------------------------------------------------
+# Execution timestamps: the parser, and legacy rows
+# ---------------------------------------------------------------------------
+
+from datetime import timezone as _tz
+from ib.execution_db import _ts
+
+
+class TestExecutionTimeParsing:
+    """The old parser accepted neither format IB actually sends and fell
+    through to datetime.now(), so every stored execution time was really a
+    processing time in host-local zone. Nothing exercised it, which is why it
+    survived. These call it directly."""
+
+    def _f(self):
+        from ib.portfolio import _parse_ib_exec_time
+        return _parse_ib_exec_time
+
+    def test_zone_suffixed_form_is_what_ib_sends(self):
+        got = self._f()("20260918 09:30:06 US/Eastern")
+        assert got.isoformat() == "2026-09-18T13:30:06+00:00"
+
+    def test_double_space_legacy_form_is_read_as_eastern_and_warns(self, caplog):
+        """No zone label means IB did not say, so the shared parser's legacy
+        Eastern default applies — 13:30 ET is 17:30 UTC. It is a guess, so it
+        must be logged rather than made quietly."""
+        got = self._f()("20260918  13:30:06")
+        assert got.isoformat() == "2026-09-18T17:30:06+00:00"
+        assert any("carries no timezone" in r.message for r in caplog.records)
+
+    def test_gateway_utc_spelling(self):
+        got = self._f()("20260918 13:30:06 Africa/Abidjan")
+        assert got.isoformat() == "2026-09-18T13:30:06+00:00"
+
+    def test_result_is_always_utc_aware(self):
+        for s in ("20260918 09:30:06 US/Eastern", "20260918  13:30:06",
+                  "20260918 06:30:06 America/Los_Angeles"):
+            assert self._f()(s).tzinfo == _tz.utc
+
+    def test_unparseable_is_loud_not_silent(self, caplog):
+        """The silent now() fallback is what hid this for months."""
+        got = self._f()("not a time")
+        assert got.tzinfo == _tz.utc
+        assert any("Unparseable IB execution time" in r.message for r in caplog.records)
+
+
+class TestLegacyTimestampsDoNotExplode:
+    def test_naive_rows_are_read_as_utc(self):
+        """Rows written before the fix are naive, in an unknown zone. Left
+        naive they would raise the first time they met an aware value."""
+        assert _ts("2026-09-18T13:00:00.298083").tzinfo == _tz.utc
+
+    def test_aware_rows_pass_through(self):
+        assert _ts("2026-09-18T13:00:00+00:00").tzinfo == _tz.utc
+
+    def test_naive_and_aware_are_comparable(self):
+        old, new = _ts("2026-09-18T13:00:00.298083"), _ts("2026-09-19T13:00:00+00:00")
+        assert old < new          # would TypeError if either stayed naive

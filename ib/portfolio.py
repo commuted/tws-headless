@@ -12,7 +12,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 
 from ibapi.contract import Contract
 from ibapi.ticktype import TickTypeEnum
@@ -104,14 +105,55 @@ SIZE_TICK_TYPE_NAMES = {
 }
 
 
+# A zone label on an IB time: "Area/Location", or a bare UTC/GMT.
+_EXEC_TIME_HAS_ZONE = re.compile(r"\s([A-Za-z_]+/[A-Za-z_]+|UTC|GMT)\s*$")
+
+
 def _parse_ib_exec_time(time_str: str) -> datetime:
-    """Parse IB execution.time string (e.g. '20231218  14:35:42') into a datetime."""
-    for fmt in ("%Y%m%d  %H:%M:%S", "%Y%m%d %H:%M:%S"):
-        try:
-            return datetime.strptime(time_str.strip(), fmt)
-        except (ValueError, AttributeError):
-            pass
-    return datetime.now()
+    """Parse IB's execution.time into a UTC-aware datetime.
+
+    THIS USED TO RETURN THE WRONG THING, SILENTLY. It tried two strptime
+    formats and, when both failed, returned datetime.now() — so the column
+    recorded when we PROCESSED a fill, in whatever zone the host happened to
+    be, rather than when the fill happened. Both formats failed on every
+    execution this system has ever recorded: IB appends a timezone
+    ("20260918 09:30:06 US/Eastern"), which neither pattern accepts. The
+    giveaway was microseconds in stored values, which strptime of a
+    seconds-resolution format cannot produce; 9 of 9 rows had them.
+
+    So it now shares the bar parser, which already reads IB's whole date
+    grammar — epoch, labelled clock time, and the legacy unlabelled form —
+    and already maps IB's zone spellings. One parser for one vendor format,
+    rather than two that drift.
+
+    An unlabelled time carries no zone of its own, and IB formats in the
+    GATEWAY's configured timezone, which the API never reports. It is read as
+    US/Eastern, the shared parser's legacy default — a guess, so it is logged
+    rather than made quietly. Modern IB labels the zone and this path is not
+    reached; if the warning starts appearing, the zone in jts.ini is what
+    decides what the value actually meant.
+    """
+    from .bar_store import parse_ib_bar_dt   # local: avoids an import cycle
+
+    raw = (time_str or "").strip()
+    try:
+        parsed = parse_ib_bar_dt(raw).astimezone(timezone.utc)
+    except (ValueError, TypeError, AttributeError):
+        parsed = None
+    if parsed is not None:
+        if not _EXEC_TIME_HAS_ZONE.search(raw):
+            logger.warning(
+                "IB execution time %r carries no timezone; reading it as "
+                "US/Eastern. If this Gateway is configured to another zone "
+                "(jts.ini TimeZone=), the stored instant is wrong by that "
+                "offset.", raw)
+        return parsed
+
+    logger.warning(
+        "Unparseable IB execution time %r — recording the current instant "
+        "instead. The stored time is when this fill was PROCESSED, not when "
+        "it executed; if this repeats, IB has changed the format again.", raw)
+    return datetime.now(timezone.utc)
 
 
 class Portfolio(IBClient):

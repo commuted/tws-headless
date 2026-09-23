@@ -694,3 +694,44 @@ class TestInsertBar:
         monkeypatch.setattr(store, "_store_bars", boom)
         bar = _make_bar("20250101 10:00:00", close=100.0)
         store.insert_bar("GLD", "5 mins", "TRADES", True, bar)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# IB execution times share this grammar (Portfolio._parse_ib_exec_time)
+# ---------------------------------------------------------------------------
+
+class TestExecutionTimeGrammar:
+    """execution.time uses TWO spaces where bar dates use one, and carries a
+    zone suffix. Both strptime formats in the old parser rejected the real
+    thing, so it fell through to datetime.now() on every fill this system
+    ever recorded — storing when a fill was processed, in host-local time,
+    instead of when it executed. 9 of 9 rows had microseconds, which a
+    seconds-resolution strptime cannot produce."""
+
+    def test_double_space_legacy_form(self):
+        assert _parse_bar_dt("20231218  14:35:42") == _dt(2023, 12, 18, 19, 35, 42)
+
+    def test_single_space_form(self):
+        assert _parse_bar_dt("20231218 14:35:42") == _dt(2023, 12, 18, 19, 35, 42)
+
+    def test_the_form_that_was_silently_failing(self):
+        """A zone suffix is what IB actually sends, and what both old formats
+        rejected."""
+        got = _parse_bar_dt("20260918 09:30:06 US/Eastern")
+        assert got == _dt(2026, 9, 18, 13, 30, 6)
+
+    def test_double_space_with_zone(self):
+        got = _parse_bar_dt("20260918  09:30:06 US/Eastern")
+        assert got == _dt(2026, 9, 18, 13, 30, 6)
+
+    def test_gateway_utc_spelling(self):
+        """EC2's Gateway is configured Africa/Abidjan, so fills come back
+        labelled that way."""
+        assert (_parse_bar_dt("20260918 13:30:06 Africa/Abidjan")
+                == _dt(2026, 9, 18, 13, 30, 6))
+
+    def test_all_spellings_of_one_fill_agree(self):
+        same = ["20260918 09:30:06 US/Eastern",
+                "20260918 13:30:06 Africa/Abidjan",
+                "20260918 06:30:06 America/Los_Angeles"]
+        assert len({_parse_bar_dt(s) for s in same}) == 1

@@ -8,7 +8,7 @@ P&L analysis, and cost basis calculation.
 import asyncio
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
@@ -17,6 +17,27 @@ logger = logging.getLogger(__name__)
 
 # Default database path
 DEFAULT_DB_PATH = Path.home() / ".ib_executions.db"
+
+
+
+def _ts(raw: str) -> datetime:
+    """A stored timestamp as a UTC-aware datetime.
+
+    Rows written before 2026-09-23 are NAIVE, and worse, they are naive in
+    whatever zone the writing host used — Pacific for the ones inherited from
+    descartes, UTC for anything EC2 wrote. Returning them as-is beside the
+    aware values written since would raise on the first comparison between
+    the two, which is exactly the sort of break that surfaces inside a cost
+    report rather than at a boundary.
+
+    So a naive value is read as UTC. That is a documented assumption, not a
+    recovery: for the legacy rows the true zone is unknown and the stored
+    instant was never the execution time anyway (see
+    Portfolio._parse_ib_exec_time).
+    """
+    dt = datetime.fromisoformat(raw)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
 
 
 @dataclass
@@ -322,7 +343,7 @@ class ExecutionDatabase:
                         avg_price=row["avg_price"],
                         side=row["side"],
                         account=row["account"] or "",
-                        timestamp=datetime.fromisoformat(row["timestamp"]),
+                        timestamp=_ts(row["timestamp"]),
                     )
                     for row in rows
                 ]
@@ -373,7 +394,7 @@ class ExecutionDatabase:
                         avg_price=row["avg_price"],
                         side=row["side"],
                         account=row["account"] or "",
-                        timestamp=datetime.fromisoformat(row["timestamp"]),
+                        timestamp=_ts(row["timestamp"]),
                     )
                     for row in rows
                 ]
@@ -401,7 +422,7 @@ class ExecutionDatabase:
                         commission=row["commission"],
                         currency=row["currency"] or "USD",
                         realized_pnl=row["realized_pnl"],
-                        timestamp=datetime.fromisoformat(row["timestamp"]),
+                        timestamp=_ts(row["timestamp"]),
                     )
                 return None
 
