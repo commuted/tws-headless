@@ -172,6 +172,18 @@ def _parse_bar_dt(date_str: str) -> datetime:
       "20240115 09:30:00 US/Eastern"       labelled, and the label is USED
       "20240115 13:30:00 Africa/Abidjan"   IB's spelling of UTC
       "20240115 06:30:00 America/Los_Angeles"
+      "2024-01-15T14:30:00+00:00"          ISO-8601 — what the engine's
+      "2024-01-15T14:30:00"                `historical fetch` command returns
+                                           (no offset = UTC, as stored here)
+
+    ISO-8601 IS WHAT ibctl HANDS BACK. The engine converts every bar date to
+    ISO-8601 UTC before putting it on the socket (run_engine._iso_bar_date),
+    and `ibctl historical fetch` passes those dicts straight to this store.
+    Without this branch every such bar raised here, _store_bars skipped it
+    with a warning, and coverage was STILL extended over the range — so an
+    ibctl fetch stored nothing and marked the gap as held for good. Found
+    2026-09-27 when a USD.JPY BID fetch left three weeks of coverage with no
+    bars behind it.
 
     We now ask IB for epoch (see Portfolio.request_historical_data), so the
     labelled forms are what already sits in the cache and what a downgraded
@@ -207,6 +219,12 @@ def _parse_bar_dt(date_str: str) -> datetime:
     # digits since 2001 and stay 10 until 2286.
     if s.isdigit() and len(s) >= 9:
         return datetime.fromtimestamp(int(s), UTC)
+
+    # ISO-8601 ("2024-01-15T14:30:00+00:00"): the engine's socket format.
+    # A missing offset means UTC — that is how this store writes it.
+    if len(s) >= 19 and s[4] == "-" and s[10] in "T ":
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).astimezone(UTC)
 
     # Daily bar: date only
     if len(s) == 8 and s.isdigit():

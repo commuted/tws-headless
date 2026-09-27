@@ -172,6 +172,21 @@ class TestParseBarDt:
         assert [_parse_bar_dt(k) for k in keys] == sorted(
             _parse_bar_dt(k) for k in keys)
 
+    # -- ISO-8601: what the engine returns to ibctl over the socket --------
+
+    def test_iso_with_offset(self):
+        assert _parse_bar_dt("2024-01-15T14:30:00+00:00") == _dt(2024, 1, 15, 14, 30)
+        assert _parse_bar_dt("2024-01-15T09:30:00-05:00") == _dt(2024, 1, 15, 14, 30)
+        assert _parse_bar_dt("2024-01-15T14:30:00Z") == _dt(2024, 1, 15, 14, 30)
+
+    def test_naive_iso_is_utc_like_the_stored_form(self):
+        assert _parse_bar_dt("2024-01-15T14:30:00") == _dt(2024, 1, 15, 14, 30)
+
+    def test_iso_round_trips_the_engine_conversion(self):
+        """run_engine._iso_bar_date(epoch) must parse back to the same instant."""
+        epoch = _parse_bar_dt("1705329000")
+        assert _parse_bar_dt(epoch.isoformat()) == epoch
+
     def test_unparseable_raises(self):
         """Both call sites catch, so raising skips one bar instead of
         storing it at a fabricated time."""
@@ -554,6 +569,19 @@ class TestBarStoreDateFormats:
             fetch_fn=lambda s, e: [_make_bar("20240115-09:30:00")],
         )
         assert len(result) == 1
+
+    def test_iso_bar_from_ibctl_is_stored_not_skipped(self, store):
+        """`ibctl historical fetch` feeds the engine's ISO dates to this
+        store. They used to be skipped while coverage was extended anyway,
+        leaving a permanent hole; they must land as rows."""
+        result = store.get_bars(
+            "USD.JPY", "5 mins", "BID", False,
+            start_dt=_dt(2026, 9, 7), end_dt=_dt(2026, 9, 8),
+            fetch_fn=lambda s, e: [_make_bar("2026-09-07T00:00:00+00:00"),
+                                   _make_bar("2026-09-07T00:05:00+00:00")],
+        )
+        # get_bars returns rows read back from SQLite, so these were stored
+        assert len(result) == 2
 
     def test_bar_dt_orig_preserved(self, store):
         original = "20240115-14:30:00"
