@@ -354,6 +354,31 @@ _CALENDAR_FETCH_TIMEOUT = 5.0
 
 _NY_TZ = ZoneInfo("America/New_York")
 
+# Warm-up: replay this many trading sessions, found within this many
+# calendar days (a weekend plus a holiday run — e.g. Thanksgiving Thursday
+# and Friday — still leaves 2 sessions inside 10 days).
+WARMUP_SESSIONS = 2
+WARMUP_LOOKBACK_DAYS = 10
+
+
+def last_sessions(bars_by_symbol: Dict[str, list], n: int, anchor: str = "GLD") -> Dict[str, list]:
+    """
+    Keep each symbol's bars from the last `n` New York session dates. The
+    dates come from the anchor symbol when it has bars (every symbol is then
+    cut to the same sessions), otherwise from all symbols together.
+    Unparseable bar dates are dropped.
+    """
+    def day(b):
+        try:
+            return parse_ib_bar_dt(str(b.date)).astimezone(_NY_TZ).date()
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    dated = {s: [(day(b), b) for b in bars] for s, bars in bars_by_symbol.items()}
+    source = dated.get(anchor) or [x for v in dated.values() for x in v]
+    keep = set(sorted({d for d, _ in source if d is not None})[-n:])
+    return {s: [b for d, b in v if d in keep] for s, v in dated.items()}
+
 # Declared to PluginExecutive.aggregate_trading_windows() via trading_hours()
 # below: the wall-clock span this plugin actually needs its four feeds and
 # connection alive for. A little before the open (so the 09:30 decision bar
@@ -988,8 +1013,20 @@ class GldUsdSwapPlugin(PluginBase):
 
     def _warm_up_from_history(self) -> None:
         """
-        Fetch 2 days of 5-min bars for UUP, TLT, RINF, and GLD to seed all
-        SMAs and derivative estimators on startup.
+        Seed all SMAs and derivative estimators on startup from the last
+        WARMUP_SESSIONS trading sessions of 5-min bars for UUP, TLT, RINF
+        and GLD.
+
+        SESSIONS, NOT CALENDAR DAYS. This used to ask for the last 2 calendar
+        days. Started on a Monday before the open (or the day after a
+        holiday) that window holds no RTH bars at all: IB answered with the
+        prior trading days, BarStore stored them — correctly, outside the
+        window — and the warm-up got nothing back and began with regime
+        "unknown" (seen 2026-09-28 06:50 UTC). Now it asks for
+        WARMUP_LOOKBACK_DAYS calendar days, enough to span a weekend plus a
+        holiday run, and replays only the last WARMUP_SESSIONS sessions
+        present (anchored on GLD), so a normal weekday pre-market start
+        replays exactly what it did before.
 
         Bars are replayed in chronological order across all symbols so that
         _recompute_regime() sees a consistent multi-signal snapshot at each
@@ -1002,7 +1039,7 @@ class GldUsdSwapPlugin(PluginBase):
 
         _UTC = timezone.utc
         _now = datetime.now(_UTC)
-        _start = _now - timedelta(days=2)
+        _start = _now - timedelta(days=WARMUP_LOOKBACK_DAYS)
 
         # --- fetch all symbols upfront ---
         signal_configs = [
@@ -1020,9 +1057,12 @@ class GldUsdSwapPlugin(PluginBase):
                 what_to_show="TRADES",
                 use_rth=True,
             )
+            bars_by_symbol[symbol] = bars or []
+
+        bars_by_symbol = last_sessions(bars_by_symbol, WARMUP_SESSIONS, anchor="GLD")
+        for symbol, bars in bars_by_symbol.items():
             if not bars:
                 logger.warning(f"Warm-up: no historical data for {symbol}")
-            bars_by_symbol[symbol] = bars or []
 
         # --- merge into a single chronological stream ---
         # Keyed on the PARSED instant, not the raw IB string. The grouping

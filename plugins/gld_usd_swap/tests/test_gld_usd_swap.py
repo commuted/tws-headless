@@ -1681,3 +1681,65 @@ class TestTradeCountOnlyCountsPlacedOrders:
         plugin._gld_price = 380.0
         plugin._place_moc_buy(26, "test")
         assert plugin._trade_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Warm-up — trading sessions, not calendar days
+# ---------------------------------------------------------------------------
+
+class TestWarmUpSessions:
+    """A Monday pre-market start used to ask for the last 2 calendar days
+    (Saturday..Monday), get no RTH bars back and begin with regime unknown."""
+
+    def _plugin_with_history(self, tmp_path, dates):
+        plugin = _make_plugin(tmp_path)
+        plugin.portfolio = Mock()
+        asked = []
+        bars = {s: [] for s in ("GLD", "UUP", "TLT", "RINF")}
+        for d in dates:
+            bars["GLD"].extend(_make_day_bars("GLD", d, 400.0, 401.0))
+            for s in ("UUP", "TLT", "RINF"):
+                bars[s].extend(_make_day_bars(s, d, 28.0, 28.0))
+
+        def fake(contract, start_dt, end_dt, **kw):
+            asked.append((contract.symbol, start_dt, end_dt))
+            return bars[contract.symbol]
+        plugin.get_bars_cached = fake
+        return plugin, asked
+
+    def test_monday_start_finds_thursday_and_friday(self, tmp_path, monkeypatch, caplog):
+        import logging
+        import plugins.gld_usd_swap.plugin as mod
+        plugin, asked = self._plugin_with_history(
+            tmp_path, ["20260922", "20260923", "20260924", "20260925"])
+        replayed = {}
+        real = mod.last_sessions
+        monkeypatch.setattr(mod, "last_sessions",
+                            lambda b, n, anchor: replayed.update(real(b, n, anchor)) or dict(replayed))
+        with caplog.at_level(logging.WARNING):
+            plugin._warm_up_from_history()
+        # asked far enough back to span a weekend plus holidays
+        assert all((e - s).days >= mod.WARMUP_LOOKBACK_DAYS for _, s, e in asked)
+        # replayed exactly Thursday and Friday, for every symbol
+        for sym in ("GLD", "UUP", "TLT", "RINF"):
+            assert {b.date[:8] for b in replayed[sym]} == {"20260924", "20260925"}
+            assert len(replayed[sym]) == 2 * 76
+        assert "no historical data" not in caplog.text
+        assert len(plugin._uup.closes) > 0
+
+    def test_only_the_last_two_sessions_are_replayed(self):
+        from plugins.gld_usd_swap.plugin import last_sessions
+        days = ["20260921", "20260922", "20260923", "20260924", "20260925"]
+        bars = {"GLD": [b for d in days for b in _make_day_bars("GLD", d, 1, 1)],
+                "UUP": [b for d in days[1:] for b in _make_day_bars("UUP", d, 1, 1)]}
+        out = last_sessions(bars, 2, anchor="GLD")
+        kept = {b.date[:8] for b in out["GLD"]}
+        assert kept == {"20260924", "20260925"}
+        assert {b.date[:8] for b in out["UUP"]} == {"20260924", "20260925"}
+
+    def test_anchor_missing_falls_back_to_all_symbols(self):
+        from plugins.gld_usd_swap.plugin import last_sessions
+        bars = {"GLD": [], "UUP": _make_day_bars("UUP", "20260924", 1, 1)
+                + _make_day_bars("UUP", "20260925", 1, 1)}
+        out = last_sessions(bars, 1, anchor="GLD")
+        assert {b.date[:8] for b in out["UUP"]} == {"20260925"}
