@@ -38,10 +38,10 @@ because the engine's historical command builds only etf/stock/forex contracts
 first, and that is a change to a live trading system, not something to slip
 into a data script.
 
-Run it with an interpreter that has ibapi — ibctl imports ib/ to store what
-it fetches, so a bare `python3` without ibapi will pull the bars and then
-fail to save them. The recorder passes its own sys.executable down to ibctl
-so the two never disagree about that.
+Run it with an interpreter that has ibapi — ibctl imports ib/, which pulls
+in ibapi. The recorder passes its own sys.executable down to ibctl so the
+two never disagree about that. The ENGINE stores the bars (through the same
+ib/historical.py path plugins use); ibctl only asks and prints.
 
 Usage:
     python3 recorder.py --status              # coverage + how close to permanent loss
@@ -108,8 +108,8 @@ handler's blocking wait never occupies the event loop.
         >> historical/recorder.log 2>&1
 
 The interpreter is named explicitly rather than relying on the shebang:
-ibctl imports ib/ to store what it fetches, so a python without ibapi pulls
-the bars successfully and then dies saving them.
+ibctl imports ib/ (for the shared DB resolver and duration parsing), and
+ib/ pulls in ibapi.
 """
 
 import argparse
@@ -208,15 +208,12 @@ def load_watchlist(path):
 
 
 def db_path():
-    """Honour the same config.json ibctl uses, so both see one database."""
-    try:
-        with open(CONFIG) as fh:
-            p = json.load(fh).get("db_path")
-            if p:
-                return p
-    except (OSError, ValueError):
-        pass
-    return DEFAULT_DB
+    """The database the engine writes: the one resolver every path uses
+    ($IB_HIST_DB, then config.json, then historical/bars.db)."""
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    from ib.bar_store import resolve_db_path
+    return str(resolve_db_path())
 
 
 def coverage_by_series(path):
@@ -306,10 +303,8 @@ def plan(entry, cov, now):
 
 def fetch(entry, days, pace, dry, sock, end=None):
     dur = f"{max(1, int(round(days)))} D"
-    # sys.executable, not the shebang. ibctl imports ib/ to write the bars it
-    # gets back, and ib/models.py imports ibapi — so a shebang resolving to a
-    # system python without ibapi fetches the data successfully and then dies
-    # saving it, which looks like a fetch failure and is not one.
+    # sys.executable, not the shebang: ibctl imports ib/, and ib/ imports
+    # ibapi, so a shebang resolving to a python without ibapi dies on import.
     cmd = [sys.executable, "ibctl.py", "--socket", sock,
            "historical", "fetch", entry["symbol"].upper(),
            "--bar-size", entry["bar_size"], "--duration", dur,
@@ -321,8 +316,10 @@ def fetch(entry, days, pace, dry, sock, end=None):
     if dry:
         print(f"    would run: {' '.join(cmd)}")
         return True
+    # The engine may make several paced IB requests for one call (ibctl
+    # waits 130 s per chunk), so allow well beyond the old single-request 300 s.
     proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
-                          timeout=300)
+                          timeout=1800)
     ok = proc.returncode == 0
     tail = (proc.stdout or proc.stderr or "").strip().splitlines()
     print(f"    {'ok ' if ok else 'FAIL'} {dur:>7}  {tail[-1][:80] if tail else ''}")

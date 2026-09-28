@@ -27,12 +27,15 @@ Usage
     from datetime import datetime
     from ib.bar_store import BarStore
 
+    # Inside the engine, prefer ib.historical.cached_bars (or, in a plugin,
+    # self.get_bars_cached): it builds the fetch_fn, keys the series and
+    # uses the shared store. Direct use looks like this:
     store = BarStore("historical/bars.db")
 
-    # Build a fetch_fn that wraps plugin.get_historical_data
+    # A fetch_fn RAISES (or returns None) on failure; [] means "no bars".
     def fetch_gld(start_dt, end_dt):
         end_str = end_dt.strftime("%Y%m%d-%H:%M:%S")   # UTC, new API format
-        return plugin.get_historical_data(
+        return plugin.get_historical_data(               # None on failure
             contract=ContractBuilder.etf("GLD"),
             end_date_time=end_str,
             duration_str=bar_store.duration_str(start_dt, end_dt),
@@ -65,7 +68,9 @@ Schema
                ISO-8601 UTC strings.  Automatically merged on every insert.
 """
 
+import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -117,6 +122,11 @@ _MAX_FETCH_SECONDS = {
     "1 month":  63_072_000,
 }
 _DEFAULT_MAX_FETCH_SECONDS = 2_592_000   # 30 days fallback
+
+
+def max_fetch_seconds(bar_size: str) -> int:
+    """The largest span one IB request covers for this bar size."""
+    return _MAX_FETCH_SECONDS.get(bar_size, _DEFAULT_MAX_FETCH_SECONDS)
 
 # Bar size → duration of one bar in seconds (for insert_bar coverage endpoint)
 _BAR_SECONDS = {
@@ -373,6 +383,81 @@ def duration_str(start_dt: datetime, end_dt: datetime) -> str:
     return f"{years} Y"
 
 
+def parse_duration(dur: str) -> timedelta:
+    """
+    IB durationStr -> timedelta; the inverse of duration_str.
+
+    Needed because callers speak (duration, end) while BarStore speaks
+    (start_dt, end_dt), and the cache cannot decide what it already holds
+    without an explicit range. Months and years are approximated the same way
+    duration_str approximates them on the way out (30 and 365 days), so a
+    round trip through both is stable. Accepts "6 M" or the socket's "6_M".
+    """
+    parts = dur.replace("_", " ").strip().split()
+    if len(parts) != 2:
+        raise ValueError(f"bad duration {dur!r}; expected e.g. '2 D' or '6 M'")
+    n, unit = int(parts[0]), parts[1].upper()
+    scale = {"S": timedelta(seconds=1), "D": timedelta(days=1),
+             "W": timedelta(weeks=1), "M": timedelta(days=30),
+             "Y": timedelta(days=365)}
+    if unit not in scale:
+        raise ValueError(f"bad duration unit {unit!r}")
+    return n * scale[unit]
+
+
+# ---------------------------------------------------------------------------
+# Which database — ONE answer for every reader and writer
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+HIST_CONFIG = PROJECT_ROOT / "historical" / "config.json"
+DEFAULT_DB = PROJECT_ROOT / "historical" / "bars.db"
+
+
+def resolve_db_path() -> Path:
+    """
+    The BarStore database every path uses, in order of precedence:
+
+        $IB_HIST_DB                         explicit override (tests, one-offs)
+        historical/config.json "db_path"    set by `ibctl historical set-db`
+        historical/bars.db                  default
+
+    Plugins used to honour only $IB_HIST_DB and ibctl only config.json, so a
+    `set-db` silently split the two onto different files: ibctl reported
+    coverage the plugins could not see, and vice versa.
+    """
+    env = os.environ.get("IB_HIST_DB")
+    if env:
+        return Path(env)
+    try:
+        with open(HIST_CONFIG) as fh:
+            p = json.load(fh).get("db_path")
+            if p:
+                return Path(p)
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_DB
+
+
+_shared_lock = threading.Lock()
+_shared: dict = {}
+
+
+def shared_store(db_path=None) -> "BarStore":
+    """
+    One BarStore per database file per process. Plugins and the engine's
+    `historical` command share it, so every writer in the engine goes
+    through the same instance and therefore the same write lock.
+    """
+    path = Path(db_path) if db_path else resolve_db_path()
+    key = str(path.resolve())
+    with _shared_lock:
+        store = _shared.get(key)
+        if store is None:
+            store = _shared[key] = BarStore(path)
+        return store
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -451,6 +536,7 @@ class BarStore:
         end_dt: datetime,
         fetch_fn: Callable[[datetime, datetime], List],
         force: bool = False,
+        stats: Optional[dict] = None,
     ) -> List[BarRecord]:
         """
         Return all bars for the requested series and date range.
@@ -467,8 +553,9 @@ class BarStore:
             objects must expose .date, .open, .high, .low, .close, .volume,
             and optionally .wap and .barCount.
 
-            RAISE to signal that the fetch FAILED — the chunk is then left
-            uncovered and will be retried on a later call. RETURN an empty
+            RAISE (or return None) to signal that the fetch FAILED — the
+            chunk is then left uncovered and will be retried on a later
+            call. RETURN an empty
             list to assert that the source was reached and genuinely has no
             data for the range; that IS recorded as coverage, so the range is
             not requested again. Returning [] on an error is therefore a way
@@ -477,7 +564,16 @@ class BarStore:
         force
             If True, bypass the cache, fetch the full range from IB, and
             overwrite any cached bars in [start_dt, end_dt].
+        stats
+            Optional dict, filled with what happened: "requests" (fetch_fn
+            calls that returned), "failed" (calls that raised — left
+            uncovered), "fetched" (bars returned) and "stored" (rows
+            written). The only way a caller can tell "all from cache" from
+            "IB refused and nothing was stored".
         """
+        if stats is None:
+            stats = {}
+        stats.update(requests=0, failed=0, fetched=0, stored=0)
         key = SeriesKey(symbol, bar_size, what_to_show, int(use_rth))
 
         if force:
@@ -503,7 +599,12 @@ class BarStore:
                     f"  fetch {key.symbol} {chunk_start} → {chunk_end}"
                 )
                 try:
-                    bars = fetch_fn(chunk_start, chunk_end) or []
+                    bars = fetch_fn(chunk_start, chunk_end)
+                    if bars is None:
+                        # get_historical_data's failure value. Read as []
+                        # this recorded "IB has no bars here" for every
+                        # timeout of a fetch_fn written the obvious way.
+                        raise RuntimeError("fetch_fn returned None (a failure, not an empty answer)")
                 except Exception as exc:
                     # A FAILED fetch must not extend coverage. Recording the
                     # range as held when the request never reached IB creates
@@ -513,6 +614,7 @@ class BarStore:
                     # One gateway outage would otherwise silently truncate a
                     # series forever.
                     failed += 1
+                    stats["failed"] += 1
                     logger.error(
                         f"  fetch_fn FAILED for {key.symbol} "
                         f"{chunk_start} → {chunk_end}: {exc} "
@@ -529,6 +631,9 @@ class BarStore:
                 with self._write_lock:
                     n = self._store_bars(key, bars, chunk_start, chunk_end)
                     self._update_coverage(key, chunk_start, chunk_end)
+                stats["requests"] += 1
+                stats["fetched"] += len(bars)
+                stats["stored"] += n
 
                 logger.info(
                     f"  stored {n} bars, coverage extended to "

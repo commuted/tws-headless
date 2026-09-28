@@ -315,9 +315,6 @@ class PluginResult:
         return [s for s in self.signals if s.is_actionable]
 
 
-# Default path to the shared BarStore database
-_DEFAULT_HIST_DB = Path(__file__).parent.parent / "historical" / "bars.db"
-
 # =============================================================================
 # Base Plugin Class
 # =============================================================================
@@ -477,11 +474,12 @@ class PluginBase(ABC):
 
     @property
     def _bar_store(self):
+        """The process-wide BarStore for bar_store.resolve_db_path() — the
+        same instance (and write lock) the engine's historical command uses."""
         if not hasattr(self, "_bar_store_instance"):
             try:
-                from ib.bar_store import BarStore
-                db = Path(os.environ.get("IB_HIST_DB", str(_DEFAULT_HIST_DB)))
-                self._bar_store_instance = BarStore(db)
+                from ib.bar_store import shared_store
+                self._bar_store_instance = shared_store()
             except Exception:
                 self._bar_store_instance = None
         return self._bar_store_instance
@@ -940,32 +938,15 @@ class PluginBase(ABC):
             logger.warning(f"Plugin '{self.name}': no portfolio for historical data")
             return None
 
-        done = threading.Event()
-        result: Dict[str, Any] = {}
-
-        def on_end(bars: list, start: str, end: str) -> None:
-            result["bars"] = bars
-            done.set()
-
-        req_id = self.portfolio.request_historical_data(
-            contract=contract,
-            end_date_time=end_date_time,
-            duration_str=duration_str,
-            bar_size_setting=bar_size_setting,
-            what_to_show=what_to_show,
-            use_rth=use_rth,
-            on_end=on_end,
-        )
-
-        if not done.wait(timeout=timeout):
-            logger.warning(
-                f"Plugin '{self.name}': historical data timeout "
-                f"after {timeout}s (req_id={req_id})"
-            )
-            self.portfolio.cancel_historical_data(req_id)
+        from ib.historical import HistoricalDataError, fetch_bars
+        try:
+            return fetch_bars(self.portfolio, contract, end_date_time, duration_str,
+                              bar_size_setting, what_to_show, use_rth, timeout)
+        except HistoricalDataError as e:
+            # None, not []: [] means IB answered with no bars, and callers
+            # that cache must never mistake a failure for that.
+            logger.warning(f"Plugin '{self.name}': historical data failed: {e}")
             return None
-
-        return result.get("bars", [])
 
     def subscribe_live_bars(
         self,
@@ -1012,7 +993,7 @@ class PluginBase(ABC):
             logger.warning(f"Plugin '{self.name}': no portfolio for live bars")
             return None
 
-        symbol = contract.symbol
+        from ib.historical import record_bar
         store  = self._bar_store
 
         def _caching(cb):
@@ -1020,7 +1001,8 @@ class PluginBase(ABC):
                 cb(bar)          # user callback first — never block live trading
                 if store:
                     try:
-                        store.insert_bar(symbol, bar_size_setting, what_to_show, use_rth, bar)
+                        record_bar(store, contract, bar_size_setting, what_to_show,
+                                   use_rth, bar)
                     except Exception:
                         pass
             return _wrapped
@@ -1058,7 +1040,13 @@ class PluginBase(ABC):
         use_rth: bool = True,
         force: bool = False,
     ) -> list:
-        """Like get_historical_data but backed by BarStore (no re-fetch if cached)."""
+        """
+        Like get_historical_data but backed by BarStore: cached bars are read,
+        only the gaps are fetched, and a chunk that fails (timeout, pacing
+        violation, refusal) is left uncovered for the next call instead of
+        being recorded as "no bars here". Same code as the engine's
+        `historical fetch` command — see ib/historical.py.
+        """
         from ib.bar_store import duration_str as _dur_str
         store = self._bar_store
         if store is None:
@@ -1070,27 +1058,12 @@ class PluginBase(ABC):
                 what_to_show=what_to_show,
                 use_rth=use_rth,
             ) or []
+        if not self.portfolio:
+            logger.warning(f"Plugin '{self.name}': no portfolio; serving cache only")
 
-        def fetch_fn(s, e):
-            return self.get_historical_data(
-                contract=contract,
-                end_date_time=e.strftime("%Y%m%d-%H:%M:%S"),
-                duration_str=_dur_str(s, e),
-                bar_size_setting=bar_size_setting,
-                what_to_show=what_to_show,
-                use_rth=use_rth,
-            ) or []
-
-        return store.get_bars(
-            symbol=contract.symbol,
-            bar_size=bar_size_setting,
-            what_to_show=what_to_show,
-            use_rth=use_rth,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            fetch_fn=fetch_fn,
-            force=force,
-        )
+        from ib.historical import cached_bars
+        return cached_bars(self.portfolio, store, contract, start_dt, end_dt,
+                           bar_size_setting, what_to_show, use_rth, force=force)
 
     def get_contract_details(
         self,

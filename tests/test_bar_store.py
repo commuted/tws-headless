@@ -611,12 +611,19 @@ class TestFetchFnErrors:
         assert result == []
 
     def test_fetch_fn_returns_none(self, store):
-        result = store.get_bars(
-            "GLD", "5 mins", "TRADES", True,
-            start_dt=_dt(2024, 1, 1), end_dt=_dt(2024, 1, 5),
-            fetch_fn=lambda s, e: None,
-        )
-        assert result == []
+        """None is get_historical_data's FAILURE value: nothing returned,
+        nothing covered, and the range is asked for again next time."""
+        calls = []
+
+        def fetch(s, e):
+            calls.append(s)
+            return None if len(calls) == 1 else [_make_bar("20240102 10:00:00")]
+
+        kw = dict(start_dt=_dt(2024, 1, 1), end_dt=_dt(2024, 1, 5), fetch_fn=fetch)
+        assert store.get_bars("GLD", "5 mins", "TRADES", True, **kw) == []
+        assert store.coverage_summary("GLD") == []
+        assert len(store.get_bars("GLD", "5 mins", "TRADES", True, **kw)) == 1
+        assert len(calls) == 2
 
 
 # ---------------------------------------------------------------------------

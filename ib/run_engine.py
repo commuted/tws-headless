@@ -2257,7 +2257,9 @@ class EngineCommandHandler:
 
     def handle_historical(self, args: List[str]):
         """
-        Handle 'historical' command — fetch bar data from IB and return as JSON.
+        Handle 'historical' command — bars for a range THROUGH the BarStore
+        cache (historical.cached_bars: read held bars, fetch only the gaps,
+        write them, cover only what IB answered), returned as JSON.
 
         Usage:
             historical fetch SYMBOL [options]
@@ -2270,13 +2272,17 @@ class EngineCommandHandler:
             --what X         TRADES, MIDPOINT, BID, ASK (default: TRADES)
             --no-rth         Include extended-hours bars
             --type X         Contract type: etf (default), stock, forex
+            --force          Re-fetch the whole range from IB, overwriting
 
         Returns bars as JSON with keys:
-            symbol, bar_size, duration, what_to_show, use_rth,
-            fetch_start_utc, fetch_end_utc, bars (list of dicts), count
+            symbol (series name, BASE.QUOTE for a pair), bar_size, duration,
+            what_to_show, use_rth, start_utc, end_utc, fetch_start_utc,
+            fetch_end_utc, db_path, stats (requests/failed/fetched/stored),
+            bars (list of dicts), count.
+        Status is ERROR when any chunk failed: those spans stay uncovered
+        and a re-run retries them.
         """
-        import threading
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timezone
         from .command_server import CommandResult, CommandStatus
 
         if not args or args[0].lower() != "fetch":
@@ -2284,7 +2290,7 @@ class EngineCommandHandler:
                 status=CommandStatus.ERROR,
                 message=(
                     "Usage: historical fetch SYMBOL [--bar-size X] [--duration X] "
-                    "[--end DATETIME] [--what X] [--no-rth] [--type etf|stock|forex]"
+                    "[--end DATETIME] [--what X] [--no-rth] [--type etf|stock|forex] [--force]"
                 ),
             )
 
@@ -2303,6 +2309,7 @@ class EngineCommandHandler:
         what_to_show   = "TRADES"
         use_rth        = True
         contract_type  = "etf"
+        force          = False
 
         i = 2
         while i < len(args):
@@ -2325,6 +2332,9 @@ class EngineCommandHandler:
             elif a == "--type" and i + 1 < len(args):
                 contract_type = args[i + 1].lower()
                 i += 2
+            elif a == "--force":
+                force = True
+                i += 1
             else:
                 i += 1
 
@@ -2345,73 +2355,86 @@ class EngineCommandHandler:
             # the only argument, which raised TypeError for every forex fetch
             # ever attempted (quote_currency has no default) — and even had it
             # worked, there would have been no way to name USD.JPY, where USD
-            # is the base. The full pair is what reaches BarStore as the series
-            # symbol, so EUR.USD and USD.JPY cannot collide.
+            # is the base. historical.series_symbol keys the series on the
+            # full pair, so EUR.USD and USD.JPY cannot collide.
             base, _, quote = symbol.partition(".")
             contract = ContractBuilder.forex(base, quote or "USD")
         else:
             contract = ContractBuilder.etf(symbol)
 
-        # Blocking fetch
-        done   = threading.Event()
-        holder: dict = {}
+        # THROUGH THE CACHE, IN THE ENGINE. This command used to make one raw
+        # IB request and hand the bars to ibctl, which ran its own BarStore in
+        # its own process: a second writer, keyed differently, fed ISO dates
+        # the parser rejected, and — like the plugin path — unable to tell a
+        # refused request from an empty one. Now it is the same call plugins
+        # make (historical.cached_bars): read what is held, fetch only the
+        # gaps, write them here, cover only what IB answered.
+        from .bar_store import parse_duration, resolve_db_path, shared_store
+        from .historical import cached_bars, series_symbol
+        try:
+            end_dt = (datetime.strptime(end_date_time, "%Y%m%d-%H:%M:%S")
+                      .replace(tzinfo=timezone.utc) if end_date_time
+                      else datetime.now(timezone.utc))
+            start_dt = end_dt - parse_duration(duration)
+        except ValueError as exc:
+            return CommandResult(status=CommandStatus.ERROR, message=str(exc))
 
-        def on_end(bars, start, end):
-            holder["bars"] = bars
-            done.set()
-
+        stats: dict = {}
         fetch_start_utc = datetime.now(timezone.utc)
-        portfolio.request_historical_data(
-            contract=contract,
-            end_date_time=end_date_time,
-            duration_str=duration,
-            bar_size_setting=bar_size,
-            what_to_show=what_to_show,
-            use_rth=use_rth,
-            on_end=on_end,
-        )
-
-        if not done.wait(120.0):
-            return CommandResult(
-                status=CommandStatus.ERROR,
-                message="Timeout waiting for historical data (120s)",
-            )
-
+        try:
+            records = cached_bars(portfolio, shared_store(), contract, start_dt, end_dt,
+                                  bar_size, what_to_show, use_rth, force=force,
+                                  timeout=120.0, stats=stats)
+        except Exception as exc:
+            logger.exception("historical fetch failed")
+            return CommandResult(status=CommandStatus.ERROR,
+                                 message=f"historical fetch failed: {exc}")
         fetch_end_utc = datetime.now(timezone.utc)
-        bars = holder.get("bars") or []
 
         bar_dicts = [
             {
-                # ISO-8601 UTC. IB now sends epoch seconds, which would make
-                # this field an opaque integer for every consumer of the
-                # response; parse_ib_bar_dt also accepts the older formatted
-                # strings, so this reads the same either way.
+                # ISO-8601 UTC for display; the store keeps IB's original.
                 "date":      _iso_bar_date(b.date),
                 "open":      float(b.open),
                 "high":      float(b.high),
                 "low":       float(b.low),
                 "close":     float(b.close),
                 "volume":    int(b.volume),
-                "wap":       float(getattr(b, "wap",      0.0)),
-                "bar_count": int(getattr(b, "barCount",   0)),
+                "wap":       float(b.wap or 0.0),
+                "bar_count": int(b.bar_count or 0),
             }
-            for b in bars
+            for b in records
         ]
-
+        series = series_symbol(contract)
+        data = {
+            "symbol":          series,
+            "bar_size":        bar_size,
+            "duration":        duration,
+            "what_to_show":    what_to_show,
+            "use_rth":         use_rth,
+            "start_utc":       start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "end_utc":         end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "fetch_start_utc": fetch_start_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+            "fetch_end_utc":   fetch_end_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+            "db_path":         str(resolve_db_path()),
+            "stats":           stats,
+            "bars":            bar_dicts,
+            "count":           len(bar_dicts),
+        }
+        if stats.get("failed"):
+            return CommandResult(
+                status=CommandStatus.ERROR,
+                message=(f"{stats['failed']} request(s) for {series} failed and were "
+                         f"left uncovered; {len(bar_dicts)} bar(s) available — "
+                         f"re-run to retry"),
+                data=data,
+            )
         return CommandResult(
             status=CommandStatus.SUCCESS,
-            message=f"Fetched {len(bar_dicts)} bars for {symbol} ({bar_size}, {duration})",
-            data={
-                "symbol":          symbol,
-                "bar_size":        bar_size,
-                "duration":        duration,
-                "what_to_show":    what_to_show,
-                "use_rth":         use_rth,
-                "fetch_start_utc": fetch_start_utc.strftime("%Y-%m-%dT%H:%M:%S"),
-                "fetch_end_utc":   fetch_end_utc.strftime("%Y-%m-%dT%H:%M:%S"),
-                "bars":            bar_dicts,
-                "count":           len(bar_dicts),
-            },
+            message=(f"{len(bar_dicts)} bars for {series} ({bar_size}, {duration}): "
+                     f"{stats.get('stored', 0)} stored from {stats.get('requests', 0)} "
+                     f"IB request(s), rest from cache"),
+            data=data,
         )
 
     def handle_pause(self, args: List[str]):

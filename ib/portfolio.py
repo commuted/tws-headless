@@ -51,6 +51,18 @@ logger = logging.getLogger(__name__)
 # it as terminal would have reported a false rejection.
 _WHATIF_ADVISORY_CODES = frozenset({10349})
 
+# IB errors that end a historical data request (historicalDataEnd never
+# follows). 162 covers both "HMDS query returned no data" — a real answer —
+# and pacing violations and cancellations, which are not; see
+# historical_error_is_no_data. 200 = no security definition, 321 = request
+# validation error, 354 = market data not subscribed.
+HISTORICAL_REQUEST_ERRORS = frozenset({162, 200, 321, 354})
+
+
+def historical_error_is_no_data(code: int, message: str) -> bool:
+    """True only when IB is saying the range genuinely holds no bars."""
+    return code == 162 and "no data" in (message or "").lower()
+
 
 # Tick types we care about for price updates
 PRICE_TICK_TYPES = (
@@ -205,6 +217,9 @@ class Portfolio(IBClient):
         # Historical data requests (one-shot, per-requester callbacks)
         # reqId -> (on_bar_cb, on_end_cb, accumulated_bars)
         self._historical_requests: Dict[int, tuple] = {}
+        # req_id -> on_error(code, message) for requests that asked to hear
+        # about failures separately from a genuinely empty result
+        self._historical_on_error: Dict[int, Callable] = {}
 
         # keepUpToDate feed monitoring: symbol and last-bar wall-clock time per
         # live-bar subscription, so a watchdog can detect a silently dead feed
@@ -1131,6 +1146,7 @@ class Portfolio(IBClient):
         on_end: Optional[Callable] = None,
         keep_up_to_date: bool = False,
         on_bar_update: Optional[Callable] = None,
+        on_error: Optional[Callable] = None,
     ) -> int:
         """
         Request historical bar data from IB.
@@ -1157,6 +1173,15 @@ class Portfolio(IBClient):
                               letting callers distinguish replayed history from
                               genuinely-live data. When None, all bars go to
                               on_bar (backward compatible).
+            on_error:         Optional callback(code, message) for a request
+                              IB REFUSED — pacing violation, invalid request,
+                              no subscription, unknown contract. When given,
+                              such a request ends here and on_end is NOT
+                              called, so the caller can tell a failure from
+                              IB genuinely having no bars ("HMDS query
+                              returned no data" still ends via on_end with
+                              an empty list). When None, a refusal ends via
+                              on_end([]) as it always has.
 
         Returns:
             Request ID (pass to cancel_historical_data() to abort early)
@@ -1165,6 +1190,8 @@ class Portfolio(IBClient):
         self._historical_requests[req_id] = (
             on_bar, on_bar_update, on_end, keep_up_to_date, []
         )
+        if on_error is not None:
+            self._historical_on_error[req_id] = on_error
         if keep_up_to_date:
             self._kutd_symbols[req_id] = contract.symbol
             self._kutd_last_bar[req_id] = time.time()
@@ -1205,6 +1232,7 @@ class Portfolio(IBClient):
         if req_id in self._historical_requests:
             self.cancelHistoricalData(req_id)
             del self._historical_requests[req_id]
+            self._historical_on_error.pop(req_id, None)
             self._kutd_symbols.pop(req_id, None)
             self._kutd_last_bar.pop(req_id, None)
             logger.debug(f"Cancelled historical data request req_id={req_id}")
@@ -2143,10 +2171,28 @@ class Portfolio(IBClient):
               advancedOrderRejectJson: str = "") -> None:
         """Override to release any waiting historical data requests on fatal errors."""
         super().error(reqId, errorTime, errorCode, errorString, advancedOrderRejectJson)
-        # Error 162: no data available.  historicalDataEnd won't fire, so we
-        # must release the waiting thread ourselves to avoid a 60-second hang.
-        if errorCode in (162, 321, 354) and reqId in self._historical_requests:
-            self.historicalDataEnd(reqId, "", "")
+        # A historical request IB answers with an error never gets
+        # historicalDataEnd, so it is released here. WHICH way matters: a
+        # genuine "no data" (162 "HMDS query returned no data") is an answer
+        # and ends as an empty result, but 162 is also IB's code for a pacing
+        # violation, and 321/354/200 are an invalid request, a missing
+        # subscription and an unknown contract. Ending those as an empty
+        # result told BarStore "IB has no bars here", which it records as
+        # coverage — a permanent hole from one refused request.
+        if (errorCode in HISTORICAL_REQUEST_ERRORS
+                and reqId in self._historical_requests):
+            on_error = self._historical_on_error.get(reqId)
+            if on_error is None or historical_error_is_no_data(errorCode, errorString):
+                self.historicalDataEnd(reqId, "", "")
+            else:
+                self._historical_requests.pop(reqId, None)
+                self._historical_on_error.pop(reqId, None)
+                self._kutd_symbols.pop(reqId, None)
+                self._kutd_last_bar.pop(reqId, None)
+                try:
+                    on_error(errorCode, errorString)
+                except Exception as e:
+                    logger.error(f"Error in historical on_error callback: {e}")
         # A whatIf order rejected outright (e.g. short selling not permitted)
         # arrives here instead of via openOrder — release the waiting caller
         # with the rejection instead of letting it time out. Advisory codes
@@ -2247,6 +2293,7 @@ class Portfolio(IBClient):
         # historicalDataUpdate can continue routing bars to on_bar.
         if not keep_up_to_date:
             self._historical_requests.pop(reqId, None)
+            self._historical_on_error.pop(reqId, None)
 
     def historicalDataUpdate(self, reqId: int, bar) -> None:
         """IB callback: a new bar has arrived for a keep_up_to_date subscription.

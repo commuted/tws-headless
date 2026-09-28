@@ -934,6 +934,10 @@ class MyPlugin(PluginBase):
         end_dt   = datetime.now(UTC)
         start_dt = end_dt - timedelta(days=30)
 
+        # Return get_historical_data's result AS IS. It is None when the
+        # request timed out or IB refused it, and BarStore leaves that range
+        # uncovered to retry; `... or []` would record it as "no bars here"
+        # and the gap would never be fetched again.
         def fetch_fn(s, e):
             return self.get_historical_data(
                 contract=ContractBuilder.etf("GLD"),
@@ -942,7 +946,7 @@ class MyPlugin(PluginBase):
                 bar_size_setting="5 mins",
                 what_to_show="TRADES",
                 use_rth=True,
-            ) or []
+            )
 
         bars = self._store.get_bars(
             symbol="GLD", bar_size="5 mins",
@@ -1000,6 +1004,19 @@ def get_bars_cached(
 ```
 
 Returns a list of `BarRecord` namedtuples (same fields as `get_bars`).
+
+**One path for every caller.** `get_bars_cached`, `subscribe_live_bars`'
+cache writes, and the engine's `historical fetch` command (which `ibctl` and
+`historical/recorder.py` call) all go through `ib/historical.py` and the same
+shared `BarStore` for the same database (`bar_store.resolve_db_path()`:
+`$IB_HIST_DB`, then `historical/config.json`, then `historical/bars.db`).
+A forex pair is stored as `BASE.QUOTE` (`USD.JPY`), never as its base alone.
+
+**Failures leave gaps open.** A chunk that times out or that IB refuses
+(pacing violation, invalid request, no subscription, unknown contract) is
+not recorded as covered, so the next call asks for it again. Only IB's own
+"no data" answer marks a range as held without bars. The call returns what
+it has; a partially failed fill is logged, not raised.
 
 **When to use:**
 - Warm-up on `start()` — instant on restart if bars are already in cache

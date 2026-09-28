@@ -517,14 +517,11 @@ _HIST_DB_DEFAULT = os.path.join(_IBCTL_DIR, "historical", "bars.db")
 
 
 def _historical_db_path() -> str:
-    """Return the configured BarStore DB path, falling back to the default."""
-    if os.path.exists(_HIST_CONFIG):
-        try:
-            with open(_HIST_CONFIG) as f:
-                return json.load(f).get("db_path", _HIST_DB_DEFAULT)
-        except Exception:
-            pass
-    return _HIST_DB_DEFAULT
+    """The BarStore DB the engine, plugins and recorder all use — one
+    resolver (bar_store.resolve_db_path) so `set-db` moves every path."""
+    sys.path.insert(0, _IBCTL_DIR)
+    from ib.bar_store import resolve_db_path
+    return str(resolve_db_path())
 
 
 def _historical_set_db(subargs: list) -> None:
@@ -539,97 +536,46 @@ def _historical_set_db(subargs: list) -> None:
     print(f"[OK] Historical DB path set to: {path}")
 
 
-class _BarProxy:
-    """
-    Duck-typed BarData for BarStore.
-
-    The engine returns bars as JSON dicts over the socket, while BarStore's
-    writer reads attributes (.date, .open, ... .barCount). This is the adapter
-    between the two, and it also renames bar_count -> barCount, which is where
-    the wire format and the ibapi format disagree.
-    """
-
-    __slots__ = ("date", "open", "high", "low", "close", "volume", "wap", "barCount")
-
-    def __init__(self, d: dict):
-        self.date     = d["date"]
-        self.open     = d["open"]
-        self.high     = d["high"]
-        self.low      = d["low"]
-        self.close    = d["close"]
-        self.volume   = d["volume"]
-        self.wap      = d.get("wap", 0.0)
-        self.barCount = d.get("bar_count", 0)
-
-
-def _parse_duration(dur: str):
-    """
-    IB durationStr -> timedelta; the inverse of bar_store.duration_str.
-
-    Needed because the CLI speaks (duration, end) while BarStore speaks
-    (start_dt, end_dt), and the cache cannot decide what it already holds
-    without an explicit range. Months and years are approximated the same way
-    duration_str approximates them on the way out (30 and 365 days), so a
-    round trip through both is stable.
-    """
-    from datetime import timedelta
-    parts = dur.strip().split()
-    if len(parts) != 2:
-        raise ValueError(f"bad duration {dur!r}; expected e.g. '2 D' or '6 M'")
-    n, unit = int(parts[0]), parts[1].upper()
-    scale = {"S": timedelta(seconds=1), "D": timedelta(days=1),
-             "W": timedelta(weeks=1), "M": timedelta(days=30),
-             "Y": timedelta(days=365)}
-    if unit not in scale:
-        raise ValueError(f"bad duration unit {unit!r}")
-    return n * scale[unit]
-
-
 def _historical_fetch(subargs: list, socket_path: str, timeout: float) -> None:
     """
-    Fetch bars THROUGH the BarStore cache and print them.
+    Ask the ENGINE for bars through its BarStore cache, and print them.
 
-    This used to fetch from IB unconditionally and then write the result to
-    the store, which made the store a log rather than a cache: every call was
-    a full round trip no matter what was already held, and the coverage
-    interval it recorded was the wall-clock window of the fetch rather than
-    the span of the data, so a later reader could never get a hit anyway.
+    The engine does everything — reads what is held, fetches only the gaps
+    in IB-sized chunks, writes them, and records coverage only for chunks IB
+    actually answered (ib/historical.py, the same code plugins use). This
+    process writes nothing.
 
-    Now the store drives. It compares the requested range against recorded
-    coverage, calls back only for the gaps, chunks each gap to the interval's
-    safe request size, and records coverage over the range it actually asked
-    for. The engine is the fetch_fn -- IB is still reached through the running
-    engine's connection, never a second one -- but it is only reached for what
-    is missing.
+    It used to run its own BarStore here with the engine as fetch_fn: a
+    second writer to the same file, keying pairs differently from plugins,
+    storing the engine's ISO dates (which the parser then rejected, so every
+    bar was dropped while coverage was still recorded), and unable to tell a
+    refused request from an empty one.
+
+    Exit status 1 when any chunk failed; those spans stay uncovered and a
+    re-run retries them.
     """
-    symbol        = None
-    bar_size      = "1 day"
-    duration      = "1 W"
-    end           = ""
-    what          = "TRADES"
-    use_rth       = True
-    contract_type = "etf"
-    force         = False
+    symbol   = None
+    bar_size = "1 day"
+    duration = "1 W"
+    passthru = []
 
     i = 0
     while i < len(subargs):
         a = subargs[i]
-        if a == "--bar-size" and i + 1 < len(subargs):
-            bar_size = subargs[i + 1];              i += 2
-        elif a == "--duration" and i + 1 < len(subargs):
-            duration = subargs[i + 1];              i += 2
-        elif a == "--end" and i + 1 < len(subargs):
-            end = subargs[i + 1];                   i += 2
-        elif a == "--what" and i + 1 < len(subargs):
-            what = subargs[i + 1];                  i += 2
-        elif a == "--type" and i + 1 < len(subargs):
-            contract_type = subargs[i + 1].lower(); i += 2
-        elif a == "--no-rth":
-            use_rth = False;                        i += 1
-        elif a == "--force":
-            force = True;                           i += 1
+        if a in ("--bar-size", "--duration", "--end", "--what", "--type") and i + 1 < len(subargs):
+            v = subargs[i + 1]
+            if a == "--bar-size":
+                bar_size = v
+            elif a == "--duration":
+                duration = v
+            elif a == "--type":
+                v = v.lower()
+            passthru += [a, v.replace(" ", "_")]
+            i += 2
+        elif a in ("--no-rth", "--force"):
+            passthru.append(a); i += 1
         elif not a.startswith("-") and symbol is None:
-            symbol = a.upper();                     i += 1
+            symbol = a.upper(); i += 1
         else:
             i += 1
 
@@ -639,97 +585,62 @@ def _historical_fetch(subargs: list, socket_path: str, timeout: float) -> None:
         print("       [--type etf|stock|forex] [--no-rth] [--force]")
         sys.exit(1)
 
-    db_path = _historical_db_path()
     sys.path.insert(0, _IBCTL_DIR)
-    from ib.bar_store import BarStore, duration_str
-    from datetime import datetime, timezone
-    UTC = timezone.utc
-
+    from ib.bar_store import max_fetch_seconds, parse_duration
     try:
-        end_dt = (datetime.strptime(end, "%Y%m%d-%H:%M:%S").replace(tzinfo=UTC)
-                  if end else datetime.now(UTC))
-        start_dt = end_dt - _parse_duration(duration)
+        span = parse_duration(duration).total_seconds()
     except ValueError as exc:
         print(f"[ERROR] {exc}")
         sys.exit(1)
+    # One engine call may make several paced IB requests; wait for all of
+    # them (the engine allows each 120 s) rather than the default 10 s.
+    chunks = max(1, int(-(-span // max_fetch_seconds(bar_size))))
+    wait = max(timeout, 60.0 + 130.0 * chunks)
 
-    calls = {"n": 0, "bars": 0, "failed": 0}
+    res = send_command(" ".join(["historical", "fetch", symbol] + passthru),
+                       socket_path=socket_path, timeout=wait)
+    data = res.data or {}
+    records = data.get("bars", [])
+    stats = data.get("stats", {})
 
-    def fetch_fn(chunk_start, chunk_end):
-        """
-        Ask the running engine for one gap.
-
-        RAISES on engine failure rather than returning []. BarStore treats an
-        empty return as "the source was reached and has nothing here" and
-        records coverage for it; an exception means the fetch failed and
-        leaves the range uncovered for a later retry. Returning [] on an
-        engine error would permanently mark the range as held.
-        """
-        parts = [
-            "historical", "fetch", symbol,
-            "--bar-size", bar_size.replace(" ", "_"),
-            "--duration", duration_str(chunk_start, chunk_end).replace(" ", "_"),
-            "--what",     what,
-            "--type",     contract_type,
-            "--end",      chunk_end.strftime("%Y%m%d-%H:%M:%S"),
-        ]
-        if not use_rth:
-            parts.append("--no-rth")
-        res = send_command(" ".join(parts), socket_path=socket_path,
-                           timeout=max(timeout, 120.0))
-        if res.status != CommandStatus.SUCCESS:
-            calls["failed"] += 1
-            print(f"[WARN] engine refused {chunk_start:%Y-%m-%d} → "
-                  f"{chunk_end:%Y-%m-%d}: {res.message}")
-            raise RuntimeError(f"engine: {res.message}")
-        got = [_BarProxy(d) for d in (res.data or {}).get("bars", [])]
-        calls["n"] += 1
-        calls["bars"] += len(got)
-        return got
-
-    store = BarStore(db_path)
-    records = store.get_bars(
-        symbol=symbol, bar_size=bar_size, what_to_show=what,
-        use_rth=use_rth, start_dt=start_dt, end_dt=end_dt,
-        fetch_fn=fetch_fn, force=force,
-    )
-
-    if calls["failed"]:
-        # Never report a failed fetch as a cache hit. The failed chunks were
-        # left UNCOVERED by BarStore, so simply re-running once the engine is
-        # healthy picks them up — no --force, no purge.
-        print(f"[ERROR] {calls['failed']} request(s) failed; "
-              f"{len(records)} bar(s) available for the range.")
-        print(f"[INFO]  Those spans were left uncovered — re-run to retry them.")
+    if res.status != CommandStatus.SUCCESS:
+        print(f"[ERROR] {res.message}")
+        if stats.get("failed"):
+            print(f"[INFO]  Those spans were left uncovered — re-run to retry them.")
+        _print_bars(records)
         sys.exit(1)
-    if calls["n"] == 0:
+    if not stats.get("requests"):
         print(f"[OK] {len(records)} bar(s) served entirely from cache "
-              f"({db_path})")
+              f"({data.get('db_path', '?')})")
     else:
-        print(f"[OK] {len(records)} bar(s); {calls['bars']} fetched from IB in "
-              f"{calls['n']} request(s), remainder from cache")
+        print(f"[OK] {len(records)} bar(s); {stats.get('stored', 0)} stored from "
+              f"{stats['requests']} IB request(s), remainder from cache")
+    _print_bars(records)
 
-    if records:
-        col = "  {:<22} {:>9} {:>9} {:>9} {:>9} {:>11}"
-        print()
-        print(col.format("Date", "Open", "High", "Low", "Close", "Volume"))
-        print("  " + "-" * 72)
-        show = (records if len(records) <= 12
-                else list(records[:6]) + [None] + list(records[-6:]))
-        for b in show:
-            if b is None:
-                print("  ...")
-                continue
-            # Volume is -1 for BID/ASK/MIDPOINT series -- a sentinel, not a
-            # count. Printed as-is rather than tidied away, so a quote series
-            # never gets mistaken for a traded one.
-            print(col.format(
-                str(b.date)[:22],
-                f"{b.open:.2f}", f"{b.high:.2f}",
-                f"{b.low:.2f}", f"{b.close:.2f}",
-                f"{int(b.volume):,}" if b.volume is not None else "-",
-            ))
-        print()
+
+def _print_bars(records: list) -> None:
+    if not records:
+        return
+    col = "  {:<25} {:>9} {:>9} {:>9} {:>9} {:>11}"
+    print()
+    print(col.format("Date (UTC)", "Open", "High", "Low", "Close", "Volume"))
+    print("  " + "-" * 75)
+    show = (records if len(records) <= 12
+            else list(records[:6]) + [None] + list(records[-6:]))
+    for b in show:
+        if b is None:
+            print("  ...")
+            continue
+        # Volume is -1 for BID/ASK/MIDPOINT series -- a sentinel, not a
+        # count. Printed as-is rather than tidied away, so a quote series
+        # never gets mistaken for a traded one.
+        print(col.format(
+            str(b["date"])[:25],
+            f"{b['open']:.2f}", f"{b['high']:.2f}",
+            f"{b['low']:.2f}", f"{b['close']:.2f}",
+            f"{int(b['volume']):,}" if b.get("volume") is not None else "-",
+        ))
+    print()
 
 
 def _historical_coverage(subargs: list) -> None:

@@ -4,9 +4,13 @@ gld_usd_swap composite-regime strategy, via BarStore.
 
 Reproduces exactly what plugins/gld_usd_swap/plugin.py does live:
 
-    - 5-min RTH bars for GLD, UUP, TLT, RINF (fetched through the trading
-      engine's `historical fetch` command, backed by the shared BarStore
-      cache at historical/bars.db — cached ranges never touch IB again).
+    - 5-min RTH bars for GLD, UUP, TLT, RINF, one `historical fetch` per
+      symbol to the trading engine. The ENGINE reads its BarStore, fetches
+      only the gaps and writes them (ib/historical.py — the same code
+      plugins use); this script writes nothing. It used to run its own
+      BarStore with the engine as fetch_fn: a second writer that recorded
+      an engine error as "no bars" and read cached dates by position, which
+      breaks on the epoch dates the engine has stored since 049adde.
 
     - Each signal ETF (UUP, TLT, RINF) is pre-smoothed with an adaptive
       StreamingTriangleTooth whose slope cap is the p50 of the trailing
@@ -69,7 +73,8 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 sys.path.insert(0, _PROJECT_ROOT)
 sys.path.insert(0, os.environ.get("VOLOMOM_PATH", os.path.join(_HERE, "..", "..", "..", "volomom")))
 
-from ib.bar_store import BarStore, duration_str as _duration_str
+from ib.bar_store import max_fetch_seconds, parse_ib_bar_dt
+from zoneinfo import ZoneInfo
 
 from hampel import StreamingHampel
 
@@ -116,8 +121,6 @@ REGIME_UNKNOWN = "unknown"
 _PAPER_PORTS = {7497, 4002}
 _LIVE_PORTS  = {7496, 4001}
 _LEGACY_SOCK = os.path.expanduser("~/.tws_headless.sock")
-_HIST_CONFIG = os.path.join(_PROJECT_ROOT, "historical", "config.json")
-_HIST_DB_DEF = os.path.join(_PROJECT_ROOT, "historical", "bars.db")
 
 
 def _socket_for_env(env: str) -> str:
@@ -143,18 +146,6 @@ def _resolve_socket(explicit: str | None, env: str | None) -> str:
     raise SystemExit(
         f"No engine socket found at {paper}. Start the trading engine first."
     )
-
-
-def _resolve_db(explicit: str | None) -> str:
-    if explicit:
-        return os.path.abspath(os.path.expanduser(explicit))
-    if os.path.exists(_HIST_CONFIG):
-        try:
-            with open(_HIST_CONFIG) as f:
-                return json.load(f).get("db_path", _HIST_DB_DEF)
-        except Exception:
-            pass
-    return _HIST_DB_DEF
 
 
 # ---------------------------------------------------------------------------
@@ -188,12 +179,20 @@ def _send_command(cmd: str, socket_path: str, timeout: float) -> dict:
     return json.loads(buf.decode("utf-8").strip())
 
 
+_NY = ZoneInfo("America/New_York")
+
+
 class _EngineBar:
-    """Bar-like object matching what BarStore._store_bars expects."""
+    """
+    One bar from the engine's JSON, with .date as "YYYYMMDD HH:MM:SS" in
+    New York time — the form _bar_date/_bar_time slice. The engine sends
+    ISO-8601 UTC; converting here keeps that slicing right whatever form the
+    store holds (IB labelled strings, epoch seconds, ISO).
+    """
     __slots__ = ("date", "open", "high", "low", "close", "volume", "wap", "barCount")
 
     def __init__(self, d: dict):
-        self.date     = d["date"]
+        self.date     = parse_ib_bar_dt(str(d["date"])).astimezone(_NY).strftime("%Y%m%d %H:%M:%S")
         self.open     = float(d["open"])
         self.high     = float(d["high"])
         self.low      = float(d["low"])
@@ -203,56 +202,38 @@ class _EngineBar:
         self.barCount = int(d.get("bar_count", 0))
 
 
-def _make_fetch_fn(symbol: str, socket_path: str, timeout: float, pacing_secs: float):
-    """Build a fetch_fn(start_dt, end_dt) → list of _EngineBar for BarStore."""
-
-    def fetch(chunk_start: datetime, chunk_end: datetime) -> list:
-        end_str  = chunk_end.astimezone(UTC).strftime("%Y%m%d-%H:%M:%S")
-        duration = _duration_str(chunk_start, chunk_end).replace(" ", "_")
-        cmd = (
-            f"historical fetch {symbol} "
-            f"--bar-size 5_mins --duration {duration} "
-            f"--what TRADES --type etf --end {end_str}"
-        )
-        print(f"    engine → {cmd}", flush=True)
-        resp = _send_command(cmd, socket_path, timeout=timeout)
-
-        status = resp.get("status")
-        if status != "success":
-            print(f"    [engine {status}] {resp.get('message', '')}", flush=True)
-            return []
-
-        bars = resp.get("data", {}).get("bars", []) or []
-        if pacing_secs > 0:
-            time.sleep(pacing_secs)
-        return [_EngineBar(b) for b in bars]
-
-    return fetch
-
-
 def fetch_bars_cached(
     symbol: str,
     start_dt: datetime,
     end_dt: datetime,
-    store: BarStore,
     socket_path: str,
     timeout: float,
-    pacing_secs: float,
     force: bool,
 ) -> list:
-    """Return all bars for [start_dt, end_dt], pulling gaps through the engine."""
+    """All bars for [start_dt, end_dt]; the engine serves the cache and
+    fetches only the gaps. A partial failure is reported and the bars it
+    did get are returned — the failed spans stay uncovered for a re-run."""
     print(f"  Fetching {symbol}: {start_dt.date()} → {end_dt.date()} …", flush=True)
-    bars = store.get_bars(
-        symbol=symbol,
-        bar_size=BAR_SIZE,
-        what_to_show=WHAT_TO_SHOW,
-        use_rth=USE_RTH,
-        start_dt=start_dt,
-        end_dt=end_dt,
-        fetch_fn=_make_fetch_fn(symbol, socket_path, timeout, pacing_secs),
-        force=force,
-    )
-    print(f"  {symbol}: {len(bars)} bars in [{start_dt.date()}, {end_dt.date()}]",
+    cmd = (f"historical fetch {symbol} --bar-size {BAR_SIZE.replace(' ', '_')} "
+           # exact days: the engine chunks the range itself, and duration_str's
+           # coarse units would round 730 days up to "3 Y"
+           f"--duration {-(-int((end_dt - start_dt).total_seconds()) // 86400)}_D "
+           f"--what {WHAT_TO_SHOW} --type etf "
+           f"--end {end_dt.astimezone(UTC).strftime('%Y%m%d-%H:%M:%S')}")
+    if not USE_RTH:
+        cmd += " --no-rth"
+    if force:
+        cmd += " --force"
+    # the engine may make one paced IB request per chunk; wait for all of them
+    chunks = max(1, int(-(-(end_dt - start_dt).total_seconds() // max_fetch_seconds(BAR_SIZE))))
+    resp = _send_command(cmd, socket_path, timeout=max(timeout, 60.0 + 130.0 * chunks))
+    data = resp.get("data") or {}
+    if resp.get("status") != "success":
+        print(f"    [engine {resp.get('status')}] {resp.get('message', '')}", flush=True)
+    stats = data.get("stats", {})
+    bars = [_EngineBar(b) for b in data.get("bars", [])]
+    print(f"  {symbol}: {len(bars)} bars in [{start_dt.date()}, {end_dt.date()}] "
+          f"({stats.get('stored', 0)} newly stored, db {data.get('db_path', '?')})",
           flush=True)
     return bars
 
@@ -617,40 +598,31 @@ def main():
                         help="Explicit engine socket path (overrides --env)")
     parser.add_argument("--env",     default=None, choices=["paper", "live"],
                         help="Which engine to target (defaults: legacy → paper)")
-    parser.add_argument("--db",      default=None,
-                        help="BarStore DB path (default: historical/config.json → historical/bars.db)")
     parser.add_argument("--years",   type=int, default=2,
                         help="Years of history to fetch (max ~2 for 5-min bars)")
     parser.add_argument("--timeout", type=float, default=180.0,
-                        help="Per-fetch engine command timeout, seconds")
-    parser.add_argument("--pacing",  type=float, default=3.0,
-                        help="Seconds to sleep between engine fetches (IB pacing)")
+                        help="Minimum engine command timeout, seconds (raised per chunk)")
     parser.add_argument("--force",   action="store_true",
                         help="Bypass BarStore cache and refetch the full range")
     args = parser.parse_args()
 
     socket_path = _resolve_socket(args.socket, args.env)
-    db_path     = _resolve_db(args.db)
 
     end_dt   = datetime.now(UTC).replace(microsecond=0)
     start_dt = end_dt - timedelta(days=args.years * 365)
 
     print(f"\ngld_usd_swap composite-regime backtest (live-plugin fidelity)")
     print(f"  socket : {socket_path}")
-    print(f"  db     : {db_path}")
     print(f"  range  : {start_dt.date()} → {end_dt.date()}  ({args.years}y)")
     print(f"  force  : {args.force}\n")
-
-    store = BarStore(db_path)
 
     # -- Fetch all 4 series (cache-first; gaps go through the engine) --------
     bars = {}
     for sym in ("GLD", "UUP", "TLT", "RINF"):
         bars[sym] = fetch_bars_cached(
-            sym, start_dt, end_dt, store,
+            sym, start_dt, end_dt,
             socket_path=socket_path,
             timeout=args.timeout,
-            pacing_secs=args.pacing,
             force=args.force,
         )
         print()

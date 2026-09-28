@@ -28,6 +28,7 @@ def _bare_portfolio():
     p._historical_requests = {}
     p._kutd_symbols = {}
     p._kutd_last_bar = {}
+    p._historical_on_error = {}
     return p
 
 
