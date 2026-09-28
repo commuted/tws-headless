@@ -175,7 +175,14 @@ class PaperTestBarStorePlugin(PluginBase):
     # -------------------------------------------------------------------------
 
     def _make_fetch_fn(self, symbol: str, bar_size: str, call_counter: List[int]):
-        """Return a fetch_fn that wraps get_historical_data and counts calls."""
+        """
+        Return a fetch_fn that wraps get_historical_data and counts calls.
+
+        The result is returned AS IS: get_historical_data gives None when the
+        request timed out or IB refused it, and BarStore leaves that range
+        uncovered. `... or []` here recorded every such failure as "no bars
+        exist" — the permanent hole this test exists to catch.
+        """
         def fetch_fn(start_dt: datetime, end_dt: datetime):
             call_counter[0] += 1
             end_str = end_dt.strftime("%Y%m%d-%H:%M:%S")
@@ -187,7 +194,7 @@ class PaperTestBarStorePlugin(PluginBase):
                 bar_size_setting=bar_size,
                 what_to_show=WHAT,
                 use_rth=USE_RTH,
-            ) or []
+            )
         return fetch_fn
 
     # -------------------------------------------------------------------------
@@ -223,12 +230,20 @@ class PaperTestBarStorePlugin(PluginBase):
             #
             # gap_fill_gld   : cache day B, request [d0,d4] → gaps A+C+D fetched, B from cache
             # gap_in_middle   : cache days A+C, request [d0,d3] → only day B (hole) fetched
+            #
+            # Days A..D are the last FOUR CONSECUTIVE COMPLETED WEEKDAYS, not
+            # the last four calendar days: run on a Monday, calendar days put
+            # the single-day tests on a Saturday, IB has no bars for it, and
+            # six checks failed for a reason that had nothing to do with the
+            # cache. (Exchange holidays are not handled — run mid-week then.)
             today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-            d0 = today - timedelta(days=4)
-            d1 = today - timedelta(days=3)
-            d2 = today - timedelta(days=2)
-            d3 = today - timedelta(days=1)
             d4 = today
+            while not all((d4 - timedelta(days=k)).weekday() < 5 for k in range(1, 5)):
+                d4 -= timedelta(days=1)
+            d0 = d4 - timedelta(days=4)
+            d1 = d4 - timedelta(days=3)
+            d2 = d4 - timedelta(days=2)
+            d3 = d4 - timedelta(days=1)
 
             # Aliases used by the single-day tests
             day1_start = d2

@@ -430,7 +430,10 @@ def _fmt_feed_results(results: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-def _print_summary(label: str, summary: Dict):
+def _print_summary(label: str, summary: Dict) -> bool:
+    """Print a plugin's summary line and return whether it passed. The
+    runners fold this into the overall verdict — it used to be printed only,
+    so 'Overall: PASS' appeared under a [WARN] with 6 of 9 checks failed."""
     total = summary.get("total", 0)
     errors = summary.get("errors", [])
 
@@ -451,7 +454,7 @@ def _print_summary(label: str, summary: Dict):
         ok = not errors and passed == total
         marker = "[PASS]" if ok else "[WARN]"
         print(f"  {marker} {label}: {', '.join(parts)}")
-        return
+        return ok
 
     filled = summary.get("filled", summary.get("passed", 0))
     stubs = summary.get("stubs", 0)
@@ -469,6 +472,7 @@ def _print_summary(label: str, summary: Dict):
     ok = not errors and (filled > 0 or stubs > 0)
     marker = "[PASS]" if ok else "[WARN]"
     print(f"  {marker} {label}: {', '.join(parts)}")
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -553,8 +557,8 @@ def run_plugins_parallel(
         summary = data.get("summary", {})
         if results:
             print(_fmt_feed_results(results))
-        if summary:
-            _print_summary(label, summary)
+        if summary and not _print_summary(label, summary):
+            overall_ok = False
 
     return overall_ok
 
@@ -636,7 +640,7 @@ def run_plugin(plugin_info: Dict, socket_path: str, timeout: float, dry_run: boo
         print()
 
     if summary:
-        _print_summary(label, summary)
+        return _print_summary(label, summary)
 
     return True
 
